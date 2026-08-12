@@ -3444,14 +3444,9 @@ test("thinkingLevelsFor: filters by the selected model's thinkingLevelMap, off-o
 test("settings command: Back re-prompts the previous field; a wrong pick is recoverable", async () => {
   const dir = await mkdtemp(join(tmpdir(), "ppo-cmd-back-"));
   try {
-    // supervisor: provider anthropic → model → Back → provider anthropic → model claude → thinking high
-    // lead: provider openai → Back (to supervisor thinking) → redo supervisor thinking high → then lead again
-    const queue = [
-      "anthropic", "claude-sonnet-4-5", "← Back", "← Back", // supervisor: back at model → provider, back at provider → cancel? NO: back at first provider = cancel
-    ];
-    // Simpler deterministic flow: wrong provider for supervisor, back to fix it.
+    // Wrong provider for supervisor, then Esc (undefined) back to fix it.
     const queue2 = [
-      "openai", "← Back", "anthropic", "claude-sonnet-4-5", "high", // supervisor
+      "openai", undefined, "anthropic", "claude-sonnet-4-5", "high", // supervisor
       "anthropic", "claude-sonnet-4-5", "medium", // lead
       "openai", "gpt-5", "off", // peer
     ];
@@ -3490,9 +3485,9 @@ test("settings command: thinking picker offers only the selected model's support
     await runSettingsWith(fake, { ...process.env, PI_CODING_AGENT_DIR: dir });
     const thinkingCalls = selectCalls.filter(([title]) => /Thinking level/.test(title));
     assert.deepEqual(thinkingCalls.map(([, options]) => options), [
-      ["← Back", "off", "xhigh", "max"],
-      ["← Back", ...extension.THINKING_LEVELS],
-      ["← Back", "off", "xhigh", "max"],
+      ["off", "xhigh", "max"],
+      [...extension.THINKING_LEVELS],
+      ["off", "xhigh", "max"],
     ]);
     const doc = JSON.parse(await readFile(join(dir, "pi-paseo-orchestration", "settings.json"), "utf8"));
     assert.equal(doc.roles.supervisor.thinking, "max");

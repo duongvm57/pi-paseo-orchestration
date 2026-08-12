@@ -3766,15 +3766,46 @@ export function thinkingLevelsFor(model) {
   return supported.length > 0 ? supported : ["off"];
 }
 
-const BACK_OPTION = "← Back";
-
-// Esc (select returns undefined) and the "← Back" option both mean back one
-// step. The whole flow cancels only at its very first field — a wizard-style
-// exit instead of a mid-flow abort.
-async function pickWithBack(ctx, title, options) {
-  const choice = await ctx.ui.select(title, [BACK_OPTION, ...options]);
-  if (choice === null || choice === undefined || choice === BACK_OPTION) return { back: true };
-  return { value: choice };
+// Wizard picker: a custom selector with truthful help text — Esc goes back one
+// step (the whole flow cancels only at its first field). The built-in select
+// dialog hard-codes "escape/ctrl+c cancel", which would lie about that
+// behavior, so when a TUI is available we render our own list with an honest
+// footer. pi-tui is loaded lazily (it is a Pi-internal package, not a package
+// dependency) and any resolution failure falls back to the built-in select,
+// which still maps Esc to back at the runSettings layer.
+async function selectWizard(ctx, title, options) {
+  if (typeof ctx.ui?.custom !== "function") return { fallback: true };
+  let tuiModule = null;
+  try {
+    tuiModule = await import("@earendil-works/pi-tui");
+  } catch {
+    tuiModule = null;
+  }
+  if (!tuiModule?.matchesKey || !tuiModule.Key) return { fallback: true };
+  const { matchesKey, Key } = tuiModule;
+  let index = 0;
+  const value = await ctx.ui.custom((tui, _theme, _keybindings, done) => ({
+    render: () => {
+      const lines = [title, ""];
+      options.forEach((option, i) => lines.push(`${i === index ? "→ " : "  "}${option}`));
+      lines.push("", "↑↓ navigate · enter select · esc back (esc at the start cancels)");
+      return lines;
+    },
+    handleInput: (data) => {
+      if (matchesKey(data, Key.up)) {
+        index = (index - 1 + options.length) % options.length;
+        tui.requestRender();
+      } else if (matchesKey(data, Key.down)) {
+        index = (index + 1) % options.length;
+        tui.requestRender();
+      } else if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
+        done(options[index]);
+      } else if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+        done(null); // null = back one step at the runSettings layer
+      }
+    },
+  }));
+  return { value };
 }
 
 async function runSettings(_args, ctx) {
@@ -3805,32 +3836,35 @@ async function runSettings(_args, ctx) {
   while (roleIdx < ROLES.length) {
     const role = ROLES[roleIdx];
     if (field === 0) {
-      const res = await pickWithBack(ctx, `Provider for ${role}:`, providers);
-      if (res.back) {
+      const res = await selectWizard(ctx, `Provider for ${role}:`, providers);
+      const choice = res.fallback ? await ctx.ui.select(`Provider for ${role}:`, providers) : res.value;
+      if (choice === null || choice === undefined) {
         if (roleIdx === 0) { notify(cancelNote, "info"); return; } // first field: back = cancel
         roleIdx -= 1;
         field = 2;
         continue;
       }
-      chosen[role] = { provider: res.value };
+      chosen[role] = { provider: choice };
       field = 1;
       continue;
     }
     if (field === 1) {
       const ids = models.filter((m) => m.provider === chosen[role].provider).map((m) => m.id).sort();
-      const res = await pickWithBack(ctx, `Model for ${role}:`, ids);
-      if (res.back) { field = 0; continue; }
-      chosen[role].model = res.value;
+      const res = await selectWizard(ctx, `Model for ${role}:`, ids);
+      const choice = res.fallback ? await ctx.ui.select(`Model for ${role}:`, ids) : res.value;
+      if (choice === null || choice === undefined) { field = 0; continue; }
+      chosen[role].model = choice;
       chosen[role].modelEntry = models.find(
-        (m) => m.provider === chosen[role].provider && m.id === res.value,
+        (m) => m.provider === chosen[role].provider && m.id === choice,
       );
       field = 2;
       continue;
     }
     const levels = thinkingLevelsFor(chosen[role].modelEntry);
-    const res = await pickWithBack(ctx, `Thinking level for ${role}:`, levels);
-    if (res.back) { field = 1; continue; }
-    roles[role] = { provider: chosen[role].provider, model: chosen[role].model, thinking: res.value };
+    const res = await selectWizard(ctx, `Thinking level for ${role}:`, levels);
+    const choice = res.fallback ? await ctx.ui.select(`Thinking level for ${role}:`, levels) : res.value;
+    if (choice === null || choice === undefined) { field = 1; continue; }
+    roles[role] = { provider: chosen[role].provider, model: chosen[role].model, thinking: choice };
     roleIdx += 1;
     field = 0;
   }
