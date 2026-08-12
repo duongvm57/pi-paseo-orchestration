@@ -779,15 +779,20 @@ test("wiring: runtime model and thinking observations are required and exact", a
   }
 });
 
-test("wiring: an attempted tool re-enablement is active-policy drift", async () => {
+test("wiring: an attempted tool re-enablement is healed and still gated per call", async () => {
   const ext = await freshExtension();
   const env = await governedFixture(ext, { role: "peer", activeTools: ["read", "bash"] });
   try {
     await env.fake.handlers.get("before_agent_start")({ prompt: "hi", systemPrompt: "base" }, env.fake.ctx);
+    // A co-extension (or loader) re-adds a tool outside the peer ceiling.
     env.fake.holder.activeTools.push("write");
     const blocked = await env.fake.handlers.get("tool_call")({ toolName: "write", input: { path: "/x" } }, env.fake.ctx);
     assert.equal(blocked.block, true);
-    assert.match(blocked.reason, /active tools drifted/);
+    assert.match(blocked.reason, /write is not permitted for the peer role/);
+    // The drift is healed, not fatal: the ceiling is re-applied on the next call.
+    assert.deepEqual(env.fake.holder.activeTools, ["read", "bash"]);
+    const passed = await env.fake.handlers.get("tool_call")({ toolName: "read", input: {} }, env.fake.ctx);
+    assert.equal(passed, undefined);
   } finally {
     await rm(env.dir, { recursive: true, force: true });
     await rm(env.profiles, { recursive: true, force: true });

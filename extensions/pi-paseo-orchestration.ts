@@ -966,8 +966,13 @@ function checkStringList(value, label, { min = 0, unique = false } = {}) {
 }
 
 function sameList(left, right) {
-  return Array.isArray(left) && Array.isArray(right)
-    && left.length === right.length && left.every((item, index) => item === right[index]);
+  // Order-insensitive set comparison: the active tool set is a shared runtime
+  // resource, so ordering or unrelated additions by co-extensions must not
+  // look like policy drift.
+  if (!Array.isArray(left) || !Array.isArray(right)) return false;
+  if (left.length !== right.length) return false;
+  const set = new Set(right);
+  return left.every((item) => set.has(item));
 }
 
 // Shared strict marker parser for the four Slice 6 documents. Like authority and
@@ -4150,14 +4155,29 @@ function readActiveTools(pi) {
   return { ok: true, tools: [...actual] };
 }
 
-function verifyActiveTools(pi) {
+// Cooperative active-tool policy: the active tool set is shared with other
+// extensions and tool loaders, so a drift from the latched policy is healed by
+// re-applying the ceiling rather than hard-blocking the session. The ceiling
+// itself is still enforced per call in checkToolCall; this function only keeps
+// the prompt surface in line with the policy.
+async function ensureToolPolicy(pi) {
   if (baseline === null) return { ok: false, error: "active-tool baseline is not observable" };
   const observed = readActiveTools(pi);
   if (!observed.ok) return observed;
   const expected = lastAppliedTools ?? baseline;
-  if (!sameList(observed.tools, expected)) {
-    return { ok: false, error: "active tools drifted from the latched session policy; start a fresh process" };
+  if (sameList(observed.tools, expected)) return { ok: true };
+  const allowed = effectiveTools(baseline, latch?.role ?? null, currentAuthority);
+  if (typeof pi.setActiveTools !== "function") return { ok: false, error: "active-tool policy cannot be re-applied" };
+  try {
+    pi.setActiveTools(allowed);
+  } catch {
+    return { ok: false, error: "active-tool policy cannot be re-applied" };
   }
+  const applied = readActiveTools(pi);
+  if (!applied.ok || !sameList(applied.tools, allowed)) {
+    return { ok: false, error: "active tools drifted while re-applying the session policy" };
+  }
+  lastAppliedTools = [...allowed];
   return { ok: true };
 }
 
@@ -4169,7 +4189,7 @@ async function verifyOrBlock(ctx, dir, pi = null, { runtime = true } = {}) {
     return false;
   }
   if (pi !== null) {
-    const tools = verifyActiveTools(pi);
+    const tools = await ensureToolPolicy(pi);
     if (tools.ok !== true) {
       const error = "error" in tools ? tools.error : "active tools are not observable";
       blockedReason = error;
