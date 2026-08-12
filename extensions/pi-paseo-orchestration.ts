@@ -530,7 +530,7 @@ export function parseEnvelope(text) {
   return validateEnvelopeShape(obj);
 }
 
-function isPathInScope(rel, scope, exclusions) {
+export function isPathInScope(rel, scope, exclusions) {
   const within = rel === scope || rel.startsWith(scope + "/");
   if (!within) return false;
   return !(exclusions ?? []).some((e) => rel === e || rel.startsWith(e + "/"));
@@ -617,10 +617,10 @@ export function effectiveTools(baseline, role, authority = null) {
   return baseline.filter((tool) => ceiling.includes(tool) || extra.includes(tool));
 }
 
-function gitOut(repoRoot, args) {
+function gitOut(repoRoot, args, trim = true) {
   return new Promise((resolve) => {
     execFile("git", args, { cwd: repoRoot, timeout: 15000 }, (err, stdout) => {
-      resolve(err ? null : stdout.trim());
+      resolve(err ? null : (trim ? stdout.trim() : stdout));
     });
   });
 }
@@ -890,6 +890,844 @@ export function createInspectionLimit(max = 1) {
       return { ok: true, remaining: max - inspections };
     },
   };
+}
+
+// ─── Stable Candidate, review, verdict, and Local Acceptance ────────────────
+
+// These are document and Git-fact seams only. They keep no candidate registry,
+// acceptance state, refs, notes, or other persistence and are not wired into
+// Peer input parsing. The caller supplies the current repository and authority
+// facts each time, so HEAD/worktree drift naturally fails revalidation.
+export const CANDIDATE_EVIDENCE_BEGIN = '<pi-paseo-orchestration evidence="v1">';
+export const CANDIDATE_EVIDENCE_END = "</pi-paseo-orchestration>";
+export const REVIEW_BEGIN = '<pi-paseo-orchestration review="v1">';
+export const REVIEW_END = "</pi-paseo-orchestration>";
+export const VERDICT_BEGIN = '<pi-paseo-orchestration verdict="v1">';
+export const VERDICT_END = "</pi-paseo-orchestration>";
+export const ACCEPTANCE_BEGIN = '<pi-paseo-orchestration acceptance="v1">';
+export const ACCEPTANCE_END = "</pi-paseo-orchestration>";
+
+const DIRECT_ACCEPTANCE = Symbol("direct Human acceptance route");
+const COMMAND_RESULTS = ["PASS", "FAIL", "NOT_RUN"];
+
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function checkClosedObject(value, fields, label) {
+  if (!isRecord(value)) return { ok: false, error: `${label} must be a single object` };
+  const extra = Object.keys(value).find((field) => !fields.includes(field));
+  if (extra !== undefined) return { ok: false, error: `unknown field ${JSON.stringify(extra)} in ${label}` };
+  return { ok: true };
+}
+
+function checkNonemptyString(value, label) {
+  return typeof value === "string" && value.trim() !== ""
+    ? { ok: true }
+    : { ok: false, error: `${label} must be a nonempty string` };
+}
+
+function checkStringList(value, label, { min = 0, unique = false } = {}) {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.trim() === "")) {
+    return { ok: false, error: `${label} must be an array of nonempty strings` };
+  }
+  if (value.length < min) return { ok: false, error: `${label} must contain at least ${min} item(s)` };
+  if (unique && new Set(value).size !== value.length) return { ok: false, error: `${label} must not repeat values` };
+  return { ok: true };
+}
+
+function sameList(left, right) {
+  return Array.isArray(left) && Array.isArray(right)
+    && left.length === right.length && left.every((item, index) => item === right[index]);
+}
+
+// Shared strict marker parser for the four Lát 6 documents. Like authority and
+// report parsing, the marker must be first, duplicate JSON keys are rejected
+// before JSON.parse, and any unknown pi-paseo marker fails closed.
+function parseV1Block(text, begin, label, resultKey, validate) {
+  if (typeof text !== "string") return { ok: true, [resultKey]: null };
+  const stripped = text.trimStart();
+  if (!stripped.includes(begin)) {
+    if (stripped.includes("<pi-paseo-orchestration")) {
+      return { ok: false, error: `unrecognized ${label} marker (unknown marker version or malformed)` };
+    }
+    return { ok: true, [resultKey]: null };
+  }
+  if (!stripped.startsWith(begin)) {
+    return { ok: false, error: `${label} must be the first nonempty content of the message` };
+  }
+  if (stripped.indexOf(begin, begin.length) !== -1) {
+    return { ok: false, error: `duplicate ${label} in one message` };
+  }
+  const endMarker = "</pi-paseo-orchestration>";
+  const endAt = stripped.indexOf(endMarker, begin.length);
+  if (endAt === -1) return { ok: false, error: `${label} has no closing marker` };
+  const trailing = stripped.slice(endAt + endMarker.length);
+  if (trailing.includes("<pi-paseo-orchestration") || trailing.includes(endMarker)) {
+    return { ok: false, error: `duplicate or mixed pi-paseo document marker after ${label}` };
+  }
+  const body = stripped.slice(begin.length, endAt);
+  const duplicate = findDuplicateKey(body);
+  if (duplicate !== null) return { ok: false, error: `duplicate field ${JSON.stringify(duplicate)} in ${label}` };
+  let object;
+  try {
+    object = JSON.parse(body);
+  } catch {
+    return { ok: false, error: `${label} body is not valid JSON` };
+  }
+  return validate(object);
+}
+
+// Stable Candidate identity is only the exact, lower-case, full-OID v1 form.
+// Retrieval is deliberately separate: an identity can parse while its objects
+// have since been garbage-collected or belong to another repository.
+export function parseCandidateRef(ref) {
+  const match = typeof ref === "string"
+    ? /^git:v1:([0-9a-f]{40}|[0-9a-f]{64}):([0-9a-f]{40}|[0-9a-f]{64})$/.exec(ref)
+    : null;
+  if (match === null) {
+    return { ok: false, error: "candidate reference must be exactly git:v1:<task-base-full-oid>:<candidate-full-oid>" };
+  }
+  if (match[1].length !== match[2].length) {
+    return { ok: false, error: "candidate reference task base and candidate must use the same full object-id length" };
+  }
+  return {
+    ok: true,
+    candidate: { ref, taskBaseOid: match[1], candidateOid: match[2] },
+  };
+}
+
+async function exactCommit(repoRoot, oid, label) {
+  const resolved = await gitOut(repoRoot, ["rev-parse", "--verify", `${oid}^{commit}`]);
+  if (resolved !== oid) return { ok: false, error: `${label} ${oid} is not a retrievable full commit object` };
+  return { ok: true };
+}
+
+async function committedPaths(repoRoot, from, to) {
+  const output = await gitOut(repoRoot, [
+    "diff", "--name-only", "--no-renames", "-z", from, to, "--",
+  ], false);
+  if (output === null) return null;
+  return output.split("\0").filter((path) => path !== "").sort();
+}
+
+async function candidateGitFacts({ candidateRef, repoRoot, grantedBase, scope, exclusions = [] }) {
+  const parsed = parseCandidateRef(candidateRef);
+  if (!parsed.ok) return parsed;
+  const { taskBaseOid, candidateOid } = parsed.candidate;
+  if (typeof repoRoot !== "string" || repoRoot.trim() === "") {
+    return { ok: false, error: "candidate eligibility requires an exact repository root" };
+  }
+  const observedRoot = await findRepoRoot(repoRoot);
+  if (observedRoot === null) return { ok: false, error: "candidate repository is not a retrievable Git worktree" };
+  if (observedRoot !== repoRoot) return { ok: false, error: "repoRoot is not the exact Git repository root" };
+  if (typeof grantedBase !== "string" || !FULL_SHA.test(grantedBase) || grantedBase.length !== candidateOid.length) {
+    return { ok: false, error: "granted candidate base must be a full Git commit oid in the repository object format" };
+  }
+  const scopeCheck = await validateScope(repoRoot, scope, exclusions);
+  if (!scopeCheck.ok) return { ok: false, error: `candidate scope is invalid: ${scopeCheck.error}` };
+
+  for (const [oid, label] of [
+    [taskBaseOid, "task base"],
+    [candidateOid, "candidate"],
+    [grantedBase, "granted candidate base"],
+  ]) {
+    const check = await exactCommit(repoRoot, oid, label);
+    if (!check.ok) return check;
+  }
+
+  const parentLine = await gitOut(repoRoot, ["rev-list", "--parents", "-n", "1", candidateOid]);
+  if (parentLine === null) return { ok: false, error: "candidate parentage is not retrievable" };
+  const parentParts = parentLine.split(/\s+/);
+  if (parentParts.length !== 2) return { ok: false, error: "candidate must be a single-parent commit" };
+  if (parentParts[1] !== grantedBase) {
+    return { ok: false, error: "candidate parent does not equal the granted candidate base" };
+  }
+
+  if (await gitOut(repoRoot, ["merge-base", "--is-ancestor", taskBaseOid, candidateOid]) === null) {
+    return { ok: false, error: "candidate is not a descendant of the referenced task base" };
+  }
+  const lineage = await gitOut(repoRoot, ["rev-list", "--parents", candidateOid, `^${taskBaseOid}`]);
+  if (lineage === null) return { ok: false, error: "candidate ancestry is not retrievable" };
+  if (lineage.split("\n").filter(Boolean).some((line) => line.trim().split(/\s+/).length !== 2)) {
+    return { ok: false, error: "candidate history from task base is not linear" };
+  }
+
+  const head = await gitOut(repoRoot, ["rev-parse", "--verify", "HEAD"]);
+  if (head !== candidateOid) return { ok: false, error: "current HEAD does not equal the candidate oid" };
+  const status = await gitOut(repoRoot, ["status", "--porcelain=v1", "--untracked-files=all"], false);
+  if (status === null) return { ok: false, error: "candidate worktree cleanliness is not observable" };
+  if (status !== "") return { ok: false, error: "candidate worktree is not clean (staged, unstaged, or untracked residue exists)" };
+
+  const [currentPaths, cumulativePaths] = await Promise.all([
+    committedPaths(repoRoot, grantedBase, candidateOid),
+    committedPaths(repoRoot, taskBaseOid, candidateOid),
+  ]);
+  if (currentPaths === null || cumulativePaths === null) {
+    return { ok: false, error: "candidate changed paths are not retrievable" };
+  }
+  if (cumulativePaths.length === 0) return { ok: false, error: "candidate cumulative diff has no changed paths" };
+  for (const path of [...new Set([...currentPaths, ...cumulativePaths])]) {
+    if (!isPathInScope(path, scope, exclusions)) {
+      return { ok: false, error: `candidate changed path ${JSON.stringify(path)} is outside the granted scope` };
+    }
+  }
+  const diff = await gitOut(repoRoot, [
+    "diff", "--binary", "--full-index", "--no-color", "--no-ext-diff",
+    taskBaseOid, candidateOid, "--",
+  ]);
+  if (diff === null) return { ok: false, error: "candidate cumulative diff is not retrievable" };
+  return { ok: true, candidate: parsed.candidate, currentPaths, cumulativePaths, diff };
+}
+
+export async function checkCandidateEligibility(facts) {
+  const check = await candidateGitFacts(facts ?? {});
+  return check.ok ? { ok: true } : { ok: false, error: check.error };
+}
+
+const EVIDENCE_FIELDS = [
+  "version", "evidence_id", "project_id", "task_id", "task_revision",
+  "assignment_id", "writer_id", "parent_id", "repository_root", "workspace_id",
+  "workspace_protocol_digest", "candidate_ref", "cumulative_diff",
+  "changed_paths", "scope", "verification", "post_commit", "clean",
+  "residual_risks", "unfinished_dependencies",
+];
+
+function authorityScope(authority) {
+  const grant = authority?.envelope ?? authority;
+  const scope = authority?.scope ?? grant?.scope;
+  const exclusions = authority?.exclusions ?? grant?.exclusions ?? [];
+  if (typeof scope !== "string" || scope === "" || !Array.isArray(exclusions)) {
+    return { ok: false, error: "candidate evidence validation requires the granted scope and exclusions" };
+  }
+  return { ok: true, scope, exclusions };
+}
+
+function validateCandidateEvidenceShape(object, authority) {
+  const closed = checkClosedObject(object, EVIDENCE_FIELDS, "candidate evidence");
+  if (!closed.ok) return closed;
+  if (object.version !== 1) return { ok: false, error: "candidate evidence version must be exactly 1" };
+  for (const field of [
+    "evidence_id", "project_id", "task_id", "task_revision", "writer_id",
+    "repository_root", "workspace_id",
+  ]) {
+    const check = checkNonemptyString(object[field], field);
+    if (!check.ok) return check;
+  }
+  for (const field of ["assignment_id", "parent_id"]) {
+    if (object[field] !== null) {
+      const check = checkNonemptyString(object[field], field);
+      if (!check.ok) return check;
+    }
+  }
+  if ((object.assignment_id === null) !== (object.parent_id === null)) {
+    return { ok: false, error: "assignment_id and parent_id must both be nonempty strings or both be null for Lead tiny" };
+  }
+  if (typeof object.workspace_protocol_digest !== "string" || !SHA256_HEX.test(object.workspace_protocol_digest)) {
+    return { ok: false, error: "workspace_protocol_digest must be a full sha256 hex digest" };
+  }
+  const candidate = parseCandidateRef(object.candidate_ref);
+  if (!candidate.ok) return { ok: false, error: `candidate evidence ${candidate.error}` };
+
+  let check = checkClosedObject(object.cumulative_diff,
+    ["evidence_id", "base_oid", "candidate_oid", "diff"], "candidate evidence cumulative_diff");
+  if (!check.ok) return check;
+  check = checkNonemptyString(object.cumulative_diff.evidence_id, "cumulative_diff.evidence_id");
+  if (!check.ok) return check;
+  if (object.cumulative_diff.base_oid !== candidate.candidate.taskBaseOid
+      || object.cumulative_diff.candidate_oid !== candidate.candidate.candidateOid) {
+    return { ok: false, error: "cumulative_diff object ids must match candidate_ref" };
+  }
+  check = checkNonemptyString(object.cumulative_diff.diff, "cumulative_diff.diff");
+  if (!check.ok) return check;
+
+  check = checkStringList(object.changed_paths, "changed_paths", { min: 1, unique: true });
+  if (!check.ok) return check;
+  if (!sameList(object.changed_paths, [...object.changed_paths].sort())) {
+    return { ok: false, error: "changed_paths must be sorted canonically" };
+  }
+  const granted = authorityScope(authority);
+  if (!granted.ok) return granted;
+  for (const path of object.changed_paths) {
+    if (path.includes("\\") || isAbsolute(path) || posix.normalize(path) !== path
+        || path === "." || path === ".." || path.startsWith("../")) {
+      return { ok: false, error: `changed path ${JSON.stringify(path)} must be canonical and repository-relative` };
+    }
+    if (!isPathInScope(path, granted.scope, granted.exclusions)) {
+      return { ok: false, error: `changed path ${JSON.stringify(path)} is outside the granted scope` };
+    }
+  }
+
+  check = checkClosedObject(object.scope, [
+    "writable_scope", "exclusions", "current_result", "cumulative_result", "evidence_refs",
+  ], "candidate evidence scope");
+  if (!check.ok) return check;
+  if (object.scope.writable_scope !== granted.scope || !sameList(object.scope.exclusions, granted.exclusions)) {
+    return { ok: false, error: "candidate evidence scope and exclusions do not match the granted scope" };
+  }
+  for (const field of ["current_result", "cumulative_result"]) {
+    if (!["PASS", "FAIL"].includes(object.scope[field])) {
+      return { ok: false, error: `scope.${field} must be PASS or FAIL` };
+    }
+  }
+  check = checkStringList(object.scope.evidence_refs, "scope.evidence_refs", { min: 1, unique: true });
+  if (!check.ok) return check;
+
+  if (!Array.isArray(object.verification) || object.verification.length === 0) {
+    return { ok: false, error: "verification must be a nonempty array" };
+  }
+  const verificationIds = [];
+  for (const [index, item] of object.verification.entries()) {
+    check = checkClosedObject(item, ["evidence_id", "command", "result", "output"], `verification[${index}]`);
+    if (!check.ok) return check;
+    for (const field of ["evidence_id", "command"]) {
+      check = checkNonemptyString(item[field], `verification[${index}].${field}`);
+      if (!check.ok) return check;
+    }
+    if (!COMMAND_RESULTS.includes(item.result)) {
+      return { ok: false, error: `verification[${index}].result must be PASS|FAIL|NOT_RUN` };
+    }
+    if (typeof item.output !== "string") return { ok: false, error: `verification[${index}].output must be a string` };
+    verificationIds.push(item.evidence_id);
+  }
+  if (new Set(verificationIds).size !== verificationIds.length) {
+    return { ok: false, error: "verification evidence_id values must not repeat" };
+  }
+
+  check = checkClosedObject(object.post_commit,
+    ["head_oid", "verification_evidence_ids"], "candidate evidence post_commit");
+  if (!check.ok) return check;
+  if (object.post_commit.head_oid !== candidate.candidate.candidateOid) {
+    return { ok: false, error: "post_commit.head_oid must equal the candidate oid" };
+  }
+  check = checkStringList(object.post_commit.verification_evidence_ids,
+    "post_commit.verification_evidence_ids", { min: 1, unique: true });
+  if (!check.ok) return check;
+  if (!sameList(object.post_commit.verification_evidence_ids, verificationIds)) {
+    return { ok: false, error: "post_commit must bind every verification evidence id in order" };
+  }
+
+  check = checkClosedObject(object.clean,
+    ["evidence_id", "command", "result", "output"], "candidate evidence clean");
+  if (!check.ok) return check;
+  check = checkNonemptyString(object.clean.evidence_id, "clean.evidence_id");
+  if (!check.ok) return check;
+  if (object.clean.command !== "git status --porcelain=v1 --untracked-files=all") {
+    return { ok: false, error: "clean.command must be exactly git status --porcelain=v1 --untracked-files=all" };
+  }
+  if (!["PASS", "FAIL"].includes(object.clean.result)) {
+    return { ok: false, error: "clean.result must be PASS or FAIL" };
+  }
+  if (typeof object.clean.output !== "string") return { ok: false, error: "clean.output must be a string" };
+  for (const field of ["residual_risks", "unfinished_dependencies"]) {
+    check = checkStringList(object[field], field);
+    if (!check.ok) return check;
+  }
+  return { ok: true, evidence: object };
+}
+
+export function parseCandidateEvidence(text, authority) {
+  return parseV1Block(
+    text, CANDIDATE_EVIDENCE_BEGIN, "candidate evidence", "evidence",
+    (object) => validateCandidateEvidenceShape(object, authority),
+  );
+}
+
+const REVIEW_FIELDS = [
+  "version", "review_result_id", "reviewer_id", "reviewer_assignment_id",
+  "candidate_ref", "mandate", "commands", "evidence", "coverage", "gaps",
+  "outcome", "findings", "correction_of", "correction_classifications",
+];
+
+function validateReviewShape(object) {
+  let check = checkClosedObject(object, REVIEW_FIELDS, "review");
+  if (!check.ok) return check;
+  if (object.version !== 1) return { ok: false, error: "review version must be exactly 1" };
+  for (const field of ["review_result_id", "reviewer_id", "reviewer_assignment_id"]) {
+    check = checkNonemptyString(object[field], field);
+    if (!check.ok) return check;
+  }
+  const candidate = parseCandidateRef(object.candidate_ref);
+  if (!candidate.ok) return { ok: false, error: `review ${candidate.error}` };
+  if (object.mandate !== "NEUTRAL_FALSIFICATION") {
+    return { ok: false, error: "review mandate must be exactly NEUTRAL_FALSIFICATION" };
+  }
+  if (!Array.isArray(object.commands) || object.commands.length === 0) {
+    return { ok: false, error: "review commands must be a nonempty array" };
+  }
+  for (const [index, command] of object.commands.entries()) {
+    check = checkClosedObject(command, ["command", "result", "output_ref"], `review commands[${index}]`);
+    if (!check.ok) return check;
+    for (const field of ["command", "output_ref"]) {
+      check = checkNonemptyString(command[field], `review commands[${index}].${field}`);
+      if (!check.ok) return check;
+    }
+    if (!COMMAND_RESULTS.includes(command.result)) {
+      return { ok: false, error: `review commands[${index}].result must be PASS|FAIL|NOT_RUN` };
+    }
+  }
+  for (const [field, min] of [["evidence", 1], ["coverage", 1], ["gaps", 0]]) {
+    check = checkStringList(object[field], field, { min });
+    if (!check.ok) return check;
+  }
+  if (!["APPROVE", "FINDINGS"].includes(object.outcome)) {
+    return { ok: false, error: "review outcome must be exactly APPROVE or FINDINGS" };
+  }
+  if (!Array.isArray(object.findings)) return { ok: false, error: "review findings must be an array" };
+  const findingIds = [];
+  for (const [index, finding] of object.findings.entries()) {
+    check = checkClosedObject(finding,
+      ["finding_id", "severity", "statement", "impact", "evidence", "scope"], `finding[${index}]`);
+    if (!check.ok) return check;
+    for (const field of ["finding_id", "statement", "impact", "scope"]) {
+      check = checkNonemptyString(finding[field], `finding[${index}].${field}`);
+      if (!check.ok) return check;
+    }
+    if (!["BLOCKER", "NON_BLOCKING"].includes(finding.severity)) {
+      return { ok: false, error: `finding[${index}].severity must be BLOCKER or NON_BLOCKING` };
+    }
+    check = checkStringList(finding.evidence, `finding[${index}].evidence`, { min: 1 });
+    if (!check.ok) return check;
+    findingIds.push(finding.finding_id);
+  }
+  if (new Set(findingIds).size !== findingIds.length) {
+    return { ok: false, error: "finding_id values must be stable and unique within a review" };
+  }
+  if (object.outcome === "APPROVE" && object.findings.length !== 0) {
+    return { ok: false, error: "APPROVE requires an empty findings array" };
+  }
+  if (object.outcome === "FINDINGS" && object.findings.length === 0) {
+    return { ok: false, error: "FINDINGS requires at least one finding" };
+  }
+
+  const correction = Object.prototype.hasOwnProperty.call(object, "correction_of");
+  const classifications = Object.prototype.hasOwnProperty.call(object, "correction_classifications");
+  if (correction !== classifications) {
+    return { ok: false, error: "correction reviews require both correction_of and correction_classifications" };
+  }
+  if (correction) {
+    check = checkNonemptyString(object.correction_of, "correction_of");
+    if (!check.ok) return check;
+    if (!Array.isArray(object.correction_classifications) || object.correction_classifications.length === 0) {
+      return { ok: false, error: "correction_classifications must be a nonempty array on a correction review" };
+    }
+    const classified = [];
+    for (const [index, classification] of object.correction_classifications.entries()) {
+      check = checkClosedObject(classification,
+        ["finding_id", "classification", "evidence"], `correction_classifications[${index}]`);
+      if (!check.ok) return check;
+      for (const field of ["finding_id", "evidence"]) {
+        check = checkNonemptyString(classification[field], `correction_classifications[${index}].${field}`);
+        if (!check.ok) return check;
+      }
+      if (!["resolved", "open", "obsolete"].includes(classification.classification)) {
+        return { ok: false, error: `correction_classifications[${index}].classification must be resolved|open|obsolete` };
+      }
+      classified.push(classification.finding_id);
+    }
+    if (new Set(classified).size !== classified.length) {
+      return { ok: false, error: "correction classification finding ids must not repeat" };
+    }
+  }
+  return { ok: true, review: object };
+}
+
+export function parseReview(text) {
+  return parseV1Block(text, REVIEW_BEGIN, "review", "review", validateReviewShape);
+}
+
+export function reviewValidForCandidate(review, candidateId) {
+  return validateReviewShape(review).ok
+    && parseCandidateRef(candidateId).ok
+    && review.candidate_ref === candidateId;
+}
+
+const VERDICT_FIELDS = [
+  "version", "verdict_id", "project_id", "task_id", "task_revision",
+  "assignment_id", "repository_root", "workspace_id", "workspace_protocol_digest",
+  "candidate_ref", "origin", "scope_result", "scope_evidence", "verification",
+  "review", "unfinished_dependencies", "residual_risks", "human_decisions",
+  "verdict", "rationale",
+];
+
+// Computes rather than trusts the declared enum. Missing/failed technical
+// evidence always wins; only an otherwise-ready document can need a Human;
+// READY is the remainder. The enum itself is never acceptance.
+export function verdictStatus(document) {
+  if (!isRecord(document)) return "NOT_READY";
+  const candidate = parseCandidateRef(document.candidate_ref);
+  const review = document.review;
+  const technicalFailure = !candidate.ok
+    || !isRecord(document.origin)
+    || checkNonemptyString(document.origin.evidence_id, "origin.evidence_id").ok === false
+    || document.scope_result !== "PASS"
+    || !Array.isArray(document.scope_evidence)
+    || document.scope_evidence.length === 0
+    || document.scope_evidence.some((item) => typeof item !== "string" || item.trim() === "")
+    || !Array.isArray(document.verification)
+    || document.verification.length === 0
+    || document.verification.some((item) => !isRecord(item)
+      || checkNonemptyString(item.command, "verification.command").ok === false
+      || item.result !== "PASS"
+      || checkNonemptyString(item.output_ref, "verification.output_ref").ok === false)
+    || !Array.isArray(document.unfinished_dependencies)
+    || document.unfinished_dependencies.length !== 0
+    || !isRecord(review)
+    || (review?.required === true
+      ? checkNonemptyString(review.review_result_id, "review_result_id").ok === false
+        || review.candidate_ref !== document.candidate_ref
+        || review.outcome !== "APPROVE"
+        || !Array.isArray(review.open_findings)
+        || review.open_findings.length !== 0
+      : review?.required !== false
+        || review.review_result_id !== null
+        || review.candidate_ref !== null
+        || review.outcome !== "NOT_REQUIRED"
+        || !Array.isArray(review.open_findings)
+        || review.open_findings.length !== 0);
+  if (technicalFailure) return "NOT_READY";
+  if (!Array.isArray(document.human_decisions)
+      || document.human_decisions.some((decision) => !isRecord(decision)
+        || !["RESOLVED", "UNRESOLVED"].includes(decision.status))) {
+    return "NOT_READY";
+  }
+  if (document.human_decisions.some((decision) => decision.status === "UNRESOLVED")) return "NEEDS_HUMAN";
+  return "READY";
+}
+
+function validateVerdictShape(object) {
+  let check = checkClosedObject(object, VERDICT_FIELDS, "verdict");
+  if (!check.ok) return check;
+  if (object.version !== 1) return { ok: false, error: "verdict version must be exactly 1" };
+  for (const field of [
+    "verdict_id", "project_id", "task_id", "task_revision", "repository_root",
+    "workspace_id", "rationale",
+  ]) {
+    check = checkNonemptyString(object[field], field);
+    if (!check.ok) return check;
+  }
+  if (object.assignment_id !== null) {
+    check = checkNonemptyString(object.assignment_id, "assignment_id");
+    if (!check.ok) return check;
+  }
+  if (typeof object.workspace_protocol_digest !== "string" || !SHA256_HEX.test(object.workspace_protocol_digest)) {
+    return { ok: false, error: "workspace_protocol_digest must be a full sha256 hex digest" };
+  }
+  const candidate = parseCandidateRef(object.candidate_ref);
+  if (!candidate.ok) return { ok: false, error: `verdict ${candidate.error}` };
+
+  check = checkClosedObject(object.origin, ["kind", "evidence_id"], "verdict origin");
+  if (!check.ok) return check;
+  if (!["PEER_HANDOFF", "LEAD_TINY"].includes(object.origin.kind)) {
+    return { ok: false, error: "origin.kind must be PEER_HANDOFF or LEAD_TINY" };
+  }
+  check = checkNonemptyString(object.origin.evidence_id, "origin.evidence_id");
+  if (!check.ok) return check;
+  if (object.origin.kind === "PEER_HANDOFF" && object.assignment_id === null) {
+    return { ok: false, error: "PEER_HANDOFF verdict requires a non-null assignment_id" };
+  }
+  if (object.origin.kind === "LEAD_TINY" && object.assignment_id !== null) {
+    return { ok: false, error: "LEAD_TINY verdict requires assignment_id null" };
+  }
+  if (!["PASS", "FAIL"].includes(object.scope_result)) {
+    return { ok: false, error: "scope_result must be PASS or FAIL" };
+  }
+  check = checkStringList(object.scope_evidence, "scope_evidence", { unique: true });
+  if (!check.ok) return check;
+
+  if (!Array.isArray(object.verification)) return { ok: false, error: "verdict verification must be an array" };
+  for (const [index, item] of object.verification.entries()) {
+    check = checkClosedObject(item, ["command", "result", "output_ref"], `verdict verification[${index}]`);
+    if (!check.ok) return check;
+    for (const field of ["command", "output_ref"]) {
+      check = checkNonemptyString(item[field], `verdict verification[${index}].${field}`);
+      if (!check.ok) return check;
+    }
+    if (!COMMAND_RESULTS.includes(item.result)) {
+      return { ok: false, error: `verdict verification[${index}].result must be PASS|FAIL|NOT_RUN` };
+    }
+  }
+
+  check = checkClosedObject(object.review,
+    ["required", "review_result_id", "candidate_ref", "outcome", "open_findings"], "verdict review");
+  if (!check.ok) return check;
+  if (typeof object.review.required !== "boolean") return { ok: false, error: "review.required must be a boolean" };
+  check = checkStringList(object.review.open_findings, "review.open_findings", { unique: true });
+  if (!check.ok) return check;
+  if (object.review.required) {
+    check = checkNonemptyString(object.review.review_result_id, "review.review_result_id");
+    if (!check.ok) return check;
+    const reviewCandidate = parseCandidateRef(object.review.candidate_ref);
+    if (!reviewCandidate.ok) return { ok: false, error: `verdict review ${reviewCandidate.error}` };
+    if (!["APPROVE", "FINDINGS"].includes(object.review.outcome)) {
+      return { ok: false, error: "required review outcome must be APPROVE or FINDINGS" };
+    }
+  } else if (object.review.review_result_id !== null || object.review.candidate_ref !== null
+      || object.review.outcome !== "NOT_REQUIRED" || object.review.open_findings.length !== 0) {
+    return { ok: false, error: "non-required review must be exactly null/null/NOT_REQUIRED with no open findings" };
+  }
+
+  for (const field of ["unfinished_dependencies", "residual_risks"]) {
+    check = checkStringList(object[field], field);
+    if (!check.ok) return check;
+  }
+  if (!Array.isArray(object.human_decisions)) return { ok: false, error: "human_decisions must be an array" };
+  const decisionIds = [];
+  for (const [index, decision] of object.human_decisions.entries()) {
+    check = checkClosedObject(decision,
+      ["decision_id", "status", "evidence_ref"], `human_decisions[${index}]`);
+    if (!check.ok) return check;
+    for (const field of ["decision_id", "evidence_ref"]) {
+      check = checkNonemptyString(decision[field], `human_decisions[${index}].${field}`);
+      if (!check.ok) return check;
+    }
+    if (!["RESOLVED", "UNRESOLVED"].includes(decision.status)) {
+      return { ok: false, error: `human_decisions[${index}].status must be RESOLVED or UNRESOLVED` };
+    }
+    decisionIds.push(decision.decision_id);
+  }
+  if (new Set(decisionIds).size !== decisionIds.length) {
+    return { ok: false, error: "human decision ids must not repeat" };
+  }
+  if (!["NOT_READY", "NEEDS_HUMAN", "READY"].includes(object.verdict)) {
+    return { ok: false, error: "verdict must be NOT_READY|NEEDS_HUMAN|READY" };
+  }
+  const computed = verdictStatus(object);
+  if (object.verdict !== computed) {
+    return { ok: false, error: `declared verdict ${object.verdict} violates precedence; computed verdict is ${computed}` };
+  }
+  return { ok: true, verdict: object };
+}
+
+export function parseVerdict(text) {
+  return parseV1Block(text, VERDICT_BEGIN, "verdict", "verdict", validateVerdictShape);
+}
+
+function validateAcceptanceShape(object) {
+  let check = checkClosedObject(object,
+    ["version", "decision", "candidate_ref", "project_verdict_id"], "local acceptance");
+  if (!check.ok) return check;
+  if (object.version !== 1) return { ok: false, error: "local acceptance version must be exactly 1" };
+  if (object.decision !== "LOCAL_ACCEPT") {
+    return { ok: false, error: "local acceptance decision must be exactly LOCAL_ACCEPT" };
+  }
+  const candidate = parseCandidateRef(object.candidate_ref);
+  if (!candidate.ok) return { ok: false, error: `local acceptance ${candidate.error}` };
+  check = checkNonemptyString(object.project_verdict_id, "project_verdict_id");
+  if (!check.ok) return check;
+  return { ok: true, acceptance: object };
+}
+
+// `source` is mandatory: only Pi's direct interactive Human route is accepted.
+// A private non-enumerable mark lets full revalidation require this parser
+// without adding a route field to the closed acceptance document.
+export function parseAcceptance(text, source) {
+  const parsed = parseV1Block(
+    text, ACCEPTANCE_BEGIN, "local acceptance", "acceptance", validateAcceptanceShape,
+  );
+  if (!parsed.ok || parsed.acceptance === null) return parsed;
+  if (source !== "interactive") {
+    return { ok: false, error: "local acceptance requires the direct Human interactive route" };
+  }
+  Object.defineProperty(parsed.acceptance, DIRECT_ACCEPTANCE, { value: true });
+  return parsed;
+}
+
+function acceptanceAuthority(authority) {
+  if (!isRecord(authority) || !isRecord(authority.envelope)) {
+    return { ok: false, error: "acceptance requires the validated candidate authority" };
+  }
+  const envelope = validateEnvelopeShape(authority.envelope);
+  if (!envelope.ok) return { ok: false, error: `candidate authority invalid: ${envelope.error}` };
+  const grant = envelope.envelope;
+  if (!["peer", "lead_tiny"].includes(grant.grant_kind)) {
+    return { ok: false, error: "acceptance authority must be a peer or lead_tiny candidate grant" };
+  }
+  if (!grant.capabilities.includes("local_commit")) {
+    return { ok: false, error: "candidate authority must include local_commit" };
+  }
+  for (const [field, value] of [
+    ["taskRevision", authority.taskRevision],
+    ["workspaceId", authority.workspaceId],
+  ]) {
+    const check = checkNonemptyString(value, `authority.${field}`);
+    if (!check.ok) return check;
+  }
+  if (typeof authority.reviewRequired !== "boolean") {
+    return { ok: false, error: "authority.reviewRequired must be a boolean" };
+  }
+  if (grant.grant_kind === "peer") {
+    for (const field of ["assignmentId", "parentId"]) {
+      const check = checkNonemptyString(authority[field], `authority.${field}`);
+      if (!check.ok) return check;
+    }
+  } else if (authority.assignmentId !== null || authority.parentId !== null) {
+    return { ok: false, error: "lead_tiny authority requires null assignmentId and parentId" };
+  }
+  for (const [field, value] of [["task_id", grant.task_id], ["agent_id", grant.agent_id]]) {
+    const check = checkNonemptyString(value, `authority envelope ${field}`);
+    if (!check.ok) return check;
+  }
+  const scope = authorityScope(authority);
+  if (!scope.ok) return scope;
+  return { ok: true, grant, scope: scope.scope, exclusions: scope.exclusions };
+}
+
+function mismatch(label, actual, expected) {
+  return actual === expected
+    ? null
+    : { ok: false, error: `${label} ${JSON.stringify(actual)} does not match ${JSON.stringify(expected)}` };
+}
+
+// The sole acceptance gate. It revalidates all closed documents, the pinned
+// protocol, exact context and evidence references, then current Git objects,
+// HEAD, cumulative/current scope, canonical diff, and porcelain cleanliness.
+// Success is only {ok:true}; there is deliberately no write or stored state.
+export async function validateAcceptance({
+  acceptance, verdict, review, evidence, authority, repoRoot, protocolPin,
+} = {}) {
+  if (!isRecord(acceptance) || acceptance[DIRECT_ACCEPTANCE] !== true) {
+    return { ok: false, error: "acceptance must be a valid block parsed from the direct Human interactive route" };
+  }
+  let check = validateAcceptanceShape(acceptance);
+  if (!check.ok) return check;
+  const auth = acceptanceAuthority(authority);
+  if (!auth.ok) return auth;
+  check = validateCandidateEvidenceShape(evidence, authority);
+  if (!check.ok) return { ok: false, error: `candidate evidence invalid: ${check.error}` };
+  check = validateVerdictShape(verdict);
+  if (!check.ok) return { ok: false, error: `verdict invalid: ${check.error}` };
+
+  if (typeof repoRoot !== "string" || repoRoot.trim() === "") {
+    return { ok: false, error: "acceptance requires the exact repository root" };
+  }
+  if (!isRecord(protocolPin) || protocolPin.repoRoot !== repoRoot
+      || typeof protocolPin.projectId !== "string" || protocolPin.projectId.trim() === ""
+      || typeof protocolPin.version !== "number"
+      || typeof protocolPin.digest !== "string" || !SHA256_HEX.test(protocolPin.digest)) {
+    return { ok: false, error: "acceptance requires a complete exact Workspace Protocol pin" };
+  }
+  const currentProtocol = await readAndValidateProtocol(repoRoot);
+  if (!currentProtocol.ok) return { ok: false, error: `workspace protocol revalidation failed: ${currentProtocol.error}` };
+  if (currentProtocol.protocol.digest !== protocolPin.digest
+      || currentProtocol.protocol.meta.project_id !== protocolPin.projectId
+      || currentProtocol.protocol.meta.version !== protocolPin.version) {
+    return { ok: false, error: "current Workspace Protocol does not match the acceptance protocol pin" };
+  }
+
+  const expectedContext = [
+    ["candidate evidence project_id", evidence.project_id, protocolPin.projectId],
+    ["verdict project_id", verdict.project_id, protocolPin.projectId],
+    ["candidate evidence task_id", evidence.task_id, auth.grant.task_id],
+    ["verdict task_id", verdict.task_id, auth.grant.task_id],
+    ["candidate evidence task_revision", evidence.task_revision, authority.taskRevision],
+    ["verdict task_revision", verdict.task_revision, authority.taskRevision],
+    ["candidate evidence assignment_id", evidence.assignment_id, authority.assignmentId],
+    ["verdict assignment_id", verdict.assignment_id, authority.assignmentId],
+    ["candidate evidence repository_root", evidence.repository_root, repoRoot],
+    ["verdict repository_root", verdict.repository_root, repoRoot],
+    ["candidate evidence workspace_id", evidence.workspace_id, authority.workspaceId],
+    ["verdict workspace_id", verdict.workspace_id, authority.workspaceId],
+    ["candidate evidence protocol digest", evidence.workspace_protocol_digest, protocolPin.digest],
+    ["verdict protocol digest", verdict.workspace_protocol_digest, protocolPin.digest],
+    ["candidate evidence writer_id", evidence.writer_id, auth.grant.agent_id],
+    ["candidate evidence parent_id", evidence.parent_id, authority.parentId],
+  ];
+  for (const [label, actual, expected] of expectedContext) {
+    const failed = mismatch(label, actual, expected);
+    if (failed) return failed;
+  }
+
+  if (acceptance.candidate_ref !== evidence.candidate_ref
+      || verdict.candidate_ref !== evidence.candidate_ref) {
+    return { ok: false, error: "acceptance, evidence, and verdict must bind the exact same candidate" };
+  }
+  if (acceptance.project_verdict_id !== verdict.verdict_id) {
+    return { ok: false, error: "local acceptance project_verdict_id does not match the immutable verdict id" };
+  }
+  if (verdict.origin.evidence_id !== evidence.evidence_id) {
+    return { ok: false, error: "verdict origin does not reference the candidate evidence id" };
+  }
+  const expectedOrigin = auth.grant.grant_kind === "peer" ? "PEER_HANDOFF" : "LEAD_TINY";
+  if (verdict.origin.kind !== expectedOrigin) {
+    return { ok: false, error: `verdict origin must be ${expectedOrigin} for this authority` };
+  }
+  if (verdict.verdict !== "READY" || verdictStatus(verdict) !== "READY") {
+    return { ok: false, error: "Local Acceptance requires a READY verdict after precedence revalidation" };
+  }
+
+  if (evidence.scope.current_result !== "PASS" || evidence.scope.cumulative_result !== "PASS") {
+    return { ok: false, error: "candidate evidence current and cumulative scope results must both PASS" };
+  }
+  if (evidence.verification.some((item) => item.result !== "PASS")) {
+    return { ok: false, error: "every candidate verification result must PASS" };
+  }
+  if (evidence.clean.result !== "PASS" || evidence.clean.output !== "") {
+    return { ok: false, error: "candidate evidence clean check must PASS with empty porcelain output" };
+  }
+  if (evidence.unfinished_dependencies.length !== 0) {
+    return { ok: false, error: "candidate evidence has unfinished dependencies" };
+  }
+  if (!sameList(verdict.unfinished_dependencies, evidence.unfinished_dependencies)
+      || !sameList(verdict.residual_risks, evidence.residual_risks)) {
+    return { ok: false, error: "verdict dependencies and residual risks must match candidate evidence" };
+  }
+
+  const scopeRefs = [evidence.cumulative_diff.evidence_id, ...evidence.scope.evidence_refs].sort();
+  if (!sameList([...verdict.scope_evidence].sort(), scopeRefs)) {
+    return { ok: false, error: "verdict scope evidence references do not exactly bind candidate evidence" };
+  }
+  if (verdict.verification.length !== evidence.verification.length) {
+    return { ok: false, error: "verdict verification references do not cover every candidate verification" };
+  }
+  for (const item of verdict.verification) {
+    const source = evidence.verification.find((entry) => entry.evidence_id === item.output_ref);
+    if (!source || source.command !== item.command || source.result !== item.result) {
+      return { ok: false, error: `verdict verification reference ${JSON.stringify(item.output_ref)} does not bind matching candidate evidence` };
+    }
+  }
+
+  if (verdict.review.required !== authority.reviewRequired) {
+    return { ok: false, error: "verdict review requirement does not match the protocol/class authority fact" };
+  }
+  if (authority.reviewRequired) {
+    check = validateReviewShape(review);
+    if (!check.ok) return { ok: false, error: `required review invalid: ${check.error}` };
+    if (!reviewValidForCandidate(review, evidence.candidate_ref)) {
+      return { ok: false, error: "required review is stale for the current candidate" };
+    }
+    if (review.reviewer_id === evidence.writer_id
+        || review.reviewer_assignment_id === authority.assignmentId) {
+      return { ok: false, error: "required review is not independent from the candidate writer/assignment" };
+    }
+    if (review.correction_classifications?.some((item) => item.classification === "open")) {
+      return { ok: false, error: "required correction review still has an open finding" };
+    }
+    if (verdict.review.review_result_id !== review.review_result_id
+        || verdict.review.candidate_ref !== review.candidate_ref
+        || verdict.review.outcome !== review.outcome
+        || !sameList(verdict.review.open_findings, review.findings.map((finding) => finding.finding_id))) {
+      return { ok: false, error: "verdict review state does not exactly bind the required review" };
+    }
+  } else if (review !== null && review !== undefined) {
+    return { ok: false, error: "no review document is valid when the protocol/class says review is not required" };
+  }
+
+  const facts = await candidateGitFacts({
+    candidateRef: evidence.candidate_ref,
+    repoRoot,
+    grantedBase: auth.grant.base,
+    scope: auth.scope,
+    exclusions: auth.exclusions,
+  });
+  if (!facts.ok) return facts;
+  if (!sameList(evidence.changed_paths, facts.cumulativePaths)) {
+    return { ok: false, error: "candidate evidence changed_paths do not match the current cumulative Git diff" };
+  }
+  if (evidence.cumulative_diff.diff !== facts.diff) {
+    return { ok: false, error: "candidate evidence cumulative_diff does not match the exact Git objects" };
+  }
+  return { ok: true };
 }
 
 // ─── Workspace Protocol ──────────────────────────────────────────────────────

@@ -2015,3 +2015,622 @@ test("command: declined confirmation and a new session clear the pending authori
     process.chdir(previous);
   }
 });
+
+// ─── Lát 6: Stable Candidate, review, verdict, Local Acceptance ─────────────
+
+const {
+  CANDIDATE_EVIDENCE_BEGIN,
+  CANDIDATE_EVIDENCE_END,
+  REVIEW_BEGIN,
+  REVIEW_END,
+  VERDICT_BEGIN,
+  VERDICT_END,
+  ACCEPTANCE_BEGIN,
+  ACCEPTANCE_END,
+  parseCandidateRef,
+  checkCandidateEligibility,
+  parseCandidateEvidence,
+  parseReview,
+  reviewValidForCandidate,
+  parseVerdict,
+  verdictStatus,
+  parseAcceptance,
+  validateAcceptance,
+} = extension;
+
+const blockText = (begin, end, doc) => `${begin}\n${JSON.stringify(doc, null, 2)}\n${end}`;
+const candidateRefOf = (base, candidate) => `git:v1:${base}:${candidate}`;
+
+async function commitCandidate(repo, path = "src/feature.go", content = "feature\n", message = "candidate") {
+  await writeFile(join(repo.dir, path), content);
+  await git(["add", "-A"], repo.dir);
+  await git(["commit", "-m", message], repo.dir);
+  return (await git(["rev-parse", "HEAD"], repo.dir)).stdout.trim();
+}
+
+const candidateAuthority = (repo, grantedBase, over = {}) => ({
+  envelope: {
+    version: 1,
+    grant_kind: "peer",
+    role: "peer",
+    issuer: "human",
+    agent_id: "peer-1",
+    task_id: "task-1",
+    objective: "Implement the candidate under src/",
+    capabilities: ["edit", "local_commit"],
+    scope: "src",
+    exclusions: [],
+    base: grantedBase,
+  },
+  taskRevision: "revision-1",
+  assignmentId: "assignment-1",
+  workspaceId: "workspace-1",
+  parentId: "lead-1",
+  reviewRequired: true,
+  ...over,
+});
+
+const protocolPinFor = (repo) => ({
+  repoRoot: repo.dir,
+  version: 1,
+  projectId: validMeta.project_id,
+  digest: digestOf(validProtocol),
+});
+
+async function candidateEvidenceDoc(repo, candidate, over = {}) {
+  const ref = candidateRefOf(repo.base, candidate);
+  const diff = (await git([
+    "diff", "--binary", "--full-index", "--no-color", "--no-ext-diff",
+    repo.base, candidate, "--",
+  ], repo.dir)).stdout.trim();
+  const changedPaths = (await git([
+    "diff", "--name-only", "--no-renames", repo.base, candidate, "--",
+  ], repo.dir)).stdout.trim().split("\n").filter(Boolean).sort();
+  return {
+    version: 1,
+    evidence_id: "candidate-evidence-1",
+    project_id: validMeta.project_id,
+    task_id: "task-1",
+    task_revision: "revision-1",
+    assignment_id: "assignment-1",
+    writer_id: "peer-1",
+    parent_id: "lead-1",
+    repository_root: repo.dir,
+    workspace_id: "workspace-1",
+    workspace_protocol_digest: digestOf(validProtocol),
+    candidate_ref: ref,
+    cumulative_diff: {
+      evidence_id: "diff-1",
+      base_oid: repo.base,
+      candidate_oid: candidate,
+      diff,
+    },
+    changed_paths: changedPaths,
+    scope: {
+      writable_scope: "src",
+      exclusions: [],
+      current_result: "PASS",
+      cumulative_result: "PASS",
+      evidence_refs: ["scope-current-1", "scope-cumulative-1"],
+    },
+    verification: [{
+      evidence_id: "verification-1",
+      command: "npm test",
+      result: "PASS",
+      output: "59 tests passed",
+    }],
+    post_commit: {
+      head_oid: candidate,
+      verification_evidence_ids: ["verification-1"],
+    },
+    clean: {
+      evidence_id: "clean-1",
+      command: "git status --porcelain=v1 --untracked-files=all",
+      result: "PASS",
+      output: "",
+    },
+    residual_risks: [],
+    unfinished_dependencies: [],
+    ...over,
+  };
+}
+
+const reviewDoc = (candidateRef, over = {}) => ({
+  version: 1,
+  review_result_id: "review-1",
+  reviewer_id: "reviewer-1",
+  reviewer_assignment_id: "review-assignment-1",
+  candidate_ref: candidateRef,
+  mandate: "NEUTRAL_FALSIFICATION",
+  commands: [{ command: "git show --stat", result: "PASS", output_ref: "review-command-1" }],
+  evidence: ["review-command-1"],
+  coverage: ["candidate identity", "cumulative diff", "verification evidence"],
+  gaps: [],
+  outcome: "APPROVE",
+  findings: [],
+  ...over,
+});
+
+const verdictDoc = (repo, candidate, over = {}) => {
+  const candidateRef = candidateRefOf(repo.base, candidate);
+  return {
+    version: 1,
+    verdict_id: "verdict-1",
+    project_id: validMeta.project_id,
+    task_id: "task-1",
+    task_revision: "revision-1",
+    assignment_id: "assignment-1",
+    repository_root: repo.dir,
+    workspace_id: "workspace-1",
+    workspace_protocol_digest: digestOf(validProtocol),
+    candidate_ref: candidateRef,
+    origin: { kind: "PEER_HANDOFF", evidence_id: "candidate-evidence-1" },
+    scope_result: "PASS",
+    scope_evidence: ["diff-1", "scope-current-1", "scope-cumulative-1"],
+    verification: [{ command: "npm test", result: "PASS", output_ref: "verification-1" }],
+    review: {
+      required: true,
+      review_result_id: "review-1",
+      candidate_ref: candidateRef,
+      outcome: "APPROVE",
+      open_findings: [],
+    },
+    unfinished_dependencies: [],
+    residual_risks: [],
+    human_decisions: [],
+    verdict: "READY",
+    rationale: "Every technical gate passes for the exact candidate.",
+    ...over,
+  };
+};
+
+const acceptanceDoc = (candidateRef, verdictId = "verdict-1") => ({
+  version: 1,
+  decision: "LOCAL_ACCEPT",
+  candidate_ref: candidateRef,
+  project_verdict_id: verdictId,
+});
+
+async function validAcceptanceChain(repo, candidate) {
+  const authority = candidateAuthority(repo, repo.base);
+  const evidenceDocument = await candidateEvidenceDoc(repo, candidate);
+  const reviewDocument = reviewDoc(evidenceDocument.candidate_ref);
+  const verdictDocument = verdictDoc(repo, candidate);
+  const acceptanceDocument = acceptanceDoc(evidenceDocument.candidate_ref);
+  const evidence = parseCandidateEvidence(
+    blockText(CANDIDATE_EVIDENCE_BEGIN, CANDIDATE_EVIDENCE_END, evidenceDocument),
+    authority,
+  );
+  const review = parseReview(blockText(REVIEW_BEGIN, REVIEW_END, reviewDocument));
+  const verdict = parseVerdict(blockText(VERDICT_BEGIN, VERDICT_END, verdictDocument));
+  const acceptance = parseAcceptance(
+    blockText(ACCEPTANCE_BEGIN, ACCEPTANCE_END, acceptanceDocument),
+    "interactive",
+  );
+  assert.equal(evidence.ok, true);
+  assert.equal(review.ok, true);
+  assert.equal(verdict.ok, true);
+  assert.equal(acceptance.ok, true);
+  return {
+    acceptance: acceptance.acceptance,
+    verdict: verdict.verdict,
+    review: review.review,
+    evidence: evidence.evidence,
+    authority,
+    repoRoot: repo.dir,
+    protocolPin: protocolPinFor(repo),
+    documents: { acceptanceDocument, verdictDocument, reviewDocument, evidenceDocument },
+  };
+}
+
+test("parseCandidateRef: only exact v1 full object-id identity parses", () => {
+  const sha1 = candidateRefOf("a".repeat(40), "b".repeat(40));
+  assert.deepEqual(parseCandidateRef(sha1), {
+    ok: true,
+    candidate: { ref: sha1, taskBaseOid: "a".repeat(40), candidateOid: "b".repeat(40) },
+  });
+  assert.equal(parseCandidateRef(candidateRefOf("a".repeat(64), "b".repeat(64))).ok, true);
+
+  for (const [label, value] of [
+    ["branch", "main"],
+    ["tag", "v1.2.3"],
+    ["HEAD", "HEAD"],
+    ["symbolic candidate", `git:v1:${"a".repeat(40)}:HEAD`],
+    ["abbreviated base", `git:v1:abcdef1:${"b".repeat(40)}`],
+    ["abbreviated candidate", `git:v1:${"a".repeat(40)}:abcdef1`],
+    ["uppercase", candidateRefOf("A".repeat(40), "b".repeat(40))],
+    ["mixed object formats", candidateRefOf("a".repeat(40), "b".repeat(64))],
+    ["leading prose", `candidate ${sha1}`],
+    ["trailing prose", `${sha1} is ready`],
+    ["leading whitespace", ` ${sha1}`],
+    ["missing version", `git:${"a".repeat(40)}:${"b".repeat(40)}`],
+    ["wrong version", `git:v2:${"a".repeat(40)}:${"b".repeat(40)}`],
+    ["non-string", null],
+  ]) {
+    const check = parseCandidateRef(value);
+    assert.equal(check.ok, false, `${label} must fail`);
+    assert.equal(typeof check.error, "string", `${label} must have an exact reason`);
+  }
+});
+
+test("checkCandidateEligibility: real Git identity, parent, linearity, scope, HEAD, and clean state are rechecked", async () => {
+  const repo = await gitRepoFixture();
+  const outOfScopeRepo = await gitRepoFixture();
+  const mergeRepo = await gitRepoFixture();
+  try {
+    const first = await commitCandidate(repo);
+    assert.deepEqual(await checkCandidateEligibility({
+      candidateRef: candidateRefOf(repo.base, first), repoRoot: repo.dir,
+      grantedBase: repo.base, scope: "src", exclusions: [],
+    }), { ok: true });
+
+    const correction = await commitCandidate(repo, "src/correction.go", "correction\n", "correction");
+    assert.deepEqual(await checkCandidateEligibility({
+      candidateRef: candidateRefOf(repo.base, correction), repoRoot: repo.dir,
+      grantedBase: first, scope: "src", exclusions: [],
+    }), { ok: true }, "a correction keeps the original task base and parents the preceding candidate");
+
+    await writeFile(join(repo.dir, ".git", "info", "exclude"), "ignored.tmp\n");
+    await writeFile(join(repo.dir, "ignored.tmp"), "cache\n");
+    assert.deepEqual(await checkCandidateEligibility({
+      candidateRef: candidateRefOf(repo.base, correction), repoRoot: repo.dir,
+      grantedBase: first, scope: "src", exclusions: [],
+    }), { ok: true }, "ignored files are not candidate residue");
+    await rm(join(repo.dir, "ignored.tmp"));
+
+    const wrongBase = await checkCandidateEligibility({
+      candidateRef: candidateRefOf(repo.base, correction), repoRoot: repo.dir,
+      grantedBase: repo.base, scope: "src", exclusions: [],
+    });
+    assert.equal(wrongBase.ok, false);
+    assert.match(wrongBase.error, /parent.*granted candidate base/);
+
+    const missingBase = await checkCandidateEligibility({
+      candidateRef: candidateRefOf("f".repeat(40), correction), repoRoot: repo.dir,
+      grantedBase: first, scope: "src", exclusions: [],
+    });
+    assert.equal(missingBase.ok, false);
+    assert.match(missingBase.error, /task base.*retrievable/);
+
+    const missingCandidate = await checkCandidateEligibility({
+      candidateRef: candidateRefOf(repo.base, "f".repeat(40)), repoRoot: repo.dir,
+      grantedBase: first, scope: "src", exclusions: [],
+    });
+    assert.equal(missingCandidate.ok, false);
+    assert.match(missingCandidate.error, /candidate.*retrievable/);
+
+    assert.equal((await checkCandidateEligibility({
+      candidateRef: `git:v1:${repo.base.slice(0, 8)}:${correction.slice(0, 8)}`,
+      repoRoot: repo.dir, grantedBase: first, scope: "src", exclusions: [],
+    })).ok, false, "abbreviated ids fail before Git lookup");
+
+    await writeFile(join(repo.dir, "src", "residue.tmp"), "dirty\n");
+    const dirty = await checkCandidateEligibility({
+      candidateRef: candidateRefOf(repo.base, correction), repoRoot: repo.dir,
+      grantedBase: first, scope: "src", exclusions: [],
+    });
+    assert.equal(dirty.ok, false);
+    assert.match(dirty.error, /not clean/);
+    await rm(join(repo.dir, "src", "residue.tmp"));
+
+    await git(["checkout", "--detach", repo.base], repo.dir);
+    const moved = await checkCandidateEligibility({
+      candidateRef: candidateRefOf(repo.base, correction), repoRoot: repo.dir,
+      grantedBase: first, scope: "src", exclusions: [],
+    });
+    assert.equal(moved.ok, false);
+    assert.match(moved.error, /HEAD.*candidate/);
+
+    const outside = await commitCandidate(outOfScopeRepo, "README.md", "changed\n", "outside");
+    const outOfScope = await checkCandidateEligibility({
+      candidateRef: candidateRefOf(outOfScopeRepo.base, outside), repoRoot: outOfScopeRepo.dir,
+      grantedBase: outOfScopeRepo.base, scope: "src", exclusions: [],
+    });
+    assert.equal(outOfScope.ok, false);
+    assert.match(outOfScope.error, /README\.md.*outside the granted scope/);
+
+    const mainBranch = (await git(["rev-parse", "--abbrev-ref", "HEAD"], mergeRepo.dir)).stdout.trim();
+    await git(["checkout", "-b", "candidate-side"], mergeRepo.dir);
+    await commitCandidate(mergeRepo, "src/side.go", "side\n", "side");
+    await git(["checkout", mainBranch], mergeRepo.dir);
+    const mainParent = await commitCandidate(mergeRepo, "src/main-change.go", "main\n", "main change");
+    await git(["merge", "--no-ff", "candidate-side", "-m", "merge candidate"], mergeRepo.dir);
+    const merge = (await git(["rev-parse", "HEAD"], mergeRepo.dir)).stdout.trim();
+    const merged = await checkCandidateEligibility({
+      candidateRef: candidateRefOf(mergeRepo.base, merge), repoRoot: mergeRepo.dir,
+      grantedBase: mainParent, scope: "src", exclusions: [],
+    });
+    assert.equal(merged.ok, false);
+    assert.match(merged.error, /single-parent/);
+  } finally {
+    await rm(repo.dir, { recursive: true, force: true });
+    await rm(outOfScopeRepo.dir, { recursive: true, force: true });
+    await rm(mergeRepo.dir, { recursive: true, force: true });
+  }
+});
+
+test("parseCandidateEvidence: closed candidate-bound evidence rejects malformed, duplicate, mistyped, unknown, and out-of-scope data", async () => {
+  const repo = await gitRepoFixture();
+  try {
+    const candidate = await commitCandidate(repo);
+    const authority = candidateAuthority(repo, repo.base);
+    const doc = await candidateEvidenceDoc(repo, candidate);
+    const valid = parseCandidateEvidence(
+      blockText(CANDIDATE_EVIDENCE_BEGIN, CANDIDATE_EVIDENCE_END, doc), authority,
+    );
+    assert.equal(valid.ok, true);
+    assert.equal(valid.evidence.candidate_ref, candidateRefOf(repo.base, candidate));
+    assert.deepEqual(valid.evidence.changed_paths, ["src/feature.go"]);
+
+    const duplicateBody = JSON.stringify(doc, null, 2).replace(
+      '  "changed_paths": [',
+      '  "changed_paths": [],\n  "changed_paths": [',
+    );
+    const cases = [
+      ["malformed", `${CANDIDATE_EVIDENCE_BEGIN}\n{"version":1,broken\n${CANDIDATE_EVIDENCE_END}`],
+      ["duplicate", `${CANDIDATE_EVIDENCE_BEGIN}\n${duplicateBody}\n${CANDIDATE_EVIDENCE_END}`],
+      ["unknown", blockText(CANDIDATE_EVIDENCE_BEGIN, CANDIDATE_EVIDENCE_END, { ...doc, surprise: true })],
+      ["mistyped", blockText(CANDIDATE_EVIDENCE_BEGIN, CANDIDATE_EVIDENCE_END, { ...doc, changed_paths: "src/feature.go" })],
+      ["out of scope", blockText(CANDIDATE_EVIDENCE_BEGIN, CANDIDATE_EVIDENCE_END, { ...doc, changed_paths: ["README.md"] })],
+      ["scope mismatch", blockText(CANDIDATE_EVIDENCE_BEGIN, CANDIDATE_EVIDENCE_END, { ...doc, scope: { ...doc.scope, writable_scope: "." } })],
+      ["unknown marker", '<pi-paseo-orchestration evidence="v2">\n{}\n</pi-paseo-orchestration>'],
+    ];
+    for (const [label, text] of cases) {
+      const parsed = parseCandidateEvidence(text, authority);
+      assert.equal(parsed.ok, false, `${label} must fail`);
+      assert.equal(typeof parsed.error, "string");
+    }
+  } finally {
+    await rm(repo.dir, { recursive: true, force: true });
+  }
+});
+
+test("parseReview: neutral exact binding, finding enums, correction classifications, and staleness are closed", () => {
+  const candidate = candidateRefOf("a".repeat(40), "b".repeat(40));
+  const approve = parseReview(blockText(REVIEW_BEGIN, REVIEW_END, reviewDoc(candidate)));
+  assert.equal(approve.ok, true);
+  assert.equal(reviewValidForCandidate(approve.review, candidate), true);
+  assert.equal(reviewValidForCandidate(approve.review, candidateRefOf("a".repeat(40), "c".repeat(40))), false);
+
+  const finding = {
+    finding_id: "F-1",
+    severity: "BLOCKER",
+    statement: "The candidate skips the required check.",
+    impact: "Acceptance could bless an invalid result.",
+    evidence: ["review-command-1: missing branch"],
+    scope: "src/feature.go",
+  };
+  assert.equal(parseReview(blockText(REVIEW_BEGIN, REVIEW_END, reviewDoc(candidate, {
+    outcome: "FINDINGS", findings: [finding],
+  }))).ok, true);
+  assert.equal(parseReview(blockText(REVIEW_BEGIN, REVIEW_END, reviewDoc(candidate, {
+    correction_of: "review-0",
+    correction_classifications: [{ finding_id: "F-0", classification: "resolved", evidence: "fixed in candidate B" }],
+  }))).ok, true);
+
+  const cases = [
+    ["non-neutral mandate", reviewDoc(candidate, { mandate: "PLEASE_APPROVE" })],
+    ["bad severity", reviewDoc(candidate, { outcome: "FINDINGS", findings: [{ ...finding, severity: "MAJOR" }] })],
+    ["approve with finding", reviewDoc(candidate, { findings: [finding] })],
+    ["findings without finding", reviewDoc(candidate, { outcome: "FINDINGS" })],
+    ["classification on initial review", reviewDoc(candidate, { correction_classifications: [{ finding_id: "F-0", classification: "open", evidence: "still fails" }] })],
+    ["correction without classifications", reviewDoc(candidate, { correction_of: "review-0" })],
+    ["bad correction classification", reviewDoc(candidate, { correction_of: "review-0", correction_classifications: [{ finding_id: "F-0", classification: "STILL_OPEN", evidence: "x" }] })],
+    ["unknown field", reviewDoc(candidate, { preferred_verdict: "READY" })],
+    ["missing reviewer", reviewDoc(candidate, { reviewer_id: "" })],
+    ["invalid candidate", reviewDoc("main")],
+  ];
+  for (const [label, doc] of cases) {
+    assert.equal(parseReview(blockText(REVIEW_BEGIN, REVIEW_END, doc)).ok, false, `${label} must fail`);
+  }
+
+  const duplicate = `${REVIEW_BEGIN}\n{"version":1,"review_result_id":"r","review_result_id":"mutated"}\n${REVIEW_END}`;
+  assert.match(parseReview(duplicate).error, /duplicate field/);
+});
+
+test("parseVerdict and verdictStatus: NOT_READY then NEEDS_HUMAN then READY precedence is exact", async () => {
+  const repo = await gitRepoFixture();
+  try {
+    const candidate = await commitCandidate(repo);
+    const ready = verdictDoc(repo, candidate);
+    assert.equal(verdictStatus(ready), "READY");
+    assert.equal(parseVerdict(blockText(VERDICT_BEGIN, VERDICT_END, ready)).ok, true);
+
+    const unresolved = [{ decision_id: "H-1", status: "UNRESOLVED", evidence_ref: "human-question-1" }];
+    const needsHuman = { ...ready, human_decisions: unresolved, verdict: "NEEDS_HUMAN" };
+    assert.equal(verdictStatus(needsHuman), "NEEDS_HUMAN");
+    assert.equal(parseVerdict(blockText(VERDICT_BEGIN, VERDICT_END, needsHuman)).ok, true);
+
+    const technicalFailure = {
+      ...ready,
+      scope_result: "FAIL",
+      human_decisions: unresolved,
+      verdict: "NOT_READY",
+    };
+    assert.equal(verdictStatus(technicalFailure), "NOT_READY", "technical failure beats unresolved Human work");
+    assert.equal(parseVerdict(blockText(VERDICT_BEGIN, VERDICT_END, technicalFailure)).ok, true);
+    assert.equal(parseVerdict(blockText(VERDICT_BEGIN, VERDICT_END, {
+      ...technicalFailure, verdict: "NEEDS_HUMAN",
+    })).ok, false, "a lower-precedence declaration fails closed");
+
+    const staleCandidate = candidateRefOf(repo.base, "f".repeat(40));
+    const staleReview = { ...ready, review: { ...ready.review, candidate_ref: staleCandidate } };
+    assert.equal(verdictStatus(staleReview), "NOT_READY");
+    assert.equal(parseVerdict(blockText(VERDICT_BEGIN, VERDICT_END, staleReview)).ok, false);
+
+    const openFinding = {
+      ...ready,
+      review: { ...ready.review, outcome: "FINDINGS", open_findings: ["F-1"] },
+    };
+    assert.equal(verdictStatus(openFinding), "NOT_READY");
+    assert.equal(parseVerdict(blockText(VERDICT_BEGIN, VERDICT_END, openFinding)).ok, false);
+
+    const missingEvidence = { ...ready, scope_evidence: [], verdict: "NOT_READY" };
+    assert.equal(verdictStatus(missingEvidence), "NOT_READY");
+    assert.equal(parseVerdict(blockText(VERDICT_BEGIN, VERDICT_END, missingEvidence)).ok, true);
+
+    assert.equal(parseVerdict(blockText(VERDICT_BEGIN, VERDICT_END, { ...ready, unknown: true })).ok, false);
+  } finally {
+    await rm(repo.dir, { recursive: true, force: true });
+  }
+});
+
+test("parseAcceptance: only one direct Human LOCAL_ACCEPT block parses and it is never an authority envelope", () => {
+  assert.equal(CANDIDATE_EVIDENCE_BEGIN, '<pi-paseo-orchestration evidence="v1">');
+  assert.equal(REVIEW_BEGIN, '<pi-paseo-orchestration review="v1">');
+  assert.equal(VERDICT_BEGIN, '<pi-paseo-orchestration verdict="v1">');
+  assert.equal(ACCEPTANCE_BEGIN, '<pi-paseo-orchestration acceptance="v1">');
+  const candidate = candidateRefOf("a".repeat(40), "b".repeat(40));
+  const valid = blockText(ACCEPTANCE_BEGIN, ACCEPTANCE_END, acceptanceDoc(candidate));
+  assert.equal(parseAcceptance(valid, "interactive").ok, true);
+  assert.equal(parseAcceptance(valid, "extension").ok, false, "an extension relay is not the direct Human route");
+  assert.equal(parseAcceptance(valid).ok, false, "an unproven route fails closed");
+  assert.equal(parseEnvelope(valid).ok, false, "acceptance is a document, never an authority envelope");
+
+  const duplicateBody = '{"version":1,"decision":"LOCAL_ACCEPT","decision":"LOCAL_ACCEPT","candidate_ref":"' + candidate + '","project_verdict_id":"verdict-1"}';
+  const cases = [
+    ["misplaced", `Example only:\n${valid}`],
+    ["duplicate block", `${valid}\n${valid}`],
+    ["duplicate close", `${valid}\n${ACCEPTANCE_END}`],
+    ["duplicate field", `${ACCEPTANCE_BEGIN}\n${duplicateBody}\n${ACCEPTANCE_END}`],
+    ["malformed", `${ACCEPTANCE_BEGIN}\n{"version":1,broken\n${ACCEPTANCE_END}`],
+    ["wrong decision", blockText(ACCEPTANCE_BEGIN, ACCEPTANCE_END, { ...acceptanceDoc(candidate), decision: "APPROVE" })],
+    ["unknown field", blockText(ACCEPTANCE_BEGIN, ACCEPTANCE_END, { ...acceptanceDoc(candidate), comment: "looks good" })],
+    ["invalid candidate", blockText(ACCEPTANCE_BEGIN, ACCEPTANCE_END, acceptanceDoc("HEAD"))],
+    ["unknown version marker", '<pi-paseo-orchestration acceptance="v2">\n{}\n</pi-paseo-orchestration>'],
+  ];
+  for (const [label, text] of cases) {
+    assert.equal(parseAcceptance(text, "interactive").ok, false, `${label} must fail`);
+  }
+});
+
+test("validateAcceptance: a complete exact chain passes; every broken identity, evidence, review, decision, route, or Git fact fails", async () => {
+  const repo = await gitRepoFixture();
+  try {
+    const candidate = await commitCandidate(repo);
+    const chain = await validAcceptanceChain(repo, candidate);
+    const refsBefore = (await git(["show-ref"], repo.dir)).stdout;
+    const headBefore = (await git(["rev-parse", "HEAD"], repo.dir)).stdout;
+    assert.deepEqual(await validateAcceptance(chain), { ok: true });
+    assert.equal((await git(["show-ref"], repo.dir)).stdout, refsBefore, "acceptance creates no ref/tag/note");
+    assert.equal((await git(["rev-parse", "HEAD"], repo.dir)).stdout, headBefore, "acceptance creates no commit");
+
+    const noReviewVerdict = parseVerdict(blockText(VERDICT_BEGIN, VERDICT_END, {
+      ...chain.documents.verdictDocument,
+      review: {
+        required: false,
+        review_result_id: null,
+        candidate_ref: null,
+        outcome: "NOT_REQUIRED",
+        open_findings: [],
+      },
+    }));
+    assert.equal(noReviewVerdict.ok, true);
+    assert.deepEqual(await validateAcceptance({
+      ...chain,
+      authority: { ...chain.authority, reviewRequired: false },
+      review: null,
+      verdict: noReviewVerdict.verdict,
+    }), { ok: true }, "review is conditional on the protocol/class fact");
+
+    const staleCandidate = candidateRefOf(repo.base, "f".repeat(40));
+    const staleVerdictDocument = {
+      ...chain.documents.verdictDocument,
+      candidate_ref: staleCandidate,
+      review: { ...chain.documents.verdictDocument.review, candidate_ref: staleCandidate },
+    };
+    const staleVerdict = parseVerdict(blockText(VERDICT_BEGIN, VERDICT_END, staleVerdictDocument));
+    assert.equal(staleVerdict.ok, true);
+    assert.equal((await validateAcceptance({ ...chain, verdict: staleVerdict.verdict })).ok, false, "stale verdict");
+
+    const mismatchedAcceptance = parseAcceptance(blockText(
+      ACCEPTANCE_BEGIN, ACCEPTANCE_END, acceptanceDoc(staleCandidate),
+    ), "interactive");
+    assert.equal(mismatchedAcceptance.ok, true);
+    assert.equal((await validateAcceptance({ ...chain, acceptance: mismatchedAcceptance.acceptance })).ok, false, "mismatched acceptance candidate");
+
+    const mismatchedVerdictId = parseAcceptance(blockText(
+      ACCEPTANCE_BEGIN, ACCEPTANCE_END,
+      acceptanceDoc(chain.documents.evidenceDocument.candidate_ref, "verdict-2"),
+    ), "interactive");
+    assert.equal(mismatchedVerdictId.ok, true);
+    assert.equal((await validateAcceptance({ ...chain, acceptance: mismatchedVerdictId.acceptance })).ok, false, "mismatched immutable verdict id");
+
+    assert.equal((await validateAcceptance({ ...chain, review: null })).ok, false, "required review missing");
+    assert.equal((await validateAcceptance({ ...chain, evidence: null })).ok, false, "candidate evidence missing");
+    assert.equal((await validateAcceptance({
+      ...chain,
+      evidence: {
+        ...chain.evidence,
+        cumulative_diff: { ...chain.evidence.cumulative_diff, diff: `${chain.evidence.cumulative_diff.diff}\ntampered` },
+      },
+    })).ok, false, "candidate evidence must match the exact Git diff");
+    assert.equal((await validateAcceptance({
+      ...chain,
+      protocolPin: { ...chain.protocolPin, digest: "f".repeat(64) },
+    })).ok, false, "protocol pin drift");
+
+    const staleReview = parseReview(blockText(REVIEW_BEGIN, REVIEW_END, reviewDoc(staleCandidate)));
+    assert.equal(staleReview.ok, true);
+    assert.equal((await validateAcceptance({ ...chain, review: staleReview.review })).ok, false, "stale review");
+
+    const selfReview = parseReview(blockText(REVIEW_BEGIN, REVIEW_END, reviewDoc(
+      chain.documents.evidenceDocument.candidate_ref,
+      { reviewer_id: "peer-1" },
+    )));
+    assert.equal(selfReview.ok, true);
+    assert.equal((await validateAcceptance({ ...chain, review: selfReview.review })).ok, false, "writer cannot review itself");
+
+    const needsHumanDocument = {
+      ...chain.documents.verdictDocument,
+      human_decisions: [{ decision_id: "H-1", status: "UNRESOLVED", evidence_ref: "human-question-1" }],
+      verdict: "NEEDS_HUMAN",
+    };
+    const needsHuman = parseVerdict(blockText(VERDICT_BEGIN, VERDICT_END, needsHumanDocument));
+    assert.equal(needsHuman.ok, true);
+    assert.equal((await validateAcceptance({ ...chain, verdict: needsHuman.verdict })).ok, false, "unresolved Human decision");
+
+    const relayed = parseAcceptance(blockText(
+      ACCEPTANCE_BEGIN, ACCEPTANCE_END, chain.documents.acceptanceDocument,
+    ), "extension");
+    assert.equal(relayed.ok, false);
+    assert.equal((await validateAcceptance({ ...chain, acceptance: null })).ok, false, "relayed acceptance never reaches the gate");
+
+    await writeFile(join(repo.dir, "src", "dirty.tmp"), "dirty\n");
+    const dirty = await validateAcceptance(chain);
+    assert.equal(dirty.ok, false);
+    assert.match(dirty.error, /not clean/);
+    await rm(join(repo.dir, "src", "dirty.tmp"));
+
+    await git(["checkout", "--detach", repo.base], repo.dir);
+    const moved = await validateAcceptance(chain);
+    assert.equal(moved.ok, false);
+    assert.match(moved.error, /HEAD.*candidate/);
+  } finally {
+    await rm(repo.dir, { recursive: true, force: true });
+  }
+});
+
+test("status, passing tests, HANDOFF, Reviewer APPROVE, and READY verdict are each non-accepting signals", async () => {
+  const repo = await gitRepoFixture();
+  try {
+    const candidate = await commitCandidate(repo);
+    const chain = await validAcceptanceChain(repo, candidate);
+    const signals = [
+      ["lifecycle", { lifecycle_status: "finished" }],
+      ["tests", { tests: "PASS" }],
+      ["handoff", handoffReport({ payload: { ...handoffReport().payload, candidate: candidateRefOf(repo.base, candidate) } })],
+      ["review approve", chain.review],
+      ["ready verdict", chain.verdict],
+      ["prose", "LOCAL_ACCEPT: everything looks good"],
+    ];
+    for (const [label, signal] of signals) {
+      const result = await validateAcceptance({ ...chain, acceptance: signal });
+      assert.equal(result.ok, false, `${label} alone must never accept`);
+    }
+    assert.equal((await validateAcceptance({ ...chain, acceptance: null })).ok, false);
+    assert.deepEqual(await validateAcceptance(chain), { ok: true }, "only the direct parsed Human block crosses the boundary");
+  } finally {
+    await rm(repo.dir, { recursive: true, force: true });
+  }
+});
