@@ -218,6 +218,9 @@ test("extension registers the settings command and a handler that never calls a 
     "pi-paseo-orchestration:settings",
     "pi-paseo-orchestration:lead-tiny",
     "pi-paseo-orchestration:supervisor-recovery",
+    "pi-paseo-orchestration:notebook-init",
+    "pi-paseo-orchestration:notebook-append",
+    "pi-paseo-orchestration:doctor",
   ]);
 });
 
@@ -2632,5 +2635,294 @@ test("status, passing tests, HANDOFF, Reviewer APPROVE, and READY verdict are ea
     assert.deepEqual(await validateAcceptance(chain), { ok: true }, "only the direct parsed Human block crosses the boundary");
   } finally {
     await rm(repo.dir, { recursive: true, force: true });
+  }
+});
+
+// ─── Lát 7: Supervisor Notebook and observation-only Doctor ──────────────────
+
+function notebookEntryFixture(manifest, projectId, repoRoot, over = {}) {
+  const now = "2026-01-02T03:04:05.000Z";
+  const selected = over.selected ?? "selected bounded fact";
+  const entry = {
+    contract: extension.NOTEBOOK_ENTRY_CONTRACT,
+    schema_version: "v1",
+    entry_id: over.entry_id ?? "entry-1",
+    notebook_id: manifest.notebook_id,
+    protocol_project_id: projectId,
+    recorded_at: now,
+    observed_at: now,
+    writer: { supervisor_agent_id: "supervisor-1", pi_session_id: "session-1" },
+    context: {
+      paseo_project_id: "paseo-project-1",
+      repository_root: repoRoot,
+      paseo_workspace_id: "workspace-1",
+      lead_agent_id: "absent",
+      binding_source: "manifest",
+      protocol_pin: null,
+    },
+    observation: over.observation ?? "Lead waited after an external failure.",
+    evidence: [{
+      item_id: "evidence-1",
+      observed_at: now,
+      kind: "session-observation",
+      source: "paseo:current-agent",
+      selected,
+      source_digest: null,
+      retained_digest: digestOf(selected).replace(/^/, "sha256:"),
+      redaction_notes: [],
+      truncated: false,
+    }],
+    suspected_mechanism: { hypothesis: "The prerequisite was not checked.", uncertainty: "Need a fresh live observation.", confidence: "medium" },
+    impact: "Attention was spent without changing the prerequisite.",
+    question: "What current fact should be checked before another wait?",
+    recommendation: "Re-observe the external prerequisite once.",
+    escalation: { needed: false, owner: "none", reason: "No owner decision is required yet.", relay_target: null },
+    history: { relation: "original", references: [], reason: "First observation." },
+    sensitivity: { redactions: [], contains_secret: false },
+    entry_digest: "",
+  };
+  Object.assign(entry, over);
+  delete entry.entry_digest;
+  entry.entry_digest = `sha256:${digestOf(extension.canonicalNotebookJson(entry))}`;
+  return entry;
+}
+
+async function notebookFixture() {
+  const config = await mkdtemp(join(tmpdir(), "ppo-notebook-config-"));
+  const repo = await gitRepoFixture();
+  const projectId = "Human project / exact ID";
+  const env = { PI_CODING_AGENT_DIR: config };
+  const initialized = await extension.initializeNotebook({
+    env, projectId, paseoProjectId: "paseo-project-1", repositoryRoot: repo.dir,
+    supervisorAgentId: "supervisor-1", piSessionId: "session-1", createdAt: "2026-01-01T00:00:00.000Z",
+  });
+  assert.equal(initialized.ok, true, initialized.error);
+  return { config, repo, env, projectId, initialized };
+}
+
+test("Notebook: exact project key, create-once manifest, immutable append, idempotency, conflict, and staging cleanup", async () => {
+  const fixture = await notebookFixture();
+  try {
+    const { config, repo, env, projectId, initialized } = fixture;
+    assert.equal(extension.deriveNotebookProjectKey(projectId), digestOf(projectId));
+    assert.match(initialized.paths.manifestPath, new RegExp(`supervisor-notebooks/v1/projects/${digestOf(projectId)}/manifest\\.json$`));
+    const manifestBytes = await readFile(initialized.paths.manifestPath);
+    const reinit = await extension.initializeNotebook({
+      env, projectId, paseoProjectId: "paseo-project-1", repositoryRoot: repo.dir,
+      supervisorAgentId: "supervisor-1", piSessionId: "session-2", createdAt: "2026-01-03T00:00:00.000Z",
+    });
+    assert.equal(reinit.ok, false);
+    assert.match(reinit.error, /create-once|already exists/);
+    assert.deepEqual(await readFile(initialized.paths.manifestPath), manifestBytes, "re-init cannot mutate manifest bytes");
+
+    const entry = notebookEntryFixture(initialized.manifest, projectId, repo.dir);
+    const context = entry.context;
+    const first = await extension.appendNotebookEntry({ env, projectId, entry, context });
+    assert.equal(first.ok, true, first.error);
+    const entryPath = join(initialized.paths.entriesRoot, "entry-1.json");
+    const entryBytes = await readFile(entryPath);
+    assert.deepEqual(await readdir(initialized.paths.stagingRoot), [], "private staging has no residue after publish");
+
+    const duplicate = await extension.appendNotebookEntry({ env, projectId, entry, context });
+    assert.deepEqual({ ok: duplicate.ok, status: duplicate.status }, { ok: true, status: "idempotent" });
+    assert.deepEqual(await readFile(entryPath), entryBytes, "idempotency preserves exact bytes");
+
+    const conflictEntry = notebookEntryFixture(initialized.manifest, projectId, repo.dir, { observation: "different bytes" });
+    const conflict = await extension.appendNotebookEntry({ env, projectId, entry: conflictEntry, context });
+    assert.equal(conflict.ok, false);
+    assert.equal(conflict.status, "conflict");
+    assert.deepEqual(await readFile(entryPath), entryBytes, "same ID conflict cannot replace the existing entry");
+
+    const repoReadme = await readFile(join(repo.dir, "README.md"));
+    const snapshot = await extension.snapshotNotebook({ env, projectId });
+    assert.equal(snapshot.ok, true);
+    assert.equal(snapshot.snapshot.valid_causal_projection.length, 1);
+    assert.deepEqual(await readFile(join(repo.dir, "README.md")), repoReadme, "Notebook never writes the project");
+  } finally {
+    await rm(fixture.config, { recursive: true, force: true });
+    await rm(fixture.repo.dir, { recursive: true, force: true });
+  }
+});
+
+test("Notebook: corrupt entries remain in the physical digest but are excluded; malformed manifest blocks writes", async () => {
+  const fixture = await notebookFixture();
+  try {
+    const { config, repo, env, projectId, initialized } = fixture;
+    await writeFile(join(initialized.paths.entriesRoot, "corrupt.json"), "{broken", "utf8");
+    const entry = notebookEntryFixture(initialized.manifest, projectId, repo.dir);
+    const appended = await extension.appendNotebookEntry({ env, projectId, entry, context: entry.context });
+    assert.equal(appended.ok, true, appended.error);
+    const snapshot = await extension.snapshotNotebook({ env, projectId });
+    assert.equal(snapshot.ok, true);
+    assert.equal(snapshot.snapshot.invalid_entries.some((item) => item.filename === "corrupt.json"), true);
+    assert.equal(snapshot.snapshot.physical_entries.some((item) => item.filename === "corrupt.json"), true);
+    assert.equal(snapshot.snapshot.valid_causal_projection.length, 1);
+
+    const manifestBytes = await readFile(initialized.paths.manifestPath);
+    await writeFile(initialized.paths.manifestPath, Buffer.from("{}"));
+    const blocked = await extension.appendNotebookEntry({
+      env, projectId, entry: notebookEntryFixture(initialized.manifest, projectId, repo.dir, { entry_id: "entry-2" }),
+      context: entry.context,
+    });
+    assert.equal(blocked.ok, false);
+    assert.match(blocked.error, /manifest|canonical|contract|invalid/i);
+    assert.equal(await readFile(initialized.paths.manifestPath, "utf8"), "{}", "corrupt manifest is never repaired");
+    await writeFile(initialized.paths.manifestPath, manifestBytes);
+  } finally {
+    await rm(fixture.config, { recursive: true, force: true });
+    await rm(fixture.repo.dir, { recursive: true, force: true });
+  }
+});
+
+test("Notebook: distinct IDs publish concurrently and path/symlink violations fail closed", async () => {
+  const fixture = await notebookFixture();
+  try {
+    const { config, repo, env, projectId, initialized } = fixture;
+    const entries = ["entry-a", "entry-b", "entry-c"].map((entry_id) => notebookEntryFixture(initialized.manifest, projectId, repo.dir, { entry_id }));
+    const results = await Promise.all(entries.map((entry) => extension.appendNotebookEntry({ env, projectId, entry, context: entry.context })));
+    assert.deepEqual(results.map((result) => result.ok), [true, true, true]);
+    assert.deepEqual((await readdir(initialized.paths.entriesRoot)).filter((name) => name.endsWith(".json")).sort(), ["entry-a.json", "entry-b.json", "entry-c.json", "corrupt.json"].filter((name) => name !== "corrupt.json").sort());
+    const traversal = await extension.appendNotebookEntry({
+      env, projectId, entry: notebookEntryFixture(initialized.manifest, projectId, repo.dir, { entry_id: "../escape" }), context: entries[0].context,
+    });
+    assert.equal(traversal.ok, false);
+    assert.match(traversal.error, /filename|component|entry_id/);
+  } finally {
+    await rm(fixture.config, { recursive: true, force: true });
+    await rm(fixture.repo.dir, { recursive: true, force: true });
+  }
+});
+
+test("Doctor: passive warning/report parsing, no output channel probe, and governed adapter fail-closed status", async () => {
+  const repo = await gitRepoFixture();
+  const config = await mkdtemp(join(tmpdir(), "ppo-doctor-config-"));
+  try {
+    const passive = await extension.buildDoctorReport({
+      ctx: { cwd: repo.dir, env: {} },
+      pi: { getActiveTools: () => ["read", "bash"], setActiveTools() {}, setModel() {}, setThinkingLevel() {} },
+      now: "2026-01-01T00:00:00.000Z", reportId: "doctor-passive",
+    });
+    assert.equal(passive.overall_status, "WARN");
+    assert.equal(passive.checks.find((check) => check.code === "ADAPTER_OBSERVER").status, "WARN");
+    assert.match(passive.checks.find((check) => check.code === "ADAPTER_OBSERVER").observed, /adapter observer not yet verified/);
+    const block = extension.formatDoctorReport(passive);
+    assert.equal(extension.parseDoctorReport(block).ok, true);
+    assert.deepEqual(passive.checks.map((check) => check.code), [...passive.checks].map((check) => check.code).sort());
+
+    let cwdReads = 0;
+    const unavailable = await extension.runDoctor("", {
+      outputMode: "json",
+      get cwd() { cwdReads += 1; return repo.dir; },
+    }, { getActiveTools() { throw new Error("doctor must not probe print mode"); } });
+    assert.deepEqual(unavailable, { ok: false, error: "OUTPUT_CHANNEL_UNAVAILABLE" });
+    assert.equal(cwdReads, 0);
+
+    const ext = await freshExtension();
+    const profiles = await profileDirFixture();
+    const settingsDir = await mkdtemp(join(tmpdir(), "ppo-doctor-governed-"));
+    const fake = fakePi({
+      activeTools: ["read", "bash", "mcp"],
+      env: { PI_CODING_AGENT_DIR: settingsDir, PI_PASEO_ORCHESTRATION_ROLE: "supervisor", PASEO_AGENT_ID: "supervisor-1", PI_PASEO_ORCHESTRATION_PROFILES_DIR: profiles },
+    });
+    await writeSettings(settingsDir, validDoc);
+    fake.ctx.cwd = repo.dir;
+    ext.default(fake.pi);
+    await fake.handlers.get("session_start")({}, fake.ctx);
+    const governed = await ext.buildDoctorReport({ ctx: fake.ctx, pi: fake.pi, now: "2026-01-01T00:00:00.000Z", reportId: "doctor-supervisor" });
+    assert.equal(governed.checks.find((check) => check.code === "ADAPTER_OBSERVER").status, "BLOCKED");
+    assert.match(governed.checks.find((check) => check.code === "ADAPTER_OBSERVER").observed, /adapter observer not yet verified/);
+    assert.equal(governed.overall_status, "BLOCKED");
+    await writeSettings(settingsDir, { ...validDoc, roles: { ...validDoc.roles, supervisor: { ...validDoc.roles.supervisor, thinking: "low" } } });
+    const drifted = await ext.buildDoctorReport({ ctx: fake.ctx, pi: fake.pi, now: "2026-01-01T00:00:00.000Z", reportId: "doctor-drift" });
+    assert.equal(drifted.checks.find((check) => check.code === "ROLE_SETTINGS").status, "BLOCKED");
+    await rm(settingsDir, { recursive: true, force: true });
+    await rm(profiles, { recursive: true, force: true });
+  } finally {
+    await rm(config, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+  }
+});
+
+test("Notebook: project binding drift stops writes; Human-confirmed move appends a rebind entry", async () => {
+  const fixture = await notebookFixture();
+  try {
+    const { config, repo, env, projectId, initialized } = fixture;
+    const entry = notebookEntryFixture(initialized.manifest, projectId, repo.dir);
+
+    // Same binding appends normally.
+    const same = await extension.appendNotebookEntry({ env, projectId, entry, context: entry.context });
+    assert.equal(same.ok, true, same.error);
+
+    // Live binding differs from the manifest locators → move_or_copy, write stops.
+    const movedContext = { ...entry.context, repository_root: "/elsewhere/repo" };
+    const second = notebookEntryFixture(initialized.manifest, projectId, "/elsewhere/repo", { entry_id: "entry-2" });
+    const blocked = await extension.appendNotebookEntry({ env, projectId, entry: second, context: movedContext });
+    assert.equal(blocked.ok, false);
+    assert.equal(blocked.classification, "move_or_copy");
+
+    // Human-confirmed move (allowRebind) appends a rebind entry, preserving prior bytes.
+    const rebound = await extension.appendNotebookEntry({ env, projectId, entry: second, context: movedContext, allowRebind: true });
+    assert.equal(rebound.ok, true, rebound.error);
+    const reboundEntry = JSON.parse(await readFile(join(initialized.paths.entriesRoot, "entry-2.json"), "utf8"));
+    assert.equal(reboundEntry.history.relation, "rebind");
+    assert.equal(reboundEntry.context.binding_source, "entry-2");
+    assert.deepEqual(JSON.parse(await readFile(join(initialized.paths.entriesRoot, "entry-1.json"), "utf8")), entry, "move never mutates prior entries");
+  } finally {
+    await rm(fixture.config, { recursive: true, force: true });
+    await rm(fixture.repo.dir, { recursive: true, force: true });
+  }
+});
+
+test("Doctor: a full run mutates nothing — config and repository trees are byte-identical", async () => {
+  const config = await mkdtemp(join(tmpdir(), "ppo-doctor-nomut-"));
+  const repo = await gitRepoFixture();
+  try {
+    await mkdir(join(config, "pi-paseo-orchestration"), { recursive: true });
+    await writeSettings(config, validDoc);
+    const fake = fakePi({ env: { PI_PASEO_ORCHESTRATION_ROLE: "lead", PASEO_AGENT_ID: "agent-7", PI_CODING_AGENT_DIR: config } });
+    fake.ctx.cwd = repo.dir;
+    const ext = await freshExtension();
+    ext.default(fake.pi);
+    const command = fake.commands.get("pi-paseo-orchestration:doctor");
+    const before = async (dir) => {
+      const map = new Map();
+      const walk = async (base, rel) => {
+        for (const name of await readdir(join(base, rel))) {
+          const full = join(base, rel, name);
+          const st = await stat(full);
+          map.set(join(rel, name), st.isDirectory() ? "dir" : (await readFile(full)).toString("hex"));
+        }
+      };
+      await walk(dir, "");
+      for (const name of await readdir(dir)) {
+        const full = join(dir, name);
+        if ((await stat(full)).isDirectory()) await walk(dir, name);
+      }
+      return [...map.entries()].sort();
+    };
+    const configBefore = await before(config);
+    const repoBefore = await before(repo.dir);
+    const result = await command.handler("", fake.ctx);
+    assert.equal(result.ok, true, result.error);
+    assert.deepEqual(await before(config), configBefore, "doctor must not write the Pi config");
+    assert.deepEqual(await before(repo.dir), repoBefore, "doctor must not write the repository");
+  } finally {
+    await rm(config, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+  }
+});
+
+test("Doctor: secret-shaped values are redacted from the report", async () => {
+  const config = await mkdtemp(join(tmpdir(), "ppo-doctor-redact-"));
+  try {
+    const fake = fakePi({ env: { PI_PASEO_ORCHESTRATION_ROLE: "peer token=super-secret-value", PI_CODING_AGENT_DIR: config } });
+    const ext = await freshExtension();
+    const report = await ext.buildDoctorReport({ ctx: fake.ctx, pi: fake.pi, now: "2026-01-01T00:00:00.000Z", reportId: "doctor-redact" });
+    const block = ext.formatDoctorReport(report);
+    assert.equal(report.checks.find((check) => check.code === "ROLE_ACTIVATION").status, "BLOCKED");
+    assert.equal(block.includes("super-secret-value"), false, "raw secret must never appear");
+    assert.equal(block.includes("[REDACTED]"), true);
+  } finally {
+    await rm(config, { recursive: true, force: true });
   }
 });

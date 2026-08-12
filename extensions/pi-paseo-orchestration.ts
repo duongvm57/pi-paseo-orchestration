@@ -1,7 +1,7 @@
-import { lstat, mkdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, posix, relative } from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -619,7 +619,11 @@ export function effectiveTools(baseline, role, authority = null) {
 
 function gitOut(repoRoot, args, trim = true) {
   return new Promise((resolve) => {
-    execFile("git", args, { cwd: repoRoot, timeout: 15000 }, (err, stdout) => {
+    execFile("git", args, {
+      cwd: repoRoot,
+      timeout: 15000,
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+    }, (err, stdout) => {
       resolve(err ? null : (trim ? stdout.trim() : stdout));
     });
   });
@@ -1989,6 +1993,1415 @@ async function activateEnvelope(envelope, route = "direct") {
   return { ok: true, authority: { envelope, repoRoot, scope: check.scope, exclusions: check.exclusions } };
 }
 
+/**
+ * Supervisor Notebook
+ *
+ * This is deliberately a small append-only file store.  The manifest and
+ * entries are evidence, not a control plane: none of the helpers below touch
+ * a repository, Paseo state, authority, or lifecycle state.
+ */
+export const NOTEBOOK_CONTRACT = "pi-paseo-supervisor-notebook";
+export const NOTEBOOK_ENTRY_CONTRACT = "pi-paseo-supervisor-notebook-entry";
+export const NOTEBOOK_CONTRACT_VERSION = "v1";
+export const NOTEBOOK_STORAGE_VERSION = "v1";
+export const NOTEBOOK_INIT_COMMAND = "pi-paseo-orchestration:notebook-init";
+export const NOTEBOOK_APPEND_COMMAND = "pi-paseo-orchestration:notebook-append";
+export const NOTEBOOK_APPEND_TOOL = "pi-paseo-orchestration:supervisor_notebook_append";
+
+const NOTEBOOK_MANIFEST_FIELDS = [
+  "contract", "contract_version", "manifest_schema", "notebook_id",
+  "protocol_project_id", "paseo_project_id_at_creation",
+  "repository_root_at_creation", "project_key", "created_at", "created_by",
+  "creation_route", "manifest_digest",
+];
+const NOTEBOOK_CREATED_BY_FIELDS = ["supervisor_agent_id", "pi_session_id"];
+const NOTEBOOK_ENTRY_FIELDS = [
+  "contract", "schema_version", "entry_id", "notebook_id", "protocol_project_id",
+  "recorded_at", "observed_at", "writer", "context", "observation", "evidence",
+  "suspected_mechanism", "impact", "question", "recommendation", "escalation",
+  "history", "sensitivity", "entry_digest",
+];
+const NOTEBOOK_WRITER_FIELDS = ["supervisor_agent_id", "pi_session_id"];
+const NOTEBOOK_CONTEXT_FIELDS = [
+  "paseo_project_id", "repository_root", "paseo_workspace_id", "lead_agent_id",
+  "binding_source", "protocol_pin",
+];
+const NOTEBOOK_PROTOCOL_PIN_FIELDS = ["version", "digest"];
+const NOTEBOOK_MECHANISM_FIELDS = ["hypothesis", "uncertainty", "confidence"];
+const NOTEBOOK_ESCALATION_FIELDS = ["needed", "owner", "reason", "relay_target"];
+const NOTEBOOK_HISTORY_FIELDS = ["relation", "references", "reason"];
+const NOTEBOOK_REFERENCE_FIELDS = ["entry_id", "entry_digest"];
+const NOTEBOOK_SENSITIVITY_FIELDS = ["redactions", "contains_secret"];
+const NOTEBOOK_EVIDENCE_FIELDS = [
+  "item_id", "observed_at", "kind", "source", "selected", "source_digest",
+  "retained_digest", "redaction_notes", "truncated",
+];
+const NOTEBOOK_MAX_ID = 128;
+const NOTEBOOK_MAX_PROJECT_ID = 512;
+const NOTEBOOK_MAX_TEXT = 4000;
+const NOTEBOOK_MAX_SOURCE = 512;
+const NOTEBOOK_MAX_EVIDENCE = 64;
+const NOTEBOOK_MAX_REDACTION_NOTES = 32;
+const NOTEBOOK_DIGEST = /^sha256:[0-9a-f]{64}$/;
+const NOTEBOOK_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const NOTEBOOK_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+function notebookStorageRoot(configRoot) {
+  return join(configRoot, "pi-paseo-orchestration", "supervisor-notebooks", NOTEBOOK_STORAGE_VERSION);
+}
+
+export function deriveNotebookProjectKey(projectId) {
+  if (typeof projectId !== "string" || projectId.length === 0 || projectId.length > NOTEBOOK_MAX_PROJECT_ID || projectId.includes("\0")) {
+    throw new Error("protocol project_id must be a nonempty bounded UTF-8 string without NUL");
+  }
+  return createHash("sha256").update(Buffer.from(projectId, "utf8")).digest("hex").toLowerCase();
+}
+
+// Short alias kept as a test seam; it still hashes the exact, untrimmed ID.
+export const projectKey = deriveNotebookProjectKey;
+export const deriveProjectKey = deriveNotebookProjectKey;
+
+export function supervisorNotebookStorageRoot(configRoot) {
+  return notebookStorageRoot(configRoot);
+}
+
+export function notebookPaths(configRoot, projectId) {
+  const root = notebookStorageRoot(configRoot);
+  const key = deriveNotebookProjectKey(projectId);
+  const projectRoot = join(root, "projects", key);
+  return {
+    configRoot,
+    storageRoot: root,
+    projectsRoot: join(root, "projects"),
+    projectRoot,
+    manifestPath: join(projectRoot, "manifest.json"),
+    entriesRoot: join(projectRoot, "entries"),
+    stagingRoot: join(root, ".staging"),
+    projectKey: key,
+  };
+}
+
+export function notebookProjectPath(configRoot, projectId) { return notebookPaths(configRoot, projectId).projectRoot; }
+export function notebookManifestPath(configRoot, projectId) { return notebookPaths(configRoot, projectId).manifestPath; }
+export function notebookEntriesPath(configRoot, projectId) { return notebookPaths(configRoot, projectId).entriesRoot; }
+export const notebookRoot = supervisorNotebookStorageRoot;
+
+function canonicalNotebookValue(value) {
+  if (Array.isArray(value)) return value.map(canonicalNotebookValue);
+  if (isRecord(value)) {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalNotebookValue(value[key])]));
+  }
+  if (typeof value === "number" && !Number.isFinite(value)) throw new Error("canonical JSON cannot contain a non-finite number");
+  if (value === undefined) throw new Error("canonical JSON cannot contain undefined");
+  return value;
+}
+
+export function canonicalNotebookJson(value) {
+  const text = JSON.stringify(canonicalNotebookValue(value));
+  if (typeof text !== "string") throw new Error("canonical JSON value is not serializable");
+  return text;
+}
+
+function notebookBytes(value) {
+  return Buffer.from(`${canonicalNotebookJson(value)}\n`, "utf8");
+}
+
+function notebookDigest(value, field) {
+  const copy = structuredClone(value);
+  delete copy[field];
+  return `sha256:${createHash("sha256").update(Buffer.from(canonicalNotebookJson(copy), "utf8")).digest("hex")}`;
+}
+
+function rawDigest(bytes) {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+function notebookClosed(value, fields, label) {
+  if (!isRecord(value)) return { ok: false, error: `${label} must be a single object` };
+  const extra = Object.keys(value).find((field) => !fields.includes(field));
+  if (extra !== undefined) return { ok: false, error: `unknown field ${JSON.stringify(extra)} in ${label}` };
+  return { ok: true };
+}
+
+function notebookText(value, label, max = NOTEBOOK_MAX_TEXT) {
+  if (typeof value !== "string" || value.trim() === "") return { ok: false, error: `${label} must be a nonempty string` };
+  if (value.length > max) return { ok: false, error: `${label} exceeds the ${max}-character bound` };
+  if (value.includes("\0")) return { ok: false, error: `${label} must not contain NUL` };
+  return { ok: true };
+}
+
+function notebookId(value, label) {
+  if (typeof value !== "string" || !NOTEBOOK_ID.test(value) || value === "." || value === "..") {
+    return { ok: false, error: `${label} must be one safe filename component` };
+  }
+  return { ok: true };
+}
+
+function notebookDigestField(value, label) {
+  return NOTEBOOK_DIGEST.test(value)
+    ? { ok: true }
+    : { ok: false, error: `${label} must be a sha256:<64 lowercase hex> digest` };
+}
+
+function notebookTimestamp(value, label) {
+  if (typeof value !== "string" || !NOTEBOOK_TIMESTAMP.test(value) || Number.isNaN(Date.parse(value))) {
+    return { ok: false, error: `${label} must be an RFC3339 UTC timestamp with milliseconds` };
+  }
+  return { ok: true };
+}
+
+function notebookPathLocator(value, label, { allowUnknown = false } = {}) {
+  if (allowUnknown && value === "unknown") return { ok: true };
+  if (typeof value !== "string" || value.trim() === "" || value.includes("\0")) {
+    return { ok: false, error: `${label} must be a nonempty path locator` };
+  }
+  if (!isAbsolute(value)) return { ok: false, error: `${label} must be an absolute canonical path` };
+  if (posix.normalize(value) !== value || (value.length > 1 && value.endsWith("/"))) {
+    return { ok: false, error: `${label} must be canonical without traversal or normalization aliases` };
+  }
+  return { ok: true };
+}
+
+export function validateNotebookManifest(manifest, { rawText } = {}) {
+  let check = notebookClosed(manifest, NOTEBOOK_MANIFEST_FIELDS, "notebook manifest");
+  if (!check.ok) return check;
+  for (const [field, expected] of [
+    ["contract", NOTEBOOK_CONTRACT], ["contract_version", NOTEBOOK_CONTRACT_VERSION], ["manifest_schema", NOTEBOOK_CONTRACT_VERSION],
+  ]) {
+    if (manifest[field] !== expected) return { ok: false, error: `manifest.${field} must be exactly ${JSON.stringify(expected)}` };
+  }
+  for (const field of ["notebook_id"]) {
+    check = notebookId(manifest[field], `manifest.${field}`);
+    if (!check.ok) return check;
+  }
+  check = notebookText(manifest.protocol_project_id, "manifest.protocol_project_id", NOTEBOOK_MAX_PROJECT_ID);
+  if (!check.ok) return check;
+  try {
+    if (deriveNotebookProjectKey(manifest.protocol_project_id) !== manifest.project_key) {
+      return { ok: false, error: "manifest.project_key does not equal lowercase sha256(protocol_project_id UTF-8 bytes)" };
+    }
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+  check = notebookPathLocator(manifest.repository_root_at_creation, "manifest.repository_root_at_creation");
+  if (!check.ok) return check;
+  check = notebookText(manifest.paseo_project_id_at_creation, "manifest.paseo_project_id_at_creation", 512);
+  if (!check.ok) return check;
+  check = notebookTimestamp(manifest.created_at, "manifest.created_at");
+  if (!check.ok) return check;
+  check = notebookClosed(manifest.created_by, NOTEBOOK_CREATED_BY_FIELDS, "manifest.created_by");
+  if (!check.ok) return check;
+  for (const field of NOTEBOOK_CREATED_BY_FIELDS) {
+    check = notebookText(manifest.created_by[field], `manifest.created_by.${field}`, 512);
+    if (!check.ok) return check;
+  }
+  if (manifest.creation_route !== "human_confirmed") {
+    return { ok: false, error: "manifest.creation_route must be exactly human_confirmed" };
+  }
+  check = notebookDigestField(manifest.manifest_digest, "manifest.manifest_digest");
+  if (!check.ok) return check;
+  if (manifest.manifest_digest !== notebookDigest(manifest, "manifest_digest")) {
+    return { ok: false, error: "manifest.manifest_digest does not match canonical manifest bytes" };
+  }
+  if (rawText !== undefined) {
+    let expected;
+    try { expected = notebookBytes(manifest).toString("utf8"); } catch (err) { return { ok: false, error: err.message }; }
+    if (rawText !== expected && rawText !== expected.slice(0, -1)) return { ok: false, error: "notebook manifest bytes are not canonical JSON" };
+  }
+  return { ok: true, manifest };
+}
+
+export function parseNotebookManifest(text) {
+  if (typeof text !== "string") return { ok: false, error: "notebook manifest must be a string" };
+  const duplicate = findDuplicateKey(text);
+  if (duplicate !== null) return { ok: false, error: `notebook manifest contains duplicate field ${JSON.stringify(duplicate)}` };
+  let manifest;
+  try { manifest = JSON.parse(text); } catch { return { ok: false, error: "notebook manifest is not valid JSON" }; }
+  const check = validateNotebookManifest(manifest, { rawText: text });
+  return check.ok ? { ok: true, manifest } : check;
+}
+
+function validateNotebookEvidenceItem(item, index) {
+  let check = notebookClosed(item, NOTEBOOK_EVIDENCE_FIELDS, `notebook evidence[${index}]`);
+  if (!check.ok) return check;
+  for (const field of ["item_id", "kind", "source", "selected", "retained_digest"]) {
+    check = notebookText(item[field], `notebook evidence[${index}].${field}`, field === "source" ? NOTEBOOK_MAX_SOURCE : NOTEBOOK_MAX_TEXT);
+    if (!check.ok) return check;
+  }
+  check = notebookTimestamp(item.observed_at, `notebook evidence[${index}].observed_at`);
+  if (!check.ok) return check;
+  if (item.source_digest !== null) {
+    check = notebookDigestField(item.source_digest, `notebook evidence[${index}].source_digest`);
+    if (!check.ok) return check;
+  }
+  check = notebookDigestField(item.retained_digest, `notebook evidence[${index}].retained_digest`);
+  if (!check.ok) return check;
+  if (item.retained_digest !== rawDigest(Buffer.from(item.selected, "utf8"))) {
+    return { ok: false, error: `notebook evidence[${index}].retained_digest does not match the retained redacted representation` };
+  }
+  if (!Array.isArray(item.redaction_notes) || item.redaction_notes.length > NOTEBOOK_MAX_REDACTION_NOTES
+      || item.redaction_notes.some((note) => typeof note !== "string" || note.trim() === "" || note.length > 512)) {
+    return { ok: false, error: `notebook evidence[${index}].redaction_notes must be a bounded array of nonempty strings` };
+  }
+  if (typeof item.truncated !== "boolean") return { ok: false, error: `notebook evidence[${index}].truncated must be a boolean` };
+  return { ok: true };
+}
+
+function validateNotebookContext(context) {
+  let check = notebookClosed(context, NOTEBOOK_CONTEXT_FIELDS, "notebook entry context");
+  if (!check.ok) return check;
+  check = notebookText(context.paseo_project_id, "context.paseo_project_id", 512);
+  if (!check.ok || context.paseo_project_id === "unknown") return { ok: false, error: "context.paseo_project_id must be an exact current Paseo project identity" };
+  check = notebookPathLocator(context.repository_root, "context.repository_root");
+  if (!check.ok) return check;
+  check = notebookText(context.paseo_workspace_id, "context.paseo_workspace_id", 512);
+  if (!check.ok) return check;
+  check = notebookText(context.lead_agent_id, "context.lead_agent_id", 512);
+  if (!check.ok) return check;
+  check = notebookId(context.binding_source, "context.binding_source");
+  if (!check.ok && context.binding_source !== "manifest") return check;
+  if (context.protocol_pin !== null) {
+    check = notebookClosed(context.protocol_pin, NOTEBOOK_PROTOCOL_PIN_FIELDS, "context.protocol_pin");
+    if (!check.ok) return check;
+    if (!Number.isSafeInteger(context.protocol_pin.version) || context.protocol_pin.version < 1) {
+      return { ok: false, error: "context.protocol_pin.version must be a positive integer" };
+    }
+    check = notebookDigestField(context.protocol_pin.digest, "context.protocol_pin.digest");
+    if (!check.ok) return check;
+  }
+  return { ok: true };
+}
+
+export function validateNotebookEntry(entry, { manifest, rawText } = {}) {
+  let check = notebookClosed(entry, NOTEBOOK_ENTRY_FIELDS, "notebook entry");
+  if (!check.ok) return check;
+  if (entry.contract !== NOTEBOOK_ENTRY_CONTRACT || entry.schema_version !== NOTEBOOK_CONTRACT_VERSION) {
+    return { ok: false, error: "notebook entry contract and schema_version must be exactly v1" };
+  }
+  check = notebookId(entry.entry_id, "entry.entry_id");
+  if (!check.ok) return check;
+  check = notebookId(entry.notebook_id, "entry.notebook_id");
+  if (!check.ok) return check;
+  check = notebookText(entry.protocol_project_id, "entry.protocol_project_id", NOTEBOOK_MAX_PROJECT_ID);
+  if (!check.ok) return check;
+  for (const field of ["recorded_at", "observed_at"]) {
+    check = notebookTimestamp(entry[field], `entry.${field}`);
+    if (!check.ok) return check;
+  }
+  check = notebookClosed(entry.writer, NOTEBOOK_WRITER_FIELDS, "notebook entry writer");
+  if (!check.ok) return check;
+  for (const field of NOTEBOOK_WRITER_FIELDS) {
+    check = notebookText(entry.writer[field], `entry.writer.${field}`, 512);
+    if (!check.ok) return check;
+  }
+  check = validateNotebookContext(entry.context);
+  if (!check.ok) return check;
+  for (const field of ["observation", "impact", "question", "recommendation"]) {
+    check = notebookText(entry[field], `entry.${field}`);
+    if (!check.ok) return check;
+  }
+  if (!Array.isArray(entry.evidence) || entry.evidence.length === 0 || entry.evidence.length > NOTEBOOK_MAX_EVIDENCE) {
+    return { ok: false, error: `entry.evidence must contain 1-${NOTEBOOK_MAX_EVIDENCE} items` };
+  }
+  for (const [index, item] of entry.evidence.entries()) {
+    check = validateNotebookEvidenceItem(item, index);
+    if (!check.ok) return check;
+  }
+  check = notebookClosed(entry.suspected_mechanism, NOTEBOOK_MECHANISM_FIELDS, "notebook suspected_mechanism");
+  if (!check.ok) return check;
+  for (const field of ["hypothesis", "uncertainty"]) {
+    check = notebookText(entry.suspected_mechanism[field], `suspected_mechanism.${field}`);
+    if (!check.ok) return check;
+  }
+  if (!["low", "medium", "high"].includes(entry.suspected_mechanism.confidence)) {
+    return { ok: false, error: "suspected_mechanism.confidence must be low|medium|high" };
+  }
+  check = notebookClosed(entry.escalation, NOTEBOOK_ESCALATION_FIELDS, "notebook escalation");
+  if (!check.ok) return check;
+  if (typeof entry.escalation.needed !== "boolean") return { ok: false, error: "escalation.needed must be a boolean" };
+  if (!["lead", "human", "none"].includes(entry.escalation.owner)) return { ok: false, error: "escalation.owner must be lead|human|none" };
+  check = notebookText(entry.escalation.reason, "escalation.reason");
+  if (!check.ok) return check;
+  if (entry.escalation.relay_target !== null) {
+    check = notebookText(entry.escalation.relay_target, "escalation.relay_target", 512);
+    if (!check.ok) return check;
+  }
+  check = notebookClosed(entry.history, NOTEBOOK_HISTORY_FIELDS, "notebook history");
+  if (!check.ok) return check;
+  if (!["original", "correction", "supersession", "rebind"].includes(entry.history.relation)) {
+    return { ok: false, error: "history.relation must be original|correction|supersession|rebind" };
+  }
+  if (!Array.isArray(entry.history.references) || entry.history.references.length > NOTEBOOK_MAX_EVIDENCE) {
+    return { ok: false, error: "history.references must be a bounded array" };
+  }
+  for (const [index, reference] of entry.history.references.entries()) {
+    check = notebookClosed(reference, NOTEBOOK_REFERENCE_FIELDS, `history.references[${index}]`);
+    if (!check.ok) return check;
+    check = notebookId(reference.entry_id, `history.references[${index}].entry_id`);
+    if (!check.ok) return check;
+    check = notebookDigestField(reference.entry_digest, `history.references[${index}].entry_digest`);
+    if (!check.ok) return check;
+  }
+  if (["correction", "supersession"].includes(entry.history.relation) && entry.history.references.length === 0) {
+    return { ok: false, error: `history.${entry.history.relation} requires a prior entry reference` };
+  }
+  check = notebookText(entry.history.reason, "history.reason");
+  if (!check.ok) return check;
+  check = notebookClosed(entry.sensitivity, NOTEBOOK_SENSITIVITY_FIELDS, "notebook sensitivity");
+  if (!check.ok) return check;
+  if (!Array.isArray(entry.sensitivity.redactions) || entry.sensitivity.redactions.length > NOTEBOOK_MAX_REDACTION_NOTES
+      || entry.sensitivity.redactions.some((item) => typeof item !== "string" || item.trim() === "" || item.length > 512)) {
+    return { ok: false, error: "sensitivity.redactions must be a bounded array of nonempty strings" };
+  }
+  if (entry.sensitivity.contains_secret !== false) return { ok: false, error: "sensitivity.contains_secret must be exactly false" };
+  check = notebookDigestField(entry.entry_digest, "entry.entry_digest");
+  if (!check.ok) return check;
+  if (manifest !== undefined) {
+    if (!manifest || entry.notebook_id !== manifest.notebook_id) return { ok: false, error: "entry.notebook_id does not match the manifest" };
+    if (entry.protocol_project_id !== manifest.protocol_project_id) return { ok: false, error: "entry.protocol_project_id does not match the manifest" };
+  }
+  if (entry.entry_digest !== notebookDigest(entry, "entry_digest")) {
+    return { ok: false, error: "entry.entry_digest does not match canonical entry bytes" };
+  }
+  if (rawText !== undefined) {
+    const expected = notebookBytes(entry).toString("utf8");
+    if (rawText !== expected && rawText !== expected.slice(0, -1)) return { ok: false, error: "notebook entry bytes are not canonical JSON" };
+  }
+  return { ok: true, entry };
+}
+
+export function parseNotebookEntry(text, { manifest } = {}) {
+  if (typeof text !== "string") return { ok: false, error: "notebook entry must be a string" };
+  const duplicate = findDuplicateKey(text);
+  if (duplicate !== null) return { ok: false, error: `notebook entry contains duplicate field ${JSON.stringify(duplicate)}` };
+  let entry;
+  try { entry = JSON.parse(text); } catch { return { ok: false, error: "notebook entry is not valid JSON" }; }
+  const check = validateNotebookEntry(entry, { manifest, rawText: text });
+  return check.ok ? { ok: true, entry } : check;
+}
+
+function safeNotebookComponentPath(root, target, label) {
+  const rel = relative(root, target);
+  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) return { ok: false, error: `${label} escapes the Pi config root` };
+  return { ok: true };
+}
+
+async function canonicalConfigRoot(raw, create = false) {
+  const candidate = isAbsolute(raw) ? raw : join(process.cwd(), raw);
+  try {
+    const real = await realpath(candidate);
+    if (!(await stat(real)).isDirectory()) return { ok: false, error: "effective Pi config directory is not a directory" };
+    return { ok: true, path: real };
+  } catch (err) {
+    if (err.code !== "ENOENT" || !create) return { ok: false, error: "effective Pi config directory is not readable" };
+    try {
+      await mkdir(candidate, { recursive: true, mode: 0o700 });
+      const real = await realpath(candidate);
+      return { ok: true, path: real };
+    } catch (createErr) {
+      return { ok: false, error: `effective Pi config directory cannot be created: ${createErr.message}` };
+    }
+  }
+}
+
+async function assertNoSymlinkComponents(root, target, label, { allowMissing = false } = {}) {
+  const containment = safeNotebookComponentPath(root, target, label);
+  if (!containment.ok) return containment;
+  const rel = relative(root, target);
+  let current = root;
+  for (const part of rel.split(/[\\/]/).filter(Boolean)) {
+    current = join(current, part);
+    let entry;
+    try { entry = await lstat(current); } catch (err) {
+      if (err.code === "ENOENT" && allowMissing) return { ok: true };
+      return { ok: false, error: `${label} is not readable` };
+    }
+    if (entry.isSymbolicLink()) return { ok: false, error: `${label} contains a symlink component` };
+  }
+  return { ok: true };
+}
+
+async function makePrivateDirectory(path, root, label) {
+  const safe = await assertNoSymlinkComponents(root, path, label, { allowMissing: true });
+  if (!safe.ok) return safe;
+  try {
+    await mkdir(path, { recursive: true, mode: 0o700 });
+  } catch (err) {
+    return { ok: false, error: `${label} cannot be created: ${err.message}` };
+  }
+  return assertNoSymlinkComponents(root, path, label);
+}
+
+async function prepareNotebookPaths(env, projectId, create = false) {
+  let root = await canonicalConfigRoot(configDir(env), create);
+  if (!root.ok) return root;
+  let paths;
+  try { paths = notebookPaths(root.path, projectId); } catch (err) { return { ok: false, error: err.message }; }
+  if (create) {
+    for (const [path, label] of [[paths.storageRoot, "notebook storage root"], [paths.projectsRoot, "notebook projects root"], [paths.projectRoot, "notebook project directory"], [paths.entriesRoot, "notebook entries directory"], [paths.stagingRoot, "notebook staging directory"]]) {
+      const made = await makePrivateDirectory(path, root.path, label);
+      if (!made.ok) return made;
+    }
+  } else {
+    for (const [path, label] of [[paths.storageRoot, "notebook storage root"], [paths.projectsRoot, "notebook projects root"], [paths.projectRoot, "notebook project directory"], [paths.entriesRoot, "notebook entries directory"]]) {
+      const check = await assertNoSymlinkComponents(root.path, path, label);
+      if (!check.ok) return check;
+    }
+  }
+  return { ok: true, root: root.path, paths };
+}
+
+async function parseNotebookJson(bytes, label) {
+  const text = bytes.toString("utf8");
+  const duplicate = findDuplicateKey(text);
+  if (duplicate !== null) return { ok: false, error: `${label} contains duplicate field ${JSON.stringify(duplicate)}` };
+  try { return { ok: true, value: JSON.parse(text), text }; }
+  catch { return { ok: false, error: `${label} is not valid JSON` }; }
+}
+
+async function readManifestForPaths(prepared) {
+  const safe = await assertNoSymlinkComponents(prepared.root, prepared.paths.manifestPath, "notebook manifest path");
+  if (!safe.ok) return safe;
+  let bytes;
+  try { bytes = await readFile(prepared.paths.manifestPath); }
+  catch (err) {
+    if (err.code === "ENOENT") return { ok: false, error: "notebook manifest is missing" };
+    return { ok: false, error: `notebook manifest read failed: ${err.message}` };
+  }
+  const parsed = await parseNotebookJson(bytes, "notebook manifest");
+  if (!parsed.ok) return parsed;
+  const check = validateNotebookManifest(parsed.value, { rawText: parsed.text });
+  if (!check.ok) return check;
+  if (parsed.value.project_key !== prepared.paths.projectKey) return { ok: false, error: "manifest project_key does not match its derived notebook directory" };
+  return { ok: true, manifest: parsed.value, bytes, rawDigest: rawDigest(bytes) };
+}
+
+async function readValidNotebookEntries(prepared, manifest) {
+  let names;
+  try { names = await readdir(prepared.paths.entriesRoot); }
+  catch (err) { return { ok: false, error: `notebook entries directory read failed: ${err.message}` }; }
+  const files = [];
+  const valid = [];
+  const invalid = [];
+  for (const name of names.sort()) {
+    const path = join(prepared.paths.entriesRoot, name);
+    let st;
+    try { st = await lstat(path); } catch (err) { return { ok: false, error: `notebook entry ${name} cannot be inspected: ${err.message}` }; }
+    if (!st.isFile()) return { ok: false, error: `notebook entry ${name} is not a regular direct-child file` };
+    const bytes = await readFile(path);
+    const digest = rawDigest(bytes);
+    files.push({ filename: name, raw_digest: digest });
+    const parsed = await parseNotebookJson(bytes, `notebook entry ${name}`);
+    let check = parsed.ok ? validateNotebookEntry(parsed.value, { manifest, rawText: parsed.text }) : parsed;
+    if (check.ok) {
+      if (name !== `${check.entry.entry_id}.json`) check = { ok: false, error: "entry filename does not match entry_id" };
+    }
+    if (check.ok) valid.push(check.entry);
+    else invalid.push({ filename: name, raw_digest: digest, error: check.error });
+  }
+  return { ok: true, files, valid, invalid };
+}
+
+async function syncNotebookDirectory(path) {
+  let handle;
+  try {
+    handle = await open(path, "r");
+    await handle.sync();
+  } catch (err) {
+    throw new Error(`directory durability sync failed for ${path}: ${err.message}`);
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+// One package-private publication primitive: complete private staging, fsync,
+// atomic hard-link to an absent final name, parent fsync, staging cleanup.
+export async function publishNotebookCreateOnly({ storageRoot, finalParent, finalName, bytes }) {
+  if (!Buffer.isBuffer(bytes)) bytes = Buffer.from(bytes);
+  const safeParent = await assertNoSymlinkComponents(storageRoot, finalParent, "notebook final parent");
+  if (!safeParent.ok) return safeParent;
+  if (dirname(join(finalParent, finalName)) !== finalParent || finalName.includes("/") || finalName.includes("\\") || finalName === "." || finalName === "..") {
+    return { ok: false, error: "notebook final name must be a direct child of the exact final parent" };
+  }
+  const stagingRoot = join(storageRoot, ".staging");
+  const safeStage = await assertNoSymlinkComponents(storageRoot, stagingRoot, "notebook staging root");
+  if (!safeStage.ok) return safeStage;
+  const finalPath = join(finalParent, finalName);
+  const before = await lstat(finalPath).catch((err) => (err.code === "ENOENT" ? null : { error: err }));
+  if (before?.error) return { ok: false, error: `notebook final path cannot be inspected: ${before.error.message}` };
+  if (before && before.isSymbolicLink()) return { ok: false, error: "notebook final path must not be a symlink" };
+  if (before && !before.isFile()) return { ok: false, error: "notebook final path is not a regular file" };
+  if (before) {
+    const existing = await readFile(finalPath);
+    const incomingDigest = rawDigest(bytes);
+    const existingDigest = rawDigest(existing);
+    if (existingDigest === incomingDigest) {
+      try { await syncNotebookDirectory(finalParent); } catch (err) { return { ok: false, error: err.message }; }
+      return { ok: true, status: "idempotent", path: finalPath, digest: existingDigest };
+    }
+    return { ok: false, status: "conflict", error: "notebook final path already contains different bytes", path: finalPath, existing_digest: existingDigest, incoming_digest: incomingDigest };
+  }
+
+  const stagePath = join(stagingRoot, `.stage-${randomUUID()}`);
+  let handle;
+  let linked = false;
+  try {
+    handle = await open(stagePath, "wx", 0o600);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const result = await handle.write(bytes, offset, bytes.length - offset);
+      if (!result.bytesWritten) throw new Error("staging write made no progress");
+      offset += result.bytesWritten;
+    }
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    const finalSafe = await assertNoSymlinkComponents(storageRoot, finalParent, "notebook final parent");
+    if (!finalSafe.ok) return finalSafe;
+    try {
+      await link(stagePath, finalPath);
+      linked = true;
+    } catch (err) {
+      if (err.code === "EEXIST") {
+        const existing = await readFile(finalPath);
+        const incomingDigest = rawDigest(bytes);
+        const existingDigest = rawDigest(existing);
+        return existingDigest === incomingDigest
+          ? { ok: true, status: "idempotent", path: finalPath, digest: existingDigest }
+          : { ok: false, status: "conflict", error: "notebook final path already contains different bytes", path: finalPath, existing_digest: existingDigest, incoming_digest: incomingDigest };
+      }
+      if (["EXDEV", "EOPNOTSUPP", "ENOTSUP", "EPERM"].includes(err.code)) {
+        return { ok: false, error: `no-replace notebook publication is unsupported: ${err.message}` };
+      }
+      return { ok: false, error: `notebook publication link failed: ${err.message}` };
+    }
+    await syncNotebookDirectory(finalParent);
+    return { ok: true, status: "created", path: finalPath, digest: rawDigest(bytes) };
+  } catch (err) {
+    return { ok: false, error: `notebook publication failed: ${err.message}` };
+  } finally {
+    await handle?.close().catch(() => {});
+    // A linked inode is already durable evidence; only the private staging name
+    // is cleaned.  Failure to remove it leaves a private orphan, never evidence.
+    await unlink(stagePath).catch(() => {});
+    await syncNotebookDirectory(stagingRoot).catch(() => {});
+  }
+}
+
+async function findNotebookIdElsewhere(prepared, notebookId) {
+  let names;
+  try { names = await readdir(prepared.paths.projectsRoot); }
+  catch (err) { return { ok: false, error: `notebook projects directory read failed: ${err.message}` }; }
+  for (const name of names) {
+    if (name === prepared.paths.projectKey) continue;
+    if (!NOTEBOOK_ID.test(name)) continue;
+    const candidateRoot = join(prepared.paths.projectsRoot, name);
+    const candidateSafety = await assertNoSymlinkComponents(prepared.root, candidateRoot, "notebook project scan path");
+    if (!candidateSafety.ok) return candidateSafety;
+    const candidate = { ...prepared, paths: notebookPaths(prepared.root, "x") };
+    candidate.paths.projectRoot = candidateRoot;
+    candidate.paths.manifestPath = join(candidate.paths.projectRoot, "manifest.json");
+    let bytes;
+    try { bytes = await readFile(candidate.paths.manifestPath); } catch (err) { if (err.code === "ENOENT") continue; return { ok: false, error: `notebook manifest scan failed: ${err.message}` }; }
+    const parsed = await parseNotebookJson(bytes, "notebook manifest");
+    if (!parsed.ok) return parsed;
+    const check = validateNotebookManifest(parsed.value, { rawText: parsed.text });
+    if (!check.ok) return { ok: false, error: `another notebook is malformed: ${check.error}` };
+    if (parsed.value.notebook_id === notebookId) return { ok: false, error: "notebook_id already exists under another project key" };
+  }
+  return { ok: true };
+}
+
+async function canonicalLocator(value, label, allowUnknown = true) {
+  if (allowUnknown && value === "unknown") return { ok: true, value };
+  if (typeof value !== "string" || value.trim() === "") return { ok: false, error: `${label} must be nonempty` };
+  const candidate = isAbsolute(value) ? value : join(process.cwd(), value);
+  try {
+    const real = await realpath(candidate);
+    if (!(await stat(real)).isDirectory()) return { ok: false, error: `${label} must name a directory` };
+    return { ok: true, value: real };
+  } catch (err) {
+    return { ok: false, error: `${label} is not readable: ${err.message}` };
+  }
+}
+
+export async function initializeNotebook({
+  env = process.env, projectId, protocolProjectId, paseoProjectId, repositoryRoot = "unknown",
+  supervisorAgentId, piSessionId, createdAt = new Date().toISOString(),
+} = {}) {
+  const humanProjectId = projectId ?? protocolProjectId;
+  if (typeof humanProjectId !== "string" || humanProjectId.length === 0) return { ok: false, error: "protocol project_id is required" };
+  const paseo = typeof paseoProjectId === "string" && paseoProjectId.trim() !== "" && paseoProjectId !== "unknown" ? paseoProjectId : null;
+  if (paseo === null) return { ok: false, error: "paseo_project_id_at_creation is required" };
+  const agent = notebookText(supervisorAgentId, "supervisor_agent_id", 512);
+  if (!agent.ok) return agent;
+  const session = notebookText(piSessionId, "pi_session_id", 512);
+  if (!session.ok) return session;
+  const repo = await canonicalLocator(repositoryRoot, "repository_root_at_creation", true);
+  if (!repo.ok) return repo;
+  const prepared = await prepareNotebookPaths(env, humanProjectId, true);
+  if (!prepared.ok) return prepared;
+  let notebookId;
+  try { notebookId = `nb-${randomUUID()}`; } catch (err) { return { ok: false, error: `notebook identity generation failed: ${err.message}` }; }
+  const duplicate = await findNotebookIdElsewhere(prepared, notebookId);
+  if (!duplicate.ok) return duplicate;
+  let existing;
+  try { existing = await lstat(prepared.paths.manifestPath); } catch (err) { if (err.code !== "ENOENT") return { ok: false, error: `notebook manifest cannot be inspected: ${err.message}` }; }
+  if (existing) return { ok: false, error: "notebook manifest already exists; initialization is create-once" };
+  const manifest = {
+    contract: NOTEBOOK_CONTRACT,
+    contract_version: NOTEBOOK_CONTRACT_VERSION,
+    manifest_schema: NOTEBOOK_CONTRACT_VERSION,
+    notebook_id: notebookId,
+    protocol_project_id: humanProjectId,
+    paseo_project_id_at_creation: paseo,
+    repository_root_at_creation: repo.value,
+    project_key: prepared.paths.projectKey,
+    created_at: createdAt,
+    created_by: { supervisor_agent_id: supervisorAgentId, pi_session_id: piSessionId },
+    creation_route: "human_confirmed",
+    manifest_digest: "",
+  };
+  manifest.manifest_digest = notebookDigest(manifest, "manifest_digest");
+  const check = validateNotebookManifest(manifest);
+  if (!check.ok) return check;
+  const published = await publishNotebookCreateOnly({
+    storageRoot: prepared.paths.storageRoot,
+    finalParent: prepared.paths.projectRoot,
+    finalName: "manifest.json",
+    bytes: notebookBytes(manifest),
+  });
+  if (!published.ok) return published;
+  if (published.status !== "created") return { ok: false, error: "notebook manifest already exists; initialization is create-once" };
+  return { ok: true, manifest, paths: prepared.paths, status: "created" };
+}
+
+async function loadNotebook(prepared) {
+  const manifest = await readManifestForPaths(prepared);
+  if (!manifest.ok) return manifest;
+  const entries = await readValidNotebookEntries(prepared, manifest.manifest);
+  if (!entries.ok) return entries;
+  return { ok: true, ...manifest, entries };
+}
+
+function contextForNotebook(options = {}) {
+  const context = options.context ?? {};
+  return {
+    paseo_project_id: context.paseo_project_id ?? context.paseoProjectId ?? options.paseoProjectId ?? "unknown",
+    repository_root: context.repository_root ?? context.repositoryRoot ?? options.repositoryRoot ?? "unknown",
+    paseo_workspace_id: context.paseo_workspace_id ?? context.paseoWorkspaceId ?? options.paseoWorkspaceId ?? "unknown",
+    lead_agent_id: context.lead_agent_id ?? context.leadAgentId ?? options.leadAgentId ?? "unknown",
+    binding_source: context.binding_source ?? context.bindingSource ?? options.bindingSource ?? "manifest",
+    protocol_pin: context.protocol_pin ?? context.protocolPin ?? options.protocolPin ?? null,
+  };
+}
+
+function currentNotebookBinding(loaded) {
+  let binding = {
+    paseo_project_id: loaded.manifest.paseo_project_id_at_creation,
+    repository_root: loaded.manifest.repository_root_at_creation,
+    source: "manifest",
+  };
+  for (const entry of loaded.entries.valid.sort((a, b) => a.entry_id.localeCompare(b.entry_id))) {
+    if (entry.history.relation === "rebind" && entry.context.binding_source === entry.entry_id) {
+      binding = { paseo_project_id: entry.context.paseo_project_id, repository_root: entry.context.repository_root, source: entry.entry_id };
+    }
+  }
+  return binding;
+}
+
+export function classifyNotebookBinding(manifestOrLoaded, context) {
+  const loaded = manifestOrLoaded?.manifest ? manifestOrLoaded : { manifest: manifestOrLoaded, entries: { valid: [] } };
+  if (!loaded.manifest) return { ok: false, classification: "invalid", error: "notebook manifest is required" };
+  const binding = currentNotebookBinding(loaded);
+  const actual = contextForNotebook({ context });
+  const sameProject = actual.paseo_project_id === binding.paseo_project_id;
+  const sameRepository = actual.repository_root === binding.repository_root;
+  if (sameProject && sameRepository) return { ok: true, classification: "same", binding_source: binding.source, context: actual };
+  return {
+    ok: false,
+    classification: "move_or_copy",
+    error: "notebook project membership or repository locator changed; Human must classify move versus copy",
+    binding,
+    context: actual,
+  };
+}
+
+function normalizeNotebookEvidence(item, index) {
+  const value = structuredClone(item);
+  if (value.selected === undefined) value.selected = value.selected_facts ?? value.excerpt;
+  if (value.source === undefined) value.source = value.source_locator;
+  if (value.redaction_notes === undefined) value.redaction_notes = value.redactions ?? [];
+  if (value.source_digest === undefined) value.source_digest = null;
+  if (value.truncated === undefined) value.truncated = false;
+  if (value.retained_digest === undefined && typeof value.selected === "string") value.retained_digest = rawDigest(Buffer.from(value.selected, "utf8"));
+  return value;
+}
+
+function redactNotebookText(text, path, redactions) {
+  if (typeof text !== "string") return text;
+  let result = text;
+  const secretPattern = /((?:password|passwd|secret|token|credential|api[_-]?key|private[_-]?key|authorization)\s*[:=]\s*)([^\s,;]+)/gi;
+  result = result.replace(secretPattern, (_whole, prefix) => {
+    redactions.push(`${path}:secret`);
+    return `${prefix}[REDACTED]`;
+  });
+  if (result.length > NOTEBOOK_MAX_TEXT) {
+    redactions.push(`${path}:truncated`);
+    result = `${result.slice(0, NOTEBOOK_MAX_TEXT - 32)}…[TRUNCATED]`;
+  }
+  return result;
+}
+
+function redactNotebookEntry(entry) {
+  const value = structuredClone(entry);
+  const redactions = Array.isArray(value.sensitivity?.redactions) ? [...value.sensitivity.redactions] : [];
+  for (const field of ["observation", "impact", "question", "recommendation", "history"]) {
+    if (field === "history") {
+      if (typeof value.history?.reason === "string") value.history.reason = redactNotebookText(value.history.reason, "history.reason", redactions);
+    } else if (typeof value[field] === "string") value[field] = redactNotebookText(value[field], field, redactions);
+  }
+  if (value.suspected_mechanism) {
+    for (const field of ["hypothesis", "uncertainty"]) value.suspected_mechanism[field] = redactNotebookText(value.suspected_mechanism[field], `suspected_mechanism.${field}`, redactions);
+  }
+  if (value.escalation?.reason) value.escalation.reason = redactNotebookText(value.escalation.reason, "escalation.reason", redactions);
+  for (const [index, item] of (value.evidence ?? []).entries()) {
+    if (typeof item.selected === "string") item.selected = redactNotebookText(item.selected, `evidence[${index}].selected`, redactions);
+    if (Array.isArray(item.redaction_notes)) item.redaction_notes = item.redaction_notes.map((note) => redactNotebookText(note, `evidence[${index}].redaction_notes`, redactions));
+    if (item.selected !== undefined) item.retained_digest = rawDigest(Buffer.from(item.selected, "utf8"));
+  }
+  if (value.sensitivity?.contains_secret === true) throw new Error("notebook entry declares contains_secret=true; redact it before appending");
+  if (value.sensitivity) value.sensitivity = { ...value.sensitivity, redactions: [...new Set(redactions)], contains_secret: false };
+  return value;
+}
+
+export async function appendNotebookEntry({
+  env = process.env, projectId, protocolProjectId, entry, context, allowRebind = false,
+  supervisorAgentId, piSessionId,
+} = {}) {
+  const humanProjectId = projectId ?? protocolProjectId ?? entry?.protocol_project_id;
+  if (typeof humanProjectId !== "string" || humanProjectId.length === 0) return { ok: false, error: "protocol project_id is required" };
+  const prepared = await prepareNotebookPaths(env, humanProjectId, false);
+  if (!prepared.ok) return prepared;
+  const loaded = await loadNotebook(prepared);
+  if (!loaded.ok) return loaded;
+  const binding = classifyNotebookBinding(loaded, context);
+  if (!binding.ok && !allowRebind) return binding;
+  let candidate;
+  try { candidate = redactNotebookEntry(structuredClone(entry)); } catch (err) { return { ok: false, error: err.message }; }
+  if (!isRecord(candidate)) return { ok: false, error: "notebook append entry must be an object" };
+  if (context !== undefined) {
+    const actual = contextForNotebook({ context });
+    for (const field of ["paseo_project_id", "repository_root", "paseo_workspace_id", "lead_agent_id"]) {
+      if (candidate.context?.[field] !== actual[field]) return { ok: false, error: `entry.context.${field} does not match the current live Notebook binding` };
+    }
+  }
+  if (binding.ok) {
+    candidate.context = { ...candidate.context, binding_source: binding.binding_source };
+  } else {
+    candidate.context = { ...candidate.context, binding_source: candidate.entry_id };
+    candidate.history = { ...candidate.history, relation: "rebind", reason: `Human-confirmed move: ${candidate.history?.reason ?? "rebind current project locator"}` };
+  }
+  candidate.notebook_id = loaded.manifest.notebook_id;
+  candidate.protocol_project_id = loaded.manifest.protocol_project_id;
+  // The binding-source/history normalization above changes bytes (rebind path),
+  // so the canonical digest is recomputed over the exact published entry — the
+  // entry as written is always self-consistent; prior entries are never touched.
+  candidate.entry_digest = notebookDigest(candidate, "entry_digest");
+  const check = validateNotebookEntry(candidate, { manifest: loaded.manifest });
+  if (!check.ok) return check;
+  if (supervisorAgentId !== undefined && candidate.writer.supervisor_agent_id !== supervisorAgentId) {
+    return { ok: false, error: "entry.writer.supervisor_agent_id does not match the current Supervisor identity" };
+  }
+  if (piSessionId !== undefined && candidate.writer.pi_session_id !== piSessionId) {
+    return { ok: false, error: "entry.writer.pi_session_id does not match the current Pi session identity" };
+  }
+  for (const reference of candidate.history.references) {
+    if (["correction", "supersession"].includes(candidate.history.relation)) {
+      const prior = loaded.entries.valid.find((item) => item.entry_id === reference.entry_id);
+      if (!prior || prior.entry_digest !== reference.entry_digest) {
+        return { ok: false, error: `history reference ${reference.entry_id} does not match a preserved prior entry digest` };
+      }
+    }
+  }
+  const published = await publishNotebookCreateOnly({
+    storageRoot: prepared.paths.storageRoot,
+    finalParent: prepared.paths.entriesRoot,
+    finalName: `${candidate.entry_id}.json`,
+    bytes: notebookBytes(candidate),
+  });
+  if (!published.ok) return published;
+  return { ok: true, status: published.status, entry: candidate, paths: prepared.paths };
+}
+
+export async function snapshotNotebook({ env = process.env, projectId, protocolProjectId } = {}) {
+  const humanProjectId = projectId ?? protocolProjectId;
+  if (typeof humanProjectId !== "string" || humanProjectId.length === 0) return { ok: false, error: "protocol project_id is required" };
+  const prepared = await prepareNotebookPaths(env, humanProjectId, false);
+  if (!prepared.ok) return prepared;
+  const loaded = await loadNotebook(prepared);
+  if (!loaded.ok) return loaded;
+  const physical = loaded.entries.files.sort((a, b) => a.filename.localeCompare(b.filename));
+  const physicalDigest = `sha256:${createHash("sha256").update(canonicalNotebookJson({ manifest_digest: loaded.rawDigest, entries: physical })).digest("hex")}`;
+  const projection = loaded.entries.valid.sort((a, b) => a.entry_id.localeCompare(b.entry_id));
+  return {
+    ok: true,
+    snapshot: {
+      manifest_digest: loaded.rawDigest,
+      manifest_canonical_digest: loaded.manifest.manifest_digest,
+      physical_entries: physical,
+      entries: physical,
+      physical_digest: physicalDigest,
+      snapshot_digest: physicalDigest,
+      digest: physicalDigest,
+      valid_causal_projection: projection,
+      causal_projection: projection,
+      invalid_entries: loaded.entries.invalid,
+    },
+  };
+}
+
+export const initNotebook = initializeNotebook;
+export const appendNotebook = appendNotebookEntry;
+export const readNotebookSnapshot = snapshotNotebook;
+
+async function notebookContextFromPi(ctx, env) {
+  const cwd = ctx?.cwd ?? process.cwd();
+  const repoRoot = await findRepoRoot(cwd);
+  const paseoProjectId = ctx?.paseoProjectId ?? ctx?.paseo_project_id ?? ctx?.workspace?.projectId ?? env.PASEO_PROJECT_ID ?? "unknown";
+  const workspaceId = ctx?.workspaceId ?? ctx?.paseoWorkspaceId ?? ctx?.paseo_workspace_id ?? env.PASEO_WORKSPACE_ID ?? "unknown";
+  const leadId = ctx?.leadAgentId ?? ctx?.lead_agent_id ?? env.PASEO_LEAD_AGENT_ID ?? "unknown";
+  let protocolPinValue = null;
+  if (repoRoot) {
+    const protocol = await readAndValidateProtocol(repoRoot);
+    if (protocol.ok) protocolPinValue = { version: protocol.protocol.meta.version, digest: protocol.protocol.digest };
+  }
+  return {
+    paseoProjectId, workspaceId, leadId, repositoryRoot: repoRoot ?? "unknown", protocolPin: protocolPinValue,
+    piSessionId: ctx?.sessionId ?? ctx?.piSessionId ?? ctx?.session?.id ?? "unknown",
+  };
+}
+
+async function runNotebookInit(_args, ctx) {
+  const notify = (message, level) => ctx.ui?.notify?.(message, level);
+  if (latch === null || latch.role !== "supervisor") { notify("pi-paseo-orchestration: notebook-init is available only to an active supervisor process", "error"); return { ok: false, error: "supervisor role required" }; }
+  if (blockedReason !== null) { notify(`pi-paseo-orchestration blocked: ${blockedReason}`, "error"); return { ok: false, error: blockedReason }; }
+  if (!(await verifyOrBlock(ctx, configDir(envOf(ctx))))) return { ok: false, error: blockedReason };
+  const ui = ctx.ui ?? {};
+  if (typeof ui.input !== "function" || typeof ui.confirm !== "function") {
+    const error = "interactive input is unavailable; notebook initialization did not write";
+    notify(error, "error");
+    return { ok: false, error };
+  }
+  const projectId = await ui.input("Protocol project_id for the Supervisor Notebook:", "");
+  if (!projectId) { notify("Cancelled; no notebook manifest written.", "info"); return { ok: false, error: "cancelled" }; }
+  const facts = await notebookContextFromPi(ctx, envOf(ctx));
+  if (facts.repositoryRoot !== "unknown") {
+    const protocol = await readAndValidateProtocol(facts.repositoryRoot);
+    if (!protocol.ok) { notify(`Notebook initialization blocked: ${protocol.error}`, "error"); return { ok: false, error: protocol.error }; }
+    if (protocol.protocol.meta.project_id !== projectId) {
+      const error = "notebook project_id must exactly match the repository Workspace Protocol project_id";
+      notify(error, "error");
+      return { ok: false, error };
+    }
+  }
+  const draft = { protocol_project_id: projectId, paseo_project_id_at_creation: facts.paseoProjectId, repository_root_at_creation: facts.repositoryRoot, supervisor_agent_id: latch.agentId, pi_session_id: facts.piSessionId };
+  const confirmed = await ui.confirm("Create this immutable Supervisor Notebook manifest?", JSON.stringify(draft, null, 2));
+  if (!confirmed) { notify("Not written; notebook manifest unchanged.", "info"); return { ok: false, error: "cancelled" }; }
+  const result = await initializeNotebook({
+    env: envOf(ctx), projectId, paseoProjectId: facts.paseoProjectId, repositoryRoot: facts.repositoryRoot,
+    supervisorAgentId: latch.agentId, piSessionId: facts.piSessionId,
+  });
+  notify(result.ok ? `Supervisor Notebook initialized at ${result.paths.manifestPath}` : `Notebook initialization failed: ${result.error}`, result.ok ? "info" : "error");
+  return result;
+}
+
+async function runNotebookAppend(args, ctx) {
+  const notify = (message, level) => ctx.ui?.notify?.(message, level);
+  if (latch === null || latch.role !== "supervisor") { const error = "supervisor role required"; notify(error, "error"); return { ok: false, error }; }
+  if (blockedReason !== null) { notify(`pi-paseo-orchestration blocked: ${blockedReason}`, "error"); return { ok: false, error: blockedReason }; }
+  if (!(await verifyOrBlock(ctx, configDir(envOf(ctx))))) return { ok: false, error: blockedReason };
+  let input = args;
+  if (typeof input === "string") {
+    try { input = JSON.parse(input); } catch { const error = "notebook-append arguments must be a JSON object"; notify(error, "error"); return { ok: false, error }; }
+  }
+  if (!isRecord(input) || Object.keys(input).some((key) => ["path", "file_path", "filesystem_path"].includes(key))) {
+    const error = "notebook-append accepts contract fields only and no filesystem path";
+    notify(error, "error");
+    return { ok: false, error };
+  }
+  const facts = await notebookContextFromPi(ctx, envOf(ctx));
+  const projectId = input.project_id ?? input.protocol_project_id;
+  const suppliedEntry = input.entry ?? Object.fromEntries(Object.entries(input).filter(([key]) => key !== "project_id"));
+  const liveContext = {
+    paseo_project_id: facts.paseoProjectId, repository_root: facts.repositoryRoot,
+    paseo_workspace_id: facts.workspaceId, lead_agent_id: facts.leadId, protocol_pin: facts.protocolPin,
+  };
+  const entry = { ...suppliedEntry, writer: { ...suppliedEntry.writer, supervisor_agent_id: latch.agentId, pi_session_id: facts.piSessionId }, context: { ...suppliedEntry.context, ...liveContext } };
+  const result = await appendNotebookEntry({
+    env: envOf(ctx), projectId, entry, supervisorAgentId: latch.agentId, piSessionId: facts.piSessionId,
+    context: liveContext,
+  });
+  if (!result.ok && result.classification === "move_or_copy") {
+    const moved = typeof ctx.ui?.confirm === "function" && await ctx.ui.confirm(
+      "Notebook binding changed. Is this a Human-confirmed project move (not a copy)?",
+      JSON.stringify({ previous: result.binding, current: result.context }, null, 2),
+    );
+    if (!moved) {
+      const error = "Notebook write stopped: classify as copy and create a new project identity and notebook";
+      notify(error, "error");
+      return { ok: false, error, classification: "copy" };
+    }
+    const reboundEntry = { ...entry, context: { ...entry.context, binding_source: entry.entry_id } };
+    const rebound = await appendNotebookEntry({
+      env: envOf(ctx), projectId, entry: reboundEntry, supervisorAgentId: latch.agentId, piSessionId: facts.piSessionId,
+      context: { ...liveContext, binding_source: entry.entry_id }, allowRebind: true,
+    });
+    notify(rebound.ok ? "Notebook rebind evidence appended; prior bytes remain immutable." : `Notebook rebind failed: ${rebound.error}`, rebound.ok ? "info" : "error");
+    return rebound;
+  }
+  notify(result.ok ? `Notebook entry ${result.status}.` : `Notebook append failed: ${result.error}`, result.ok ? "info" : "error");
+  return result;
+}
+
+// ─── Doctor ──────────────────────────────────────────────────────────────────
+
+export const DOCTOR_REPORT_BEGIN = '<pi-paseo-orchestration doctor="v1">';
+export const DOCTOR_REPORT_END = "</pi-paseo-orchestration>";
+const DOCTOR_STATUSES = ["PASS", "WARN", "BLOCKED"];
+const DOCTOR_STATUS_RANK = { PASS: 0, WARN: 1, BLOCKED: 2 };
+const DOCTOR_CHECK_CODES = [
+  "CONTEXT_CWD", "GIT_REPOSITORY", "GIT_WORKTREE", "PI_CAPABILITIES", "PACKAGE_PROVENANCE",
+  "PASEO_IDENTITY", "ADAPTER_OBSERVER", "ROLE_ACTIVATION", "ROLE_SETTINGS", "ROLE_PROFILE",
+  "WORKSPACE_PROTOCOL", "TOOL_POLICY", "AUTHORITY_STATE",
+];
+
+function doctorRemediation(status, owner, action) {
+  if (status === "PASS") return { owner: null, action: null, commands: [], rerun_required: false };
+  return { owner: owner ?? "human", action: action ?? "Re-observe the reported fact and rerun doctor.", commands: [], rerun_required: true };
+}
+
+function doctorCheck(code, subject, status, expected, observed, evidence = [], remediation = {}) {
+  const owner = remediation.owner ?? (status === "BLOCKED" ? "operator" : "human");
+  return {
+    code, subject, applicable: remediation.applicable !== false, required: remediation.required !== false,
+    status, expected: redactDoctorText(expected), observed: redactDoctorText(observed),
+    evidence: evidence.map((item) => ({
+      kind: item.kind ?? "memory", source: redactDoctorText(item.source ?? "doctor"),
+      digest: typeof item.digest === "string" && SHA256_HEX.test(item.digest) ? `sha256:${item.digest}` : (item.digest ?? null),
+      exit_code: item.exit_code ?? null,
+      output: item.output === null || item.output === undefined ? null : redactDoctorText(item.output, 500),
+    })),
+    remediation: doctorRemediation(status, owner, remediation.action),
+  };
+}
+
+function redactDoctorText(value, max = 300) {
+  if (typeof value !== "string") return value;
+  let result = value.replace(/((?:password|passwd|secret|token|credential|api[_-]?key|authorization)\s*[:=]\s*)([^\s,;]+)/gi, "$1[REDACTED]");
+  if (result.length > max) result = `${result.slice(0, Math.max(0, max - 30))}…[TRUNCATED sha256:${createHash("sha256").update(value).digest("hex")}]`;
+  return result;
+}
+
+function doctorNow(value) {
+  return value instanceof Date ? value.toISOString() : (typeof value === "string" ? value : new Date().toISOString());
+}
+
+function doctorMode(ctx) {
+  const output = ctx?.outputMode ?? ctx?.mode;
+  if (output === "print" || output === "json" || output === "stdout" || ctx?.json === true || ctx?.print === true) return null;
+  if (ctx?.rpc === true || (ctx?.rpc && typeof ctx.rpc === "object") || ctx?.mode === "rpc" || ctx?.outputMode === "rpc" || ctx?.ui?.mode === "rpc") return "rpc";
+  if (ctx?.ui && typeof ctx.ui.notify === "function") return "tui";
+  return null;
+}
+
+export function doctorOutputMode(ctx) {
+  const mode = doctorMode(ctx);
+  return mode ?? "OUTPUT_CHANNEL_UNAVAILABLE";
+}
+
+function doctorPackageSource() {
+  const url = import.meta.url;
+  const fileSource = url.startsWith("file:") ? fileURLToPath(url) : "data-url";
+  return {
+    scope: url.startsWith("file:") ? "project" : "temporary",
+    origin: "package",
+    source: fileSource,
+    digest: `sha256:${createHash("sha256").update(url).digest("hex")}`,
+  };
+}
+
+async function doctorPaseoObservation(ctx, env, role) {
+  const agentId = (env[AGENT_ENV] ?? "").trim();
+  const observer = ctx?.observeCurrentAgent
+    ?? ctx?.paseoObserver?.observeCurrentAgent
+    ?? ctx?.paseo?.observeCurrentAgent;
+  if (typeof observer !== "function") {
+    return {
+      status: role === "lead" || role === "supervisor" ? "BLOCKED" : "WARN",
+      reason: "adapter observer not yet verified",
+      observation: null,
+      agentId,
+    };
+  }
+  let observation;
+  try {
+    // One bounded read-only observation. There is intentionally no retry or
+    // alternate target when this capability is unavailable.
+    const result = Promise.resolve(observer({ agent_id: agentId }));
+    observation = await Promise.race([
+      result,
+      new Promise((resolve) => setTimeout(() => resolve({ __timeout: true }), 1500)),
+    ]);
+  } catch (err) {
+    return { status: role === "lead" || role === "supervisor" ? "BLOCKED" : "WARN", reason: `adapter observer unavailable: ${err.message}`, observation: null, agentId };
+  }
+  if (!observation || observation.__timeout) {
+    return { status: role === "lead" || role === "supervisor" ? "BLOCKED" : "WARN", reason: "adapter observer timed out", observation: null, agentId };
+  }
+  if (!isRecord(observation) || observation.agent_id !== agentId || agentId === "") {
+    return { status: role === "lead" || role === "supervisor" ? "BLOCKED" : "WARN", reason: "adapter observer returned an unbound current-agent identity", observation: null, agentId };
+  }
+  return { status: "PASS", reason: "public current-agent observer returned the exact current identity", observation, agentId };
+}
+
+function doctorActivation(roleCheck) {
+  if (!roleCheck.ok) return "blocked";
+  if (roleCheck.role === null) return "ungoverned";
+  if (blockedReason !== null) return "blocked";
+  return "governed";
+}
+
+function doctorPiCapabilities(pi) {
+  const required = ["getActiveTools", "setActiveTools", "setModel", "setThinkingLevel"];
+  const missing = required.filter((name) => typeof pi?.[name] !== "function");
+  return { missing, observed: required.filter((name) => typeof pi?.[name] === "function") };
+}
+
+function doctorAuthorityState() {
+  if (currentAuthority !== null) return "valid";
+  if (authorityReason !== null) return "rejected";
+  return "none";
+}
+
+function doctorEffectiveToolReport(pi, role) {
+  const actual = typeof pi?.getActiveTools === "function" ? pi.getActiveTools() : [];
+  const base = baseline ?? actual;
+  const authority = currentAuthority;
+  const expected = role ? effectiveTools(base, role, authority) : [];
+  const requested = authority?.envelope?.capabilities ?? [];
+  const names = [...new Set([...base, ...CEILINGS[role] ?? [], "mcp_script", "write", "edit"])].sort();
+  const effective = names.map((name) => {
+    const active = actual.includes(name);
+    const allowed = expected.includes(name);
+    return {
+      name,
+      source: base.includes(name) ? "session_baseline" : "role_ceiling_or_authority",
+      state: active ? "active" : (base.includes(name) || allowed ? "inactive" : "unavailable"),
+      reason: active ? (allowed ? "effective_policy" : "policy_drift") : (base.includes(name) ? "human_disabled_or_not_applied" : "outside_role_ceiling"),
+    };
+  });
+  return { actual, base, expected, requested, effective };
+}
+
+export async function buildDoctorReport({ ctx = {}, pi = {}, now, reportId } = {}) {
+  const startedAt = doctorNow(now);
+  const env = envOf(ctx);
+  const roleCheck = parseRole(env);
+  const role = roleCheck.ok ? roleCheck.role : null;
+  const activation = doctorActivation(roleCheck);
+  const cwdValue = typeof ctx.cwd === "string" && ctx.cwd !== "" ? ctx.cwd : null;
+  let cwd = null;
+  if (cwdValue !== null) {
+    try { cwd = await realpath(cwdValue); } catch { cwd = null; }
+  }
+  let repoRoot = null;
+  if (cwd !== null) {
+    const found = await findRepoRoot(cwd);
+    if (found !== null) { try { repoRoot = await realpath(found); } catch { repoRoot = found; } }
+  }
+  const statusOutput = repoRoot === null ? null : await gitOut(repoRoot, ["status", "--porcelain=v1", "--untracked-files=all"], false);
+  const head = repoRoot === null ? null : await gitOut(repoRoot, ["rev-parse", "HEAD"]);
+  const branch = repoRoot === null ? null : await gitOut(repoRoot, ["branch", "--show-current"]);
+  const statusLines = statusOutput === null ? [] : statusOutput.split(/\r?\n/).filter(Boolean);
+  const untracked = statusLines.filter((line) => line.startsWith("??")).length;
+  const staged = statusLines.filter((line) => !line.startsWith("??") && line[0] !== " ").length;
+  const unstaged = statusLines.filter((line) => !line.startsWith("??") && line[1] !== " ").length;
+  const dirty = statusLines.length;
+  const cwdCheckStatus = cwd === null ? (role ? "BLOCKED" : "WARN") : "PASS";
+  const repoStatus = repoRoot === null ? (role ? "BLOCKED" : "WARN") : "PASS";
+  const checks = [];
+  checks.push(doctorCheck("CONTEXT_CWD", "current Pi cwd", cwdCheckStatus, "ctx.cwd resolves to a readable canonical directory", cwd ?? "unavailable", [{ kind: "memory", source: "ctx.cwd", output: cwd }], { owner: "operator", action: "Start doctor with the current readable Pi cwd." }));
+  checks.push(doctorCheck("GIT_REPOSITORY", "containing Git repository", repoStatus, "one canonical Git repository root contains cwd", repoRoot ?? "not found", [{ kind: "command", source: "git rev-parse --show-toplevel", output: repoRoot }], { owner: "operator", action: "Open the intended Git repository and rerun doctor." }));
+  checks.push(doctorCheck("GIT_WORKTREE", "Git clean and dirty counts", repoRoot === null ? (role ? "BLOCKED" : "WARN") : "PASS", "read-only Git status is observable", repoRoot === null ? "unavailable" : JSON.stringify({ head, branch, staged, unstaged, untracked, dirty }), [{ kind: "command", source: "git status --porcelain=v1 --untracked-files=all", output: repoRoot === null ? null : JSON.stringify({ head, branch, staged, unstaged, untracked, dirty }) }], { owner: "human", action: "Review reported dirty files manually; doctor does not clean or stash them." }));
+
+  const piFacts = doctorPiCapabilities(pi);
+  checks.push(doctorCheck("PI_CAPABILITIES", "Pi read-only API and hook surface", piFacts.missing.length === 0 ? "PASS" : (role ? "BLOCKED" : "WARN"), "required Pi APIs are present", piFacts.missing.length === 0 ? "all required APIs present" : `missing ${piFacts.missing.join(", ")}`, [{ kind: "api", source: "Pi extension API", output: piFacts.observed.join(", ") }], { owner: "operator", action: "Use a Pi process exposing the required extension APIs." }));
+  const packageSource = doctorPackageSource();
+  const packageStatus = packageSource.scope === "temporary" ? "WARN" : "PASS";
+  checks.push(doctorCheck("PACKAGE_PROVENANCE", "loaded extension provenance", packageStatus, "one canonical package source is observable", packageSource.source, [{ kind: "api", source: "import.meta.url", digest: packageSource.digest, output: packageSource.source }], { owner: "operator", action: "Load the reviewed package source once and rerun doctor." }));
+
+  const paseo = await doctorPaseoObservation(ctx, env, role);
+  const paseoIdentityStatus = role && (env[AGENT_ENV] ?? "").trim() === "" ? "BLOCKED" : (role ? "PASS" : "WARN");
+  checks.push(doctorCheck("PASEO_IDENTITY", "Paseo current-agent identity", paseoIdentityStatus, role ? "PASEO_AGENT_ID is nonempty" : "identity is not required for passive mode", (env[AGENT_ENV] ?? "").trim() || "absent", [{ kind: "env", source: AGENT_ENV, output: (env[AGENT_ENV] ?? "").trim() ? "present" : "absent" }], { owner: "operator", action: "Set the exact Paseo agent identity before governed work." }));
+  const observerOwner = role === "supervisor" ? "supervisor" : role === "lead" ? "lead" : "operator";
+  checks.push(doctorCheck("ADAPTER_OBSERVER", "public current-agent observation capability", paseo.status, "the already-loaded adapter proves exact current-agent observation", paseo.reason, [{ kind: "api", source: "public current-agent observer", output: paseo.observation ? "verified" : "unavailable" }], { owner: observerOwner, action: paseo.status === "BLOCKED" ? "Install/configure the public adapter current-agent observer, then rerun doctor." : "Use a configured adapter observer when governed live facts are needed." }));
+
+  if (!roleCheck.ok) {
+    checks.push(doctorCheck("ROLE_ACTIVATION", "role activation", "BLOCKED", "PI_PASEO_ORCHESTRATION_ROLE is supervisor|lead|peer or empty", roleCheck.error, [{ kind: "env", source: ROLE_ENV, output: redactDoctorText(env[ROLE_ENV] ?? "absent") }], { owner: "human", action: "Correct the role environment and start a fresh process." }));
+  } else if (role === null) {
+    checks.push(doctorCheck("ROLE_ACTIVATION", "role activation", "WARN", "an explicit governed role is optional", "UNGOVERNED", [{ kind: "env", source: ROLE_ENV, output: "absent" }], { owner: "human", action: "Set an explicit role only when governed orchestration is intended." }));
+  } else if (latch === null) {
+    checks.push(doctorCheck("ROLE_ACTIVATION", "role activation snapshot", "BLOCKED", "first successful activation snapshot is latched", "governed role has no activation snapshot", [], { owner: "operator", action: "Start a fresh governed Pi process and rerun doctor." }));
+  } else {
+    checks.push(doctorCheck("ROLE_ACTIVATION", "role activation snapshot", blockedReason ? "BLOCKED" : "PASS", "latched role and Paseo identity remain current", blockedReason ?? `${latch.role}/${latch.agentId}`, [{ kind: "memory", source: "process activation latch", output: `${latch.role}/${latch.agentId}` }], { owner: "operator", action: "Start a fresh process after correcting activation drift." }));
+  }
+
+  let settingsStatus = "PASS";
+  let settingsObserved = "not applicable";
+  let profileStatus = "PASS";
+  let profileObserved = "not applicable";
+  let latchVerification = null;
+  if (role !== null) {
+    if (latch === null) {
+      settingsStatus = profileStatus = "BLOCKED";
+      settingsObserved = profileObserved = "activation snapshot unavailable";
+    } else {
+      latchVerification = await verifyLatch(latch, env, configDir(env));
+      try {
+        const currentSettings = await readSettings(configDir(env));
+        settingsObserved = currentSettings === null ? "missing" : (JSON.stringify(currentSettings) === JSON.stringify(latch.settings) ? "matches activation snapshot" : "drifted");
+        if (settingsObserved !== "matches activation snapshot") settingsStatus = "BLOCKED";
+      } catch (err) { settingsStatus = "BLOCKED"; settingsObserved = err.message; }
+      try {
+        const currentProfile = await readProfile(latch.profileDir, latch.role);
+        profileObserved = profileDigest(currentProfile) === latch.profileDigest ? "matches activation snapshot" : "drifted";
+        if (profileObserved !== "matches activation snapshot") profileStatus = "BLOCKED";
+      } catch (err) { profileStatus = "BLOCKED"; profileObserved = err.message; }
+      if (!latchVerification.ok) {
+        if (/profile/.test(latchVerification.error)) profileStatus = "BLOCKED";
+        if (/settings/.test(latchVerification.error)) settingsStatus = "BLOCKED";
+        if (/role environment|Paseo agent identity/.test(latchVerification.error)) {
+          const activationCheck = checks.find((check) => check.code === "ROLE_ACTIVATION");
+          if (activationCheck) { activationCheck.status = "BLOCKED"; activationCheck.observed = latchVerification.error; }
+        }
+      }
+    }
+  }
+  checks.push(doctorCheck("ROLE_SETTINGS", "role model settings snapshot", settingsStatus, role ? "current settings equal the latched closed document" : "not applicable in passive mode", settingsObserved, [{ kind: "file", source: settingsPath(configDir(env)), output: role ? settingsObserved : null }], { owner: "human", action: "Restore the latched settings or start a fresh process; do not hot-switch a governed role.", applicable: role !== null, required: role !== null }));
+  checks.push(doctorCheck("ROLE_PROFILE", "selected Role Profile snapshot", profileStatus, role ? "selected profile bytes equal the latched digest" : "not applicable in passive mode", profileObserved, [{ kind: "file", source: role ? latch?.profileDir ?? "unavailable" : "not applicable", digest: role ? latch?.profileDigest ? `sha256:${latch.profileDigest}` : null : null, output: role ? profileObserved : null }], { owner: "human", action: "Restore the selected profile or start a fresh process; doctor does not fall back.", applicable: role !== null, required: role !== null }));
+
+  let protocol = null;
+  if (repoRoot !== null) protocol = await readAndValidateProtocol(repoRoot);
+  const protocolRequired = role !== null;
+  let protocolStatus;
+  let protocolObserved;
+  if (protocol === null) { protocolStatus = protocolRequired ? "BLOCKED" : "WARN"; protocolObserved = "repository root unavailable"; }
+  else if (!protocol.ok) { protocolStatus = protocolRequired ? "BLOCKED" : "WARN"; protocolObserved = protocol.error; }
+  else {
+    protocolObserved = JSON.stringify({ project_id: protocol.protocol.meta.project_id, version: protocol.protocol.meta.version, digest: protocol.protocol.digest });
+    protocolStatus = "PASS";
+    if (role === "lead" && protocolPin !== null && (protocol.protocol.digest !== protocolPin.digest || protocol.protocol.meta.version !== protocolPin.version || protocol.protocol.meta.project_id !== protocolPin.projectId)) {
+      protocolStatus = "BLOCKED";
+      protocolObserved = `pinned protocol drift: ${protocolObserved}`;
+    }
+  }
+  checks.push(doctorCheck("WORKSPACE_PROTOCOL", "repository-root Workspace Protocol", protocolStatus, protocolRequired ? "strict protocol is valid and matches any current Lead pin" : "current protocol is informative in passive mode", protocolObserved, [{ kind: "file", source: repoRoot ? protocolPath(repoRoot) : "unavailable", digest: protocol?.ok ? protocol.protocol.digest : null, output: protocolObserved }], { owner: "lead", action: "Re-read the exact repository-root protocol, resolve drift with the Human, and rerun doctor.", applicable: repoRoot !== null, required: protocolRequired }));
+
+  const toolReport = doctorEffectiveToolReport(pi, role);
+  const missingCore = role ? requireBaselineTools(toolReport.base, role) : { ok: true };
+  const toolDrift = role ? toolReport.actual.some((name) => !toolReport.expected.includes(name)) : false;
+  const toolStatus = !missingCore.ok || toolDrift || toolReport.actual.includes("mcp_script") ? (role ? "BLOCKED" : "WARN") : "PASS";
+  checks.push(doctorCheck("TOOL_POLICY", "baseline, ceiling, authority, and effective tools", toolStatus, role ? "actual tools equal baseline ∩ role policy ∩ current authority" : "passive mode does not shape tools", JSON.stringify({ baseline: toolReport.base, ceiling: CEILINGS[role] ?? [], requested: toolReport.requested, effective: toolReport.actual }), [{ kind: "memory", source: "Pi active-tool API", output: JSON.stringify(toolReport.effective) }], { owner: "human", action: "Restore the Human-selected baseline and rerun the governed process; doctor never re-enables tools.", applicable: role !== null, required: role !== null }));
+  const authorityState = doctorAuthorityState();
+  const authorityStatus = blockedReason !== null ? "BLOCKED" : authorityState === "rejected" ? "WARN" : "PASS";
+  checks.push(doctorCheck("AUTHORITY_STATE", "current-run Task Authority Envelope", authorityStatus, "doctor reports internal authority only; no authority is minted", authorityState, [{ kind: "memory", source: "extension authority state", output: currentAuthority ? JSON.stringify({ grant_kind: currentAuthority.envelope.grant_kind, task_id: currentAuthority.envelope.task_id, capabilities: currentAuthority.envelope.capabilities }) : authorityReason ?? "none" }], { owner: "human", action: "Submit a fresh direct Human grant only if the current run actually needs exceptional capability." }));
+
+  checks.sort((left, right) => left.code.localeCompare(right.code));
+  const overall = checks.reduce((worst, check) => DOCTOR_STATUS_RANK[check.status] > DOCTOR_STATUS_RANK[worst] ? check.status : worst, role === null ? "WARN" : "PASS");
+  const paseoObservation = paseo.observation;
+  const target = {
+    cwd,
+    repository_root: repoRoot,
+    pi_session_id: ctx.sessionId ?? ctx.piSessionId ?? ctx.session?.id ?? null,
+    paseo_agent_id: (env[AGENT_ENV] ?? "").trim() || null,
+    workspace_id: paseoObservation?.workspace_id ?? ctx.workspaceId ?? ctx.paseoWorkspaceId ?? null,
+    paseo_project_id: paseoObservation?.project_id ?? ctx.paseoProjectId ?? ctx.paseo_project_id ?? null,
+    protocol_project_id: protocol?.ok ? protocol.protocol.meta.project_id : null,
+    role,
+  };
+  const authorityEnvelope = currentAuthority?.envelope;
+  const actualToolPolicy = {
+    session_baseline: [...toolReport.base], role_ceiling: [...(CEILINGS[role] ?? [])], authority_state: authorityState,
+    requested_capabilities: [...toolReport.requested],
+    effective_tools: toolReport.effective,
+  };
+  const report = {
+    report_id: reportId ?? `doctor-${randomUUID()}`,
+    started_at: startedAt,
+    finished_at: doctorNow(now),
+    doctor: { contract_version: "v1", package_version: "unknown", source: packageSource },
+    overall_status: overall,
+    activation,
+    target,
+    compatibility: [
+      { component: "adapter", version: null, strategy: "capability", required_capabilities: ["public-current-agent-observer"], missing_capabilities: paseo.status === "PASS" ? [] : ["public-current-agent-observer"], floor: null, status: paseo.status },
+      { component: "paseo-client", version: null, strategy: "capability", required_capabilities: ["current-agent-observer"], missing_capabilities: paseo.status === "PASS" ? [] : ["current-agent-observer"], floor: null, status: paseo.status },
+      { component: "paseo-daemon", version: null, strategy: "capability", required_capabilities: ["current-agent-observer"], missing_capabilities: paseo.status === "PASS" ? [] : ["current-agent-observer"], floor: null, status: paseo.status },
+      { component: "pi", version: null, strategy: "capability", required_capabilities: piFacts.observed, missing_capabilities: piFacts.missing, floor: null, status: piFacts.missing.length === 0 ? "PASS" : (role ? "BLOCKED" : "WARN") },
+    ],
+    checks,
+    policy: actualToolPolicy,
+    mutations: { attempted: false, performed: false },
+    limitations: [
+      "not acceptance or authority",
+      "not a sandbox, authentication, authorization, or security guarantee",
+      "not current task/lifecycle truth; notebook evidence is historical only",
+      "Human/profile/protocol semantics are not cryptographically proven",
+    ],
+  };
+  // Keep the authority variable intentionally local to the observation block;
+  // it is not included in raw prompt form and does not alter current authority.
+  void authorityEnvelope;
+  return report;
+}
+
+export function formatDoctorReport(report) {
+  return `${DOCTOR_REPORT_BEGIN}\n${canonicalNotebookJson(report)}\n${DOCTOR_REPORT_END}`;
+}
+
+export const doctorReport = buildDoctorReport;
+
+export function formatDoctorTable(report) {
+  const lines = [
+    `Doctor ${report.overall_status} | target=${report.target.cwd ?? "unavailable"} | repo=${report.target.repository_root ?? "unavailable"}`,
+    "STATUS | CODE | OBSERVED | REMEDIATION",
+  ];
+  for (const check of report.checks) {
+    lines.push(`${check.status} | ${check.code} | ${check.observed} | ${check.remediation.action ?? "none"}`);
+  }
+  lines.push(`authority=${report.policy.authority_state} tools=${report.policy.effective_tools.filter((tool) => tool.state === "active").map((tool) => tool.name).join(",") || "none"}`);
+  lines.push(`limitations=${report.limitations.join("; ")}`);
+  return lines.join("\n");
+}
+
+function validateDoctorNullableString(value, label) {
+  return value === null || (typeof value === "string" && value.trim() !== "")
+    ? { ok: true }
+    : { ok: false, error: `${label} must be null or a nonempty string` };
+}
+
+function validateDoctorStringArray(value, label) {
+  return Array.isArray(value) && value.every((item) => typeof item === "string" && item.trim() !== "")
+    ? { ok: true }
+    : { ok: false, error: `${label} must be an array of nonempty strings` };
+}
+
+function validateDoctorEvidence(item) {
+  if (!isRecord(item)) return { ok: false, error: "doctor evidence must be an object" };
+  const fields = ["kind", "source", "digest", "exit_code", "output"];
+  const closed = notebookClosed(item, fields, "doctor evidence");
+  if (!closed.ok) return closed;
+  if (typeof item.kind !== "string" || item.kind.trim() === "") return { ok: false, error: "doctor evidence.kind must be nonempty" };
+  if (typeof item.source !== "string" || item.source.trim() === "") return { ok: false, error: "doctor evidence.source must be nonempty" };
+  if (item.digest !== null && !NOTEBOOK_DIGEST.test(item.digest)) return { ok: false, error: "doctor evidence.digest must be null or sha256 digest" };
+  if (item.exit_code !== null && !Number.isInteger(item.exit_code)) return { ok: false, error: "doctor evidence.exit_code must be null or an integer" };
+  if (item.output !== null && typeof item.output !== "string") return { ok: false, error: "doctor evidence.output must be null or a string" };
+  return { ok: true };
+}
+
+export function parseDoctorReport(text) {
+  if (typeof text !== "string") return { ok: false, error: "doctor report must be a string" };
+  const stripped = text.trim();
+  if (!stripped.startsWith(`${DOCTOR_REPORT_BEGIN}\n`) || !stripped.endsWith(`\n${DOCTOR_REPORT_END}`)) return { ok: false, error: "doctor report markers are malformed" };
+  const body = stripped.slice(DOCTOR_REPORT_BEGIN.length + 1, -DOCTOR_REPORT_END.length - 1);
+  const duplicate = findDuplicateKey(body);
+  if (duplicate !== null) return { ok: false, error: `duplicate field ${JSON.stringify(duplicate)} in doctor report` };
+  let report;
+  try { report = JSON.parse(body); } catch { return { ok: false, error: "doctor report body is not valid JSON" }; }
+  const fields = ["report_id", "started_at", "finished_at", "doctor", "overall_status", "activation", "target", "compatibility", "checks", "policy", "mutations", "limitations"];
+  let check = notebookClosed(report, fields, "doctor report");
+  if (!check.ok) return check;
+  check = notebookId(report.report_id, "doctor report.report_id"); if (!check.ok) return check;
+  for (const field of ["started_at", "finished_at"]) { check = notebookTimestamp(report[field], `doctor report.${field}`); if (!check.ok) return check; }
+  if (!DOCTOR_STATUSES.includes(report.overall_status)) return { ok: false, error: "doctor report.overall_status is invalid" };
+  if (!["governed", "ungoverned", "blocked"].includes(report.activation)) return { ok: false, error: "doctor report.activation is invalid" };
+  check = notebookClosed(report.doctor, ["contract_version", "package_version", "source"], "doctor report.doctor"); if (!check.ok) return check;
+  if (report.doctor.contract_version !== "v1" || typeof report.doctor.package_version !== "string") return { ok: false, error: "doctor report doctor metadata is malformed" };
+  check = notebookClosed(report.doctor.source, ["scope", "origin", "source", "digest"], "doctor report source"); if (!check.ok) return check;
+  for (const field of ["scope", "origin", "source"]) { check = notebookText(report.doctor.source[field], `doctor report source.${field}`, 2000); if (!check.ok) return check; }
+  check = notebookDigestField(report.doctor.source.digest, "doctor report source.digest"); if (!check.ok) return check;
+  check = notebookClosed(report.target, ["cwd", "repository_root", "pi_session_id", "paseo_agent_id", "workspace_id", "paseo_project_id", "protocol_project_id", "role"], "doctor report target"); if (!check.ok) return check;
+  for (const field of ["cwd", "repository_root", "pi_session_id", "paseo_agent_id", "workspace_id", "paseo_project_id", "protocol_project_id"]) { check = validateDoctorNullableString(report.target[field], `doctor report target.${field}`); if (!check.ok) return check; }
+  if (report.target.role !== null && !ROLES.includes(report.target.role)) return { ok: false, error: "doctor report target.role is invalid" };
+  if (!Array.isArray(report.compatibility) || !Array.isArray(report.checks) || !Array.isArray(report.limitations)) return { ok: false, error: "doctor report arrays are malformed" };
+  let previous = "";
+  for (const component of report.compatibility) {
+    check = notebookClosed(component, ["component", "version", "strategy", "required_capabilities", "missing_capabilities", "floor", "status"], "doctor compatibility"); if (!check.ok) return check;
+    if (typeof component.component !== "string" || component.component <= previous) return { ok: false, error: "doctor compatibility must be deterministically ordered" };
+    previous = component.component;
+    if (!DOCTOR_STATUSES.includes(component.status) || !["capability", "floor"].includes(component.strategy)
+        || !Array.isArray(component.required_capabilities) || !Array.isArray(component.missing_capabilities)
+        || !component.required_capabilities.every((item) => typeof item === "string")
+        || !component.missing_capabilities.every((item) => typeof item === "string")) return { ok: false, error: "doctor compatibility item is malformed" };
+    check = validateDoctorNullableString(component.version, "doctor compatibility.version"); if (!check.ok) return check;
+    check = validateDoctorNullableString(component.floor, "doctor compatibility.floor"); if (!check.ok) return check;
+  }
+  const codes = new Set();
+  let previousCode = "";
+  for (const item of report.checks) {
+    check = notebookClosed(item, ["code", "subject", "applicable", "required", "status", "expected", "observed", "evidence", "remediation"], "doctor check"); if (!check.ok) return check;
+    if (codes.has(item.code)) return { ok: false, error: "doctor check codes must be unique" };
+    codes.add(item.code);
+    if (typeof item.code !== "string" || item.code.trim() === "" || item.code <= previousCode) return { ok: false, error: "doctor checks must be deterministically ordered" };
+    previousCode = item.code;
+    if (DOCTOR_STATUSES.includes(item.status) === false || typeof item.applicable !== "boolean" || typeof item.required !== "boolean" || !Array.isArray(item.evidence)) return { ok: false, error: "doctor check is malformed" };
+    for (const field of ["subject", "expected", "observed"]) { check = notebookText(item[field], `doctor check.${field}`, 4000); if (!check.ok) return check; }
+    for (const evidence of item.evidence) { check = validateDoctorEvidence(evidence); if (!check.ok) return check; }
+    check = notebookClosed(item.remediation, ["owner", "action", "commands", "rerun_required"], "doctor remediation"); if (!check.ok) return check;
+    if (item.remediation.owner !== null && !["human", "operator", "lead", "supervisor"].includes(item.remediation.owner)) return { ok: false, error: "doctor remediation.owner is invalid" };
+    check = validateDoctorNullableString(item.remediation.action, "doctor remediation.action"); if (!check.ok) return check;
+    if (!Array.isArray(item.remediation.commands) || typeof item.remediation.rerun_required !== "boolean") return { ok: false, error: "doctor remediation is malformed" };
+    for (const command of item.remediation.commands) {
+      check = notebookClosed(command, ["command", "mutates"], "doctor remediation command"); if (!check.ok) return check;
+      if (typeof command.command !== "string" || typeof command.mutates !== "boolean") return { ok: false, error: "doctor remediation command is malformed" };
+    }
+  }
+  check = notebookClosed(report.policy, ["session_baseline", "role_ceiling", "authority_state", "requested_capabilities", "effective_tools"], "doctor policy"); if (!check.ok) return check;
+  for (const field of ["session_baseline", "role_ceiling", "requested_capabilities"]) { check = validateDoctorStringArray(report.policy[field], `doctor policy.${field}`); if (!check.ok) return check; }
+  if (!["none", "valid", "rejected", "stale_inactive"].includes(report.policy.authority_state)) return { ok: false, error: "doctor policy authority_state is invalid" };
+  if (!Array.isArray(report.policy.effective_tools)) return { ok: false, error: "doctor policy.effective_tools must be an array" };
+  for (const tool of report.policy.effective_tools) {
+    check = notebookClosed(tool, ["name", "source", "state", "reason"], "doctor policy tool"); if (!check.ok) return check;
+    if (typeof tool.name !== "string" || typeof tool.source !== "string" || !["active", "inactive", "unavailable"].includes(tool.state) || typeof tool.reason !== "string") return { ok: false, error: "doctor policy tool is malformed" };
+  }
+  check = notebookClosed(report.mutations, ["attempted", "performed"], "doctor mutations"); if (!check.ok) return check;
+  if (report.mutations.attempted !== false || report.mutations.performed !== false) return { ok: false, error: "doctor report must assert no mutation" };
+  if (report.limitations.some((item) => typeof item !== "string" || item.trim() === "")) return { ok: false, error: "doctor limitations must be nonempty strings" };
+  return { ok: true, report };
+}
+
+export async function runDoctor(args, ctx, pi) {
+  const hasAlternateTarget = (typeof args === "string" && args.trim() !== "")
+    || (isRecord(args) && Object.keys(args).length > 0);
+  if (hasAlternateTarget) return { ok: false, error: "doctor does not accept an alternate target" };
+  const mode = doctorMode(ctx);
+  const notify = ctx?.ui?.notify ?? ctx?.rpc?.notify ?? ctx?.emit;
+  if (mode === null || typeof notify !== "function") {
+    const error = "OUTPUT_CHANNEL_UNAVAILABLE";
+    if (typeof notify === "function" && ctx.outputMode !== "print" && ctx.outputMode !== "json") notify(error, "error");
+    return { ok: false, error };
+  }
+  const report = await buildDoctorReport({ ctx, pi });
+  const block = formatDoctorReport(report);
+  const table = formatDoctorTable(report);
+  // Both outputs are ephemeral command-channel messages; nothing is written to
+  // transcript/session state by this extension.
+  notify(block, "info");
+  notify(table, "info");
+  return { ok: true, mode, report, block, table };
+}
+
 // ─── Slash-command authority routes ──────────────────────────────────────────
 
 // Both routes are idle-only: they run only when the process is latched to the
@@ -2296,6 +3709,38 @@ export default function (pi) {
     description: "Store a Human-confirmed Supervisor recovery grant binding provider, workspace, and handoff (idle supervisor process only)",
     handler: runSupervisorRecovery,
   });
+  pi.registerCommand(NOTEBOOK_INIT_COMMAND, {
+    description: "Create a Human-confirmed immutable Supervisor Notebook manifest (Supervisor only)",
+    handler: runNotebookInit,
+  });
+  pi.registerCommand(NOTEBOOK_APPEND_COMMAND, {
+    description: "Append one typed immutable Supervisor Notebook observation (Supervisor only)",
+    handler: runNotebookAppend,
+  });
+  pi.registerCommand("pi-paseo-orchestration:doctor", {
+    description: "Report bounded observation-only readiness for the current Pi/Paseo context",
+    handler: (args, ctx) => runDoctor(args, ctx, pi),
+  });
+  if (typeof pi.registerTool === "function") {
+    pi.registerTool(NOTEBOOK_APPEND_TOOL, {
+      description: "Supervisor-only typed append of one immutable causal Notebook entry; no filesystem path is accepted",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["project_id", "entry"],
+        properties: {
+          project_id: { type: "string" },
+          entry: {
+            type: "object",
+            additionalProperties: false,
+            properties: Object.fromEntries(NOTEBOOK_ENTRY_FIELDS.filter((field) => field !== "entry_digest").map((field) => [field, {}])),
+          },
+        },
+      },
+      isEnabled: () => latch?.role === "supervisor" && blockedReason === null,
+      execute: async (input, ctx) => runNotebookAppend(input, ctx ?? {}),
+    });
+  }
 
   pi.on("session_start", async (_event, ctx) => {
     currentAuthority = null; // new/resumed/forked sessions inherit no authority
