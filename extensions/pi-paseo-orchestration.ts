@@ -673,6 +673,225 @@ export async function checkCommitGate(command, authority) {
   return undefined;
 }
 
+// ─── Peer Report ─────────────────────────────────────────────────────────────
+
+// One strict v1 Peer Report, parsed as the first nonempty content of a Peer
+// run's final response. A report is validated as a document only: it NEVER
+// grants authority, NEVER changes the envelope/authority state, and NEVER
+// accepts anything (8.16). Emission, transport, and consumption are Peer/Lead
+// conduct — the extension validates the format and the correlation facts and
+// implements no mailbox, queue, retry, or notification arming.
+export const REPORT_BEGIN = '<pi-paseo-orchestration report="v1">';
+export const REPORT_END = "</pi-paseo-orchestration>";
+export const REPORT_KINDS = ["PROGRESS", "HANDOFF", "REOPEN_REQUEST", "DEPENDENCY_REQUEST", "BLOCKED"];
+
+// Closed common block: report version/kind, Peer agent ID, exact parent Lead
+// agent ID, task/assignment IDs, nonempty summary + evidence, typed payload
+// per kind, and optional superseded report ID. Unknown, duplicate, malformed,
+// mistyped, misplaced, or mismatched data rejects the report.
+const REPORT_FIELDS = [
+  "version", "kind", "peer_id", "parent_id", "task_id", "assignment_id",
+  "summary", "evidence", "payload", "supersedes",
+];
+
+// Typed payload per kind (closed per the spec's kind descriptions): `string`
+// is a nonempty string, `strings` is an array of nonempty strings (min = lower
+// bound), `boolean` is a strict boolean. `optional` fields may be absent but
+// must match their type when present.
+const REPORT_PAYLOAD = {
+  PROGRESS: {
+    checkpoint: { type: "string" }, // a meaningful terminal checkpoint, not timer/polling output
+  },
+  HANDOFF: {
+    artifacts: { type: "strings", min: 1 },
+    candidate: { type: "string", optional: true }, // conditional candidate reference
+    verification: { type: "strings", min: 1 },
+    residual_risks: { type: "strings" },
+    unfinished_dependencies: { type: "strings" },
+  },
+  REOPEN_REQUEST: {
+    failed_premise: { type: "string" },
+    impact: { type: "string" },
+    options: { type: "strings", min: 1 },
+    requested_decision: { type: "string" },
+  },
+  DEPENDENCY_REQUEST: {
+    needed: { type: "string" },
+    from: { type: "string" },
+    impact: { type: "string" },
+    human_decision_required: { type: "boolean" },
+  },
+  BLOCKED: {
+    blocker: { type: "string" },
+    impact: { type: "string" },
+    unblock_condition: { type: "string" },
+    attempts: { type: "strings", min: 1 },
+    unrelated_continuation: { type: "boolean" },
+  },
+};
+
+function checkReportPayload(payload, kind) {
+  const err = (error) => ({ ok: false, error });
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    return err(`payload must be a single object for kind ${kind}`);
+  }
+  const schema = REPORT_PAYLOAD[kind];
+  for (const field of Object.keys(payload)) {
+    if (!Object.prototype.hasOwnProperty.call(schema, field)) {
+      return err(`unknown field ${JSON.stringify(field)} in ${kind} payload`);
+    }
+  }
+  for (const [field, rule] of Object.entries(schema)) {
+    if (!Object.prototype.hasOwnProperty.call(payload, field)) {
+      if (rule.optional) continue;
+      return err(`payload.${field} is missing for kind ${kind}`);
+    }
+    const value = payload[field];
+    if (rule.type === "string") {
+      if (typeof value !== "string" || value.trim() === "") {
+        return err(`payload.${field} must be a nonempty string`);
+      }
+    } else if (rule.type === "boolean") {
+      if (typeof value !== "boolean") {
+        return err(`payload.${field} must be a boolean`);
+      }
+    } else if (rule.type === "strings") {
+      if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.trim() === "")) {
+        return err(`payload.${field} must be an array of nonempty strings`);
+      }
+      if (rule.min !== undefined && value.length < rule.min) {
+        return err(`payload.${field} must contain at least ${rule.min} item(s)`);
+      }
+    }
+  }
+  return { ok: true };
+}
+
+function validateReportShape(obj) {
+  const err = (error) => ({ ok: false, error });
+  if (obj === null || typeof obj !== "object" || Array.isArray(obj)) {
+    return err("peer report body must be a single JSON object");
+  }
+  if (obj.version !== 1) {
+    return err(`peer report version must be exactly 1 (got ${JSON.stringify(obj.version)})`);
+  }
+  if (!REPORT_KINDS.includes(obj.kind)) {
+    return err(`kind must be one of ${REPORT_KINDS.join("|")} (got ${JSON.stringify(obj.kind)})`);
+  }
+  const extra = Object.keys(obj).find((k) => !REPORT_FIELDS.includes(k));
+  if (extra !== undefined) return err(`unknown field ${JSON.stringify(extra)} in peer report`);
+  for (const field of ["peer_id", "parent_id", "task_id", "assignment_id"]) {
+    if (typeof obj[field] !== "string" || obj[field].trim() === "") {
+      return err(`${field} must be a nonempty string`);
+    }
+  }
+  if (typeof obj.summary !== "string" || obj.summary.trim() === "") {
+    return err("summary must be a nonempty string");
+  }
+  if (!Array.isArray(obj.evidence) || obj.evidence.length === 0 || obj.evidence.some((item) => typeof item !== "string" || item.trim() === "")) {
+    return err("evidence must be a nonempty array of nonempty strings");
+  }
+  if (obj.supersedes !== undefined && (typeof obj.supersedes !== "string" || obj.supersedes.trim() === "")) {
+    return err("supersedes must be a nonempty string when present");
+  }
+  const payload = checkReportPayload(obj.payload, obj.kind);
+  if (!payload.ok) return payload;
+  return { ok: true, report: { ...obj } };
+}
+
+// Parses the strict v1 Peer Report from a Peer run's final response. Returns
+// { ok: true, report: null } when no report is present, { ok: true, report }
+// for a schema-valid report, or { ok: false, error } when a report attempt
+// exists but is misplaced, duplicated, malformed, or invalid — nothing is
+// accepted in that case. Validation never touches authority state.
+export function parseReport(text) {
+  if (typeof text !== "string") return { ok: true, report: null };
+  const stripped = text.trimStart();
+  if (!stripped.includes(REPORT_BEGIN)) {
+    if (stripped.includes("<pi-paseo-orchestration")) {
+      return { ok: false, error: "unrecognized peer report marker (unknown marker version or malformed)" };
+    }
+    return { ok: true, report: null };
+  }
+  if (!stripped.startsWith(REPORT_BEGIN)) {
+    return { ok: false, error: "peer report must be the first nonempty content of the response" };
+  }
+  if (stripped.indexOf(REPORT_BEGIN, 1) !== -1) {
+    return { ok: false, error: "duplicate peer report in one response" };
+  }
+  const endAt = stripped.indexOf(REPORT_END, REPORT_BEGIN.length);
+  if (endAt === -1) {
+    return { ok: false, error: "peer report has no closing marker" };
+  }
+  const body = stripped.slice(REPORT_BEGIN.length, endAt);
+  const dup = findDuplicateKey(body);
+  if (dup !== null) {
+    return { ok: false, error: `duplicate field ${JSON.stringify(dup)} in peer report` };
+  }
+  let obj;
+  try {
+    obj = JSON.parse(body);
+  } catch {
+    return { ok: false, error: "peer report body is not valid JSON" };
+  }
+  return validateReportShape(obj);
+}
+
+// Correlation facts for the Lead: a validated report against the latched
+// identities the Lead minted and bound. Pure function over the report + known
+// IDs — lifecycle, arrival path, or prose can never repair correlation, and a
+// missing fact fails closed.
+export function correlateReport(report, known) {
+  const err = (error) => ({ ok: false, error });
+  if (report === null || typeof report !== "object" || Array.isArray(report)) {
+    return err("correlation requires a validated peer report object");
+  }
+  if (known === null || typeof known !== "object" || Array.isArray(known)) {
+    return err("correlation requires the known child/parent/task/assignment identities");
+  }
+  const pairs = [
+    ["peerId", "peer_id", "child peer agent"],
+    ["parentId", "parent_id", "parent lead agent"],
+    ["taskId", "task_id", "task"],
+    ["assignmentId", "assignment_id", "assignment"],
+  ];
+  for (const [knownKey, field, label] of pairs) {
+    const knownValue = known[knownKey];
+    if (typeof knownValue !== "string" || knownValue.trim() === "") {
+      return err(`the known ${label} id is missing; correlation fails closed`);
+    }
+    if (typeof report[field] !== "string" || report[field].trim() === "") {
+      return err(`${field} must be a nonempty string`);
+    }
+    if (report[field] !== knownValue) {
+      return err(`report ${field} ${JSON.stringify(report[field])} does not match the known ${label} id ${JSON.stringify(knownValue)}`);
+    }
+  }
+  return { ok: true };
+}
+
+// Spec: "at most one bounded inspection" after missing or ambiguous evidence.
+// Recording evidence resets the budget; exceeding it fails closed. The Lead
+// profile names the rule; this helper is its canonical encoding.
+export function createInspectionLimit(max = 1) {
+  if (!Number.isInteger(max) || max < 1) {
+    throw new Error(`inspection limit must be a positive integer (got ${String(max)})`);
+  }
+  let inspections = 0;
+  return {
+    recordEvidence() {
+      inspections = 0;
+    },
+    requestInspection() {
+      if (inspections >= max) {
+        return { ok: false, error: `inspection budget exhausted: at most ${max} bounded inspection(s) without new evidence` };
+      }
+      inspections += 1;
+      return { ok: true, remaining: max - inspections };
+    },
+  };
+}
+
 // ─── Workspace Protocol ──────────────────────────────────────────────────────
 
 // One canonical repository-wide protocol at the repository root; v0.1 has no
@@ -886,19 +1105,26 @@ async function ensureProtocolPin() {
   return { ok: true };
 }
 
-// Route binding: the direct Human task message is the only authority route in
-// this slice. tiny Lead and Supervisor recovery grant kinds are parsed and
-// schema-validated above, but their idle governed slash-command flows do not
-// exist yet (later slice) — route absent means grant nothing.
-async function activateEnvelope(envelope) {
-  if (envelope.role !== latch.role) {
+// Route binding: the direct Human task message is the only authority route
+// for Peer grants. tiny Lead and Supervisor recovery grants are issued only
+// by their idle governed slash-command flows (route "command"); an envelope of
+// those kinds pasted into a direct message has no route and grants nothing.
+// supervisor_recovery binds a supervisor process but targets a Lead, so its
+// role check applies on the command route only; on the direct route every
+// non-peer kind is rejected by the route check below regardless of process.
+async function activateEnvelope(envelope, route = "direct") {
+  if (envelope.grant_kind === "supervisor_recovery") {
+    if (route === "command" && latch.role !== "supervisor") {
+      return { ok: false, error: "supervisor_recovery requires a supervisor process" };
+    }
+  } else if (envelope.role !== latch.role) {
     return { ok: false, error: `envelope role ${JSON.stringify(envelope.role)} does not match the ${latch.role} process` };
   }
   if (envelope.agent_id !== latch.agentId) {
     return { ok: false, error: `envelope agent_id ${JSON.stringify(envelope.agent_id)} does not match the latched Paseo agent ${JSON.stringify(latch.agentId)}` };
   }
   // lead_tiny binds the currently pinned protocol digest; a mismatch fails
-  // closed even though the idle slash-command route does not exist yet.
+  // closed whether the envelope arrived by command or by direct message.
   if (envelope.grant_kind === "lead_tiny") {
     if (protocolPin === null) {
       return { ok: false, error: "lead_tiny requires a pinned workspace protocol digest" };
@@ -908,7 +1134,13 @@ async function activateEnvelope(envelope) {
     }
   }
   if (envelope.grant_kind !== "peer") {
-    return { ok: false, error: `grant_kind ${envelope.grant_kind} has no route in this slice: its idle slash-command flow does not exist yet, so it grants nothing` };
+    if (route !== "command") {
+      return { ok: false, error: `grant_kind ${envelope.grant_kind} has no route in this slice for direct messages: it is issued only by its idle slash-command flow after Human confirmation` };
+    }
+  }
+  if (envelope.grant_kind === "supervisor_recovery") {
+    // Recovery grants carry no edit/commit capability and no writable scope.
+    return { ok: true, authority: { envelope, repoRoot: null, scope: null, exclusions: [] } };
   }
   const repoRoot = await findRepoRoot();
   if (repoRoot === null) {
@@ -917,6 +1149,169 @@ async function activateEnvelope(envelope) {
   const check = await validateScope(repoRoot, envelope.scope, envelope.exclusions);
   if (!check.ok) return check;
   return { ok: true, authority: { envelope, repoRoot, scope: check.scope, exclusions: check.exclusions } };
+}
+
+// ─── Slash-command authority routes ──────────────────────────────────────────
+
+// Both routes are idle-only: they run only when the process is latched to the
+// right role, is not blocked, and has no agent run in flight. Each collects
+// the grant fields, shows the complete draft, requires explicit Human
+// confirmation, and stores the envelope as a pending authority that the next
+// input event activates through the same activateEnvelope path as every other
+// grant. Cancel, incomplete, or invalid drafts preserve and store nothing.
+function processIsIdle(ctx) {
+  if (typeof ctx.isIdle === "function") return ctx.isIdle();
+  return false; // idle is not observable → fail closed
+}
+
+async function runLeadTiny(_args, ctx) {
+  const notify = (message, level) => ctx.ui?.notify?.(message, level);
+  if (latch === null || latch.role !== "lead") {
+    notify("pi-paseo-orchestration: lead-tiny is available only to an active lead process", "error");
+    return;
+  }
+  if (blockedReason !== null) {
+    notify(`pi-paseo-orchestration blocked: ${blockedReason}`, "error");
+    return;
+  }
+  if (!processIsIdle(ctx)) {
+    notify("pi-paseo-orchestration: lead-tiny requires an idle process; wait for the current run to settle", "error");
+    return;
+  }
+  const env = envOf(ctx);
+  if (!(await verifyOrBlock(ctx, configDir(env)))) return;
+  const pin = await ensureProtocolPin();
+  if (!pin.ok) {
+    blockWith(ctx, pin.error);
+    return;
+  }
+  const ui = ctx.ui ?? {};
+  if (typeof ui.input !== "function" || typeof ui.select !== "function" || typeof ui.confirm !== "function") {
+    notify("pi-paseo-orchestration: interactive input is unavailable in this mode; no pending authority stored", "error");
+    return;
+  }
+  const cancelled = () => {
+    notify("Cancelled; no pending authority stored.", "info");
+    return null;
+  };
+  const taskId = await ui.input("Task ID for the tiny Lead grant:", "");
+  if (!taskId) return cancelled();
+  const objective = await ui.input("Bounded objective for the tiny Lead run:", "");
+  if (!objective) return cancelled();
+  const capabilityChoice = await ui.select("Capabilities for this run:", ["edit", "local_commit", "edit,local_commit"]);
+  if (!capabilityChoice) return cancelled();
+  const capabilities = capabilityChoice.split(",");
+  const scope = await ui.input("Repository-relative writable scope:", "");
+  if (!scope) return cancelled();
+  const exclusionsRaw = await ui.input("In-scope exclusions (comma-separated; optional):", "");
+  if (exclusionsRaw === undefined) return cancelled();
+  const exclusions = exclusionsRaw.split(",").map((s) => s.trim()).filter((s) => s !== "");
+  let base;
+  if (capabilities.includes("local_commit")) {
+    const head = await gitOut(protocolPin.repoRoot, ["rev-parse", "HEAD"]);
+    if (head === null) {
+      notify("Cannot resolve a full HEAD commit as the candidate base; no pending authority stored.", "error");
+      return;
+    }
+    base = head;
+  }
+  const draft = {
+    version: 1,
+    grant_kind: "lead_tiny",
+    role: "lead",
+    issuer: "human",
+    agent_id: latch.agentId,
+    task_id: taskId,
+    objective,
+    capabilities,
+    scope,
+    exclusions,
+    protocol_digest: protocolPin.digest,
+    ...(base !== undefined ? { base } : {}),
+  };
+  const check = validateEnvelopeShape(draft);
+  if (!check.ok) {
+    notify(`Invalid grant draft (${check.error}); no pending authority stored.`, "error");
+    return;
+  }
+  const scopeCheck = await validateScope(protocolPin.repoRoot, check.envelope.scope, check.envelope.exclusions);
+  if (!scopeCheck.ok) {
+    notify(`Invalid grant scope (${scopeCheck.error}); no pending authority stored.`, "error");
+    return;
+  }
+  const confirmed = await ui.confirm("Store this grant as a pending authority for the next run?", JSON.stringify(check.envelope, null, 2));
+  if (!confirmed) {
+    notify("Not stored; no pending authority.", "info");
+    return;
+  }
+  pendingAuthority = check.envelope;
+  notify("Pending authority stored; it activates on the next input event.", "info");
+}
+
+async function runSupervisorRecovery(_args, ctx) {
+  const notify = (message, level) => ctx.ui?.notify?.(message, level);
+  if (latch === null || latch.role !== "supervisor") {
+    notify("pi-paseo-orchestration: supervisor-recovery is available only to an active supervisor process", "error");
+    return;
+  }
+  if (blockedReason !== null) {
+    notify(`pi-paseo-orchestration blocked: ${blockedReason}`, "error");
+    return;
+  }
+  if (!processIsIdle(ctx)) {
+    notify("pi-paseo-orchestration: supervisor-recovery requires an idle process; wait for the current run to settle", "error");
+    return;
+  }
+  if (!(await verifyOrBlock(ctx, configDir(envOf(ctx))))) return;
+  const ui = ctx.ui ?? {};
+  if (typeof ui.input !== "function" || typeof ui.select !== "function" || typeof ui.confirm !== "function") {
+    notify("pi-paseo-orchestration: interactive input is unavailable in this mode; no pending authority stored", "error");
+    return;
+  }
+  const cancelled = () => {
+    notify("Cancelled; no pending authority stored.", "info");
+    return null;
+  };
+  const taskId = await ui.input("Task ID for the recovery grant:", "");
+  if (!taskId) return cancelled();
+  const objective = await ui.input("Bounded objective for the replacement Lead:", "");
+  if (!objective) return cancelled();
+  const models = ctx.modelRegistry?.getAvailable?.() ?? [];
+  const providers = [...new Set(models.map((m) => m.provider))].sort();
+  if (providers.length === 0) {
+    notify("No providers available in the current model registry; no pending authority stored.", "error");
+    return;
+  }
+  const provider = await ui.select("Provider for the replacement Lead:", providers);
+  if (!provider) return cancelled();
+  const workspaceId = await ui.input("Paseo workspace ID for the replacement Lead:", "");
+  if (!workspaceId) return cancelled();
+  const handoffId = await ui.input("Handoff ID:", "");
+  if (!handoffId) return cancelled();
+  const draft = {
+    version: 1,
+    grant_kind: "supervisor_recovery",
+    role: "lead",
+    issuer: "human",
+    agent_id: latch.agentId,
+    task_id: taskId,
+    objective,
+    provider,
+    workspace_id: workspaceId,
+    handoff_id: handoffId,
+  };
+  const check = validateEnvelopeShape(draft);
+  if (!check.ok) {
+    notify(`Invalid grant draft (${check.error}); no pending authority stored.`, "error");
+    return;
+  }
+  const confirmed = await ui.confirm("Store this recovery grant as a pending authority for the next run?", JSON.stringify(check.envelope, null, 2));
+  if (!confirmed) {
+    notify("Not stored; no pending authority.", "info");
+    return;
+  }
+  pendingAuthority = check.envelope;
+  notify("Pending authority stored; it activates on the next input event.", "info");
 }
 
 async function runSettings(_args, ctx) {
@@ -998,6 +1393,15 @@ export function getAuthorityReason() {
   return authorityReason;
 }
 
+// Pending authority from a confirmed idle slash-command (lead_tiny /
+// supervisor_recovery): stored by the command handler, consumed by the next
+// input event (one-shot), and cleared by any new/resumed/forked session.
+let pendingAuthority = null;
+
+export function getPendingAuthority() {
+  return pendingAuthority === null ? null : { ...pendingAuthority };
+}
+
 export function getProtocolPin() {
   return protocolPin === null ? null : { ...protocolPin };
 }
@@ -1046,9 +1450,18 @@ export default function (pi) {
     description: "Choose the exact provider, model, and thinking level for Supervisor, Lead, and Peer roles",
     handler: runSettings,
   });
+  pi.registerCommand("pi-paseo-orchestration:lead-tiny", {
+    description: "Store a Human-confirmed tiny Lead edit/local-commit grant as a pending authority (idle lead process only)",
+    handler: runLeadTiny,
+  });
+  pi.registerCommand("pi-paseo-orchestration:supervisor-recovery", {
+    description: "Store a Human-confirmed Supervisor recovery grant binding provider, workspace, and handoff (idle supervisor process only)",
+    handler: runSupervisorRecovery,
+  });
 
   pi.on("session_start", async (_event, ctx) => {
     currentAuthority = null; // new/resumed/forked sessions inherit no authority
+    pendingAuthority = null; // ...and clear any pending slash-command authority
     authorityReason = null;
     const env = envOf(ctx);
     const dir = configDir(env);
@@ -1116,14 +1529,31 @@ export default function (pi) {
     }
     // Authority lifetime: every run (input) replaces the internal current-run
     // authority record — including replacement with NO authority when the
-    // message carries no valid envelope. Only the direct Human task-message
-    // route (Peer grants) exists in this slice; tiny Lead and Supervisor
-    // recovery grant kinds parse and validate, but their idle slash-command
-    // routes do not exist yet, so route absence keeps them from ever
-    // activating here. New/resumed/forked sessions inherit nothing.
+    // message carries no valid envelope. A Human-confirmed slash-command grant
+    // (lead_tiny / supervisor_recovery) is stored as a pending authority and
+    // activates here on the NEXT input event through the same activation path
+    // as every other grant; the pending slot is one-shot (this run consumes it
+    // whether activation succeeds or fails). Direct messages can never
+    // activate those kinds — the route is bound at issuance. New/resumed/
+    // forked sessions inherit nothing.
     currentAuthority = null;
     authorityReason = null;
-    if (event.source === "extension") {
+    if (pendingAuthority !== null) {
+      const pending = pendingAuthority;
+      pendingAuthority = null;
+      if (event.source === "extension") {
+        authorityReason = "authority envelope route must be a direct Human message, not an extension relay";
+        ctx.ui?.notify?.(`pi-paseo-orchestration: no authority granted (${authorityReason})`, "error");
+      } else {
+        const activated = await activateEnvelope(pending, "command");
+        if (!activated.ok) {
+          authorityReason = activated.error;
+          ctx.ui?.notify?.(`pi-paseo-orchestration: no authority granted (${activated.error})`, "error");
+        } else {
+          currentAuthority = activated.authority;
+        }
+      }
+    } else if (event.source === "extension") {
       authorityReason = "authority envelope route must be a direct Human message, not an extension relay";
       ctx.ui?.notify?.(`pi-paseo-orchestration: no authority granted (${authorityReason})`, "error");
     } else {
@@ -1132,7 +1562,7 @@ export default function (pi) {
         authorityReason = parsed.error;
         ctx.ui?.notify?.(`pi-paseo-orchestration: no authority granted (${parsed.error})`, "error");
       } else if (parsed.envelope !== null) {
-        const activated = await activateEnvelope(parsed.envelope);
+        const activated = await activateEnvelope(parsed.envelope, "direct");
         if (!activated.ok) {
           authorityReason = activated.error;
           ctx.ui?.notify?.(`pi-paseo-orchestration: no authority granted (${activated.error})`, "error");

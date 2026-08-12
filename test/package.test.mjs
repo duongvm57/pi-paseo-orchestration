@@ -214,7 +214,11 @@ test("extension registers the settings command and a handler that never calls a 
   const source = await readFile(join(root, manifest.pi.extensions[0]), "utf8");
   const ext = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
   ext.default(fake.pi);
-  assert.deepEqual([...fake.commands.keys()], ["pi-paseo-orchestration:settings"]);
+  assert.deepEqual([...fake.commands.keys()], [
+    "pi-paseo-orchestration:settings",
+    "pi-paseo-orchestration:lead-tiny",
+    "pi-paseo-orchestration:supervisor-recovery",
+  ]);
 });
 
 test("settings command: cancel anywhere preserves prior bytes and writes nothing", async () => {
@@ -1539,6 +1543,471 @@ test("wiring: a lead_tiny envelope whose digest does not match the pinned protoc
     await inputText(env.fake, matched);
     assert.equal(ext.getAuthority(), null);
     assert.match(ext.getAuthorityReason(), /no route in this slice/);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+    process.chdir(previous);
+  }
+});
+
+// ─── Lát 5: Peer Reports & Lead–Peer orchestration ───────────────────────────
+
+const {
+  REPORT_BEGIN,
+  REPORT_END,
+  REPORT_KINDS,
+  parseReport,
+  correlateReport,
+  createInspectionLimit,
+} = extension;
+
+const reportText = (obj) => `${REPORT_BEGIN}\n${JSON.stringify(obj, null, 2)}\n${REPORT_END}`;
+
+const progressReport = (over = {}) => ({
+  version: 1,
+  kind: "PROGRESS",
+  peer_id: "peer-1",
+  parent_id: "lead-7",
+  task_id: "task-42",
+  assignment_id: "a-1",
+  summary: "Checkpoint reached: the scoped investigation is complete.",
+  evidence: ["read src/main.go: module boundary confirmed"],
+  payload: { checkpoint: "Investigation complete; writes would need a grant" },
+  ...over,
+});
+
+const handoffReport = (over = {}) => ({
+  version: 1,
+  kind: "HANDOFF",
+  peer_id: "peer-1",
+  parent_id: "lead-7",
+  task_id: "task-42",
+  assignment_id: "a-1",
+  summary: "Feature implemented and verified.",
+  evidence: ["git diff --stat shows only src/feature.go", "npm test passes"],
+  payload: {
+    artifacts: ["src/feature.go"],
+    candidate: `git:v1:${"a".repeat(40)}:${"b".repeat(40)}`,
+    verification: ["npm test -- --run"],
+    residual_risks: [],
+    unfinished_dependencies: [],
+  },
+  ...over,
+});
+
+const reopenReport = (over = {}) => ({
+  version: 1,
+  kind: "REOPEN_REQUEST",
+  peer_id: "peer-1",
+  parent_id: "lead-7",
+  task_id: "task-42",
+  assignment_id: "a-1",
+  summary: "The assignment premise fails: the API contract changed.",
+  evidence: ["read src/api.go: the exported type no longer exists"],
+  payload: {
+    failed_premise: "The assumed API contract no longer exists in main.",
+    impact: "The assigned change cannot be implemented as framed.",
+    options: ["Re-frame the assignment against the new contract", "Abandon the task"],
+    requested_decision: "Which option should the assignment follow?",
+  },
+  ...over,
+});
+
+const dependencyReport = (over = {}) => ({
+  version: 1,
+  kind: "DEPENDENCY_REQUEST",
+  peer_id: "peer-1",
+  parent_id: "lead-7",
+  task_id: "task-42",
+  assignment_id: "a-1",
+  summary: "A Human decision is required before work can continue.",
+  evidence: ["read CONTEXT.md: product ownership is undefined"],
+  payload: {
+    needed: "A product decision on the output format.",
+    from: "Human",
+    impact: "The format choice changes the entire diff.",
+    human_decision_required: true,
+  },
+  ...over,
+});
+
+const blockedReport = (over = {}) => ({
+  version: 1,
+  kind: "BLOCKED",
+  peer_id: "peer-1",
+  parent_id: "lead-7",
+  task_id: "task-42",
+  assignment_id: "a-1",
+  summary: "No edit grant is available; the outcome requires writes.",
+  evidence: ["tool list shows no write/edit capability"],
+  payload: {
+    blocker: "No current-run edit grant.",
+    impact: "The assigned outcome cannot be produced read-only.",
+    unblock_condition: "A direct Human grant for scope src/.",
+    attempts: ["Confirmed the write tools are absent"],
+    unrelated_continuation: false,
+  },
+  ...over,
+});
+
+test("parseReport: every closed kind validates as a strict v1 document", () => {
+  assert.deepEqual(REPORT_KINDS, ["PROGRESS", "HANDOFF", "REOPEN_REQUEST", "DEPENDENCY_REQUEST", "BLOCKED"]);
+  const fixtures = [
+    ["PROGRESS", progressReport()],
+    ["HANDOFF", handoffReport()],
+    ["REOPEN_REQUEST", reopenReport()],
+    ["DEPENDENCY_REQUEST", dependencyReport()],
+    ["BLOCKED", blockedReport()],
+  ];
+  for (const [kind, report] of fixtures) {
+    const parsed = parseReport(reportText(report));
+    assert.equal(parsed.ok, true, `${kind} must validate`);
+    assert.equal(parsed.report.kind, kind);
+    assert.equal(parsed.report.peer_id, "peer-1");
+    assert.equal(parsed.report.parent_id, "lead-7");
+    assert.equal(parsed.report.task_id, "task-42");
+    assert.equal(parsed.report.assignment_id, "a-1");
+    assert.equal(typeof parsed.report.summary, "string");
+    assert.equal(parsed.report.evidence.length >= 1, true);
+    assert.equal(typeof parsed.report.payload, "object");
+  }
+
+  // Optional supersedes is accepted when nonempty; HANDOFF candidate is optional.
+  assert.equal(parseReport(reportText(progressReport({ supersedes: "report-9" }))).ok, true);
+  assert.equal(parseReport(reportText(handoffReport({ payload: { ...handoffReport().payload, candidate: undefined } }))).ok, true);
+
+  // No marker → not a report; empty/whitespace are null, never errors.
+  assert.deepEqual(parseReport("just a response"), { ok: true, report: null });
+  assert.deepEqual(parseReport(""), { ok: true, report: null });
+  assert.deepEqual(parseReport("  \n "), { ok: true, report: null });
+});
+
+test("parseReport: unknown, duplicate, malformed, mistyped, misplaced data rejects with exact reasons", () => {
+  const valid = reportText(progressReport());
+  const cases = [
+    ["unknown kind", reportText(progressReport({ kind: "DONE" })), /kind must be one of PROGRESS\|HANDOFF\|REOPEN_REQUEST\|DEPENDENCY_REQUEST\|BLOCKED/],
+    ["unknown version", reportText(progressReport({ version: 2 })), /version must be exactly 1/],
+    ["unknown field", reportText(progressReport({ magic: true })), /unknown field "magic"/],
+    ["duplicate field", `${REPORT_BEGIN}\n{\n  "version": 1,\n  "kind": "PROGRESS",\n  "kind": "BLOCKED",\n  "peer_id": "peer-1",\n  "parent_id": "lead-7",\n  "task_id": "task-42",\n  "assignment_id": "a-1",\n  "summary": "x",\n  "evidence": ["y"],\n  "payload": { "checkpoint": "z" }\n}\n${REPORT_END}`, /duplicate field "kind"/],
+    ["malformed", `${REPORT_BEGIN}\n{"version": 1, broken\n${REPORT_END}`, /not valid JSON/],
+    ["array body", `${REPORT_BEGIN}\n[1, 2]\n${REPORT_END}`, /single JSON object/],
+    ["missing peer id", reportText(progressReport({ peer_id: "" })), /peer_id must be a nonempty string/],
+    ["numeric peer id", reportText(progressReport({ peer_id: 7 })), /peer_id must be a nonempty string/],
+    ["missing parent id", reportText(progressReport({ parent_id: " " })), /parent_id must be a nonempty string/],
+    ["missing task id", reportText(progressReport({ task_id: "" })), /task_id must be a nonempty string/],
+    ["missing assignment id", reportText(progressReport({ assignment_id: "" })), /assignment_id must be a nonempty string/],
+    ["numeric summary", reportText(progressReport({ summary: 5 })), /summary must be a nonempty string/],
+    ["empty evidence", reportText(progressReport({ evidence: [] })), /evidence must be a nonempty array/],
+    ["string evidence", reportText(progressReport({ evidence: "x" })), /evidence must be a nonempty array/],
+    ["blank evidence item", reportText(progressReport({ evidence: ["  "] })), /evidence must be a nonempty array/],
+    ["empty supersedes", reportText(progressReport({ supersedes: "" })), /supersedes must be a nonempty string/],
+    ["numeric supersedes", reportText(progressReport({ supersedes: 9 })), /supersedes must be a nonempty string/],
+    ["misplaced", `Here is my work.\n${valid}`, /must be the first nonempty content/],
+    ["duplicate report", `${valid}\n${valid}`, /duplicate peer report/],
+    ["unclosed", `${REPORT_BEGIN}\n${JSON.stringify(progressReport())}`, /no closing marker/],
+    ["unknown marker version", '<pi-paseo-orchestration report="v2">\n{"version": 1}\n</pi-paseo-orchestration>', /unrecognized peer report marker/],
+    ["authority marker is not a report", '<pi-paseo-orchestration authority="v1">\n{}\n</pi-paseo-orchestration>', /unrecognized peer report marker/],
+  ];
+  for (const [label, text, re] of cases) {
+    const parsed = parseReport(text);
+    assert.equal(parsed.ok, false, `${label} must fail`);
+    assert.match(parsed.error, re, label);
+  }
+});
+
+test("parseReport: payload is typed and closed per kind", () => {
+  const cases = [
+    ["string payload", reportText(progressReport({ payload: "x" })), /payload must be a single object/],
+    ["missing payload", reportText(progressReport({ payload: undefined })), /payload must be a single object/],
+    ["unknown payload field", reportText(progressReport({ payload: { checkpoint: "x", extra: 1 } })), /unknown field "extra" in PROGRESS payload/],
+    ["empty checkpoint", reportText(progressReport({ payload: { checkpoint: " " } })), /payload\.checkpoint must be a nonempty string/],
+    ["handoff missing artifacts", reportText(handoffReport({ payload: { candidate: "x", verification: ["y"], residual_risks: [], unfinished_dependencies: [] } })), /payload\.artifacts is missing/],
+    ["handoff empty artifacts", reportText(handoffReport({ payload: { ...handoffReport().payload, artifacts: [] } })), /payload\.artifacts must contain at least 1/],
+    ["handoff blank verification item", reportText(handoffReport({ payload: { ...handoffReport().payload, verification: [" "] } })), /payload\.verification must be an array of nonempty strings/],
+    ["reopen missing premise", reportText(reopenReport({ payload: { impact: "i", options: ["o"], requested_decision: "d" } })), /payload\.failed_premise is missing/],
+    ["reopen string options", reportText(reopenReport({ payload: { ...reopenReport().payload, options: "o" } })), /payload\.options must be an array of nonempty strings/],
+    ["reopen empty options", reportText(reopenReport({ payload: { ...reopenReport().payload, options: [] } })), /payload\.options must contain at least 1/],
+    ["dependency string boolean", reportText(dependencyReport({ payload: { ...dependencyReport().payload, human_decision_required: "yes" } })), /payload\.human_decision_required must be a boolean/],
+    ["blocked empty attempts", reportText(blockedReport({ payload: { ...blockedReport().payload, attempts: [] } })), /payload\.attempts must contain at least 1/],
+    ["blocked string boolean", reportText(blockedReport({ payload: { ...blockedReport().payload, unrelated_continuation: "maybe" } })), /payload\.unrelated_continuation must be a boolean/],
+  ];
+  for (const [label, text, re] of cases) {
+    const parsed = parseReport(text);
+    assert.equal(parsed.ok, false, `${label} must fail`);
+    assert.match(parsed.error, re, label);
+  }
+});
+
+test("correlateReport: exact child/parent/task/assignment correlation; any mismatch or missing fact fails closed", () => {
+  const known = { peerId: "peer-1", parentId: "lead-7", taskId: "task-42", assignmentId: "a-1" };
+  assert.deepEqual(correlateReport(progressReport(), known), { ok: true });
+
+  // Stale/mismatched identities all fail closed.
+  for (const [label, over] of [
+    ["stale child", { peer_id: "peer-2" }],
+    ["wrong parent", { parent_id: "lead-8" }],
+    ["other task", { task_id: "task-43" }],
+    ["other assignment", { assignment_id: "a-2" }],
+  ]) {
+    assert.equal(correlateReport(progressReport(over), known).ok, false, `${label} must fail`);
+  }
+
+  // Missing known facts fail closed (the Lead must hold every identity it minted).
+  for (const key of ["peerId", "parentId", "taskId", "assignmentId"]) {
+    const partial = { ...known, [key]: "" };
+    assert.equal(correlateReport(progressReport(), partial).ok, false, `missing known ${key} must fail`);
+  }
+  assert.equal(correlateReport(progressReport(), null).ok, false);
+  assert.equal(correlateReport(null, known).ok, false);
+
+  // Report ids must be nonempty even when the known facts agree.
+  assert.equal(correlateReport(progressReport({ task_id: "" }), known).ok, false);
+  assert.equal(correlateReport(progressReport({ assignment_id: " " }), known).ok, false);
+});
+
+test("createInspectionLimit: at most one bounded inspection; evidence resets; exceeding fails closed", () => {
+  const limit = createInspectionLimit();
+  assert.deepEqual(limit.requestInspection(), { ok: true, remaining: 0 });
+  assert.equal(limit.requestInspection().ok, false, "second inspection without evidence fails closed");
+  assert.match(limit.requestInspection().error, /inspection budget exhausted/);
+  limit.recordEvidence();
+  assert.deepEqual(limit.requestInspection(), { ok: true, remaining: 0 }, "evidence resets the budget");
+  assert.equal(limit.requestInspection().ok, false);
+  assert.throws(() => createInspectionLimit(0), /positive integer/);
+  assert.throws(() => createInspectionLimit("1"), /positive integer/);
+});
+
+// Governed process wired for slash-command flows: fake ui with input support
+// and an observable idle state.
+async function governedCommandFixture(ext, { role = "lead", activeTools = ["read", "bash", "write", "edit"] } = {}) {
+  const dir = await mkdtemp(join(tmpdir(), "ppo-cmd-"));
+  await mkdir(join(dir, "pi-paseo-orchestration"), { recursive: true });
+  await writeSettings(dir, validDoc);
+  const profiles = await profileDirFixture();
+  const fake = fakePi({
+    activeTools,
+    env: {
+      PI_PASEO_ORCHESTRATION_ROLE: role,
+      PASEO_AGENT_ID: "agent-7",
+      PI_CODING_AGENT_DIR: dir,
+      PI_PASEO_ORCHESTRATION_PROFILES_DIR: profiles,
+    },
+    ui: {
+      input: async () => undefined,
+      select: async () => null,
+      confirm: async () => false,
+    },
+    ctx: { isIdle: () => true },
+  });
+  ext.default(fake.pi);
+  await fake.handlers.get("session_start")({ reason: "startup" }, fake.ctx);
+  return { dir, profiles, fake };
+}
+
+test("command: lead-tiny requires an idle lead, stores a pending authority, activates on next input, rejects direct messages", async () => {
+  const repo = await gitRepoFixture();
+  const previous = process.cwd();
+  process.chdir(repo.dir);
+  const ext = await freshExtension();
+  const env = await governedCommandFixture(ext, { role: "lead", activeTools: ["read", "bash", "mcp", "write", "edit"] });
+  try {
+    const handler = env.fake.commands.get("pi-paseo-orchestration:lead-tiny").handler;
+    assert.notEqual(handler, undefined);
+    assert.equal(ext.getPendingAuthority(), null);
+
+    // Cancel on the first field preserves and stores nothing.
+    env.fake.ctx.ui.input = async () => undefined;
+    await handler("", env.fake.ctx);
+    assert.equal(ext.getPendingAuthority(), null);
+    assert.equal(env.fake.notifications.some(([msg]) => /Cancelled/.test(msg)), true);
+
+    // Full flow: fields → complete draft confirm → pending stored.
+    const inputs = ["t-1", "Tiny doc fix in src/", "src", ""];
+    env.fake.ctx.ui = {
+      ...env.fake.ctx.ui,
+      input: async () => inputs.shift(),
+      select: async () => "edit,local_commit",
+      confirm: async () => true,
+    };
+    await handler("", env.fake.ctx);
+    const pending = ext.getPendingAuthority();
+    assert.notEqual(pending, null);
+    assert.equal(pending.grant_kind, "lead_tiny");
+    assert.equal(pending.role, "lead");
+    assert.equal(pending.issuer, "human");
+    assert.equal(pending.agent_id, "agent-7");
+    assert.deepEqual(pending.capabilities, ["edit", "local_commit"]);
+    assert.equal(pending.scope, "src");
+    assert.equal(pending.base, repo.base);
+    assert.equal(pending.protocol_digest, digestOf(validProtocol));
+    assert.equal(env.fake.notifications.some(([msg]) => /Pending authority stored/.test(msg)), true);
+
+    // The next input (a plain no-envelope run) activates it through the normal
+    // path, with scope validation against the real repository.
+    await inputText(env.fake, "do the tiny work");
+    const auth = ext.getAuthority();
+    assert.notEqual(auth, null);
+    assert.equal(auth.envelope.grant_kind, "lead_tiny");
+    assert.equal(auth.envelope.capabilities.join(","), "edit,local_commit");
+    assert.equal(auth.repoRoot, repo.dir);
+    assert.equal(ext.getPendingAuthority(), null, "the pending slot is consumed by the run");
+
+    // edit/local_commit are in effect for this run.
+    const write = await env.fake.handlers.get("tool_call")({ toolName: "write", input: { path: join(repo.dir, "src", "doc.md") } }, env.fake.ctx);
+    assert.equal(write, undefined);
+    await writeFile(join(repo.dir, "src", "doc.md"), "x\n");
+    const commit = await env.fake.handlers.get("tool_call")({ toolName: "bash", input: { command: "git commit -m tiny" } }, env.fake.ctx);
+    assert.equal(commit, undefined);
+    const outOfScope = await env.fake.handlers.get("tool_call")({ toolName: "write", input: { path: join(repo.dir, "README.md") } }, env.fake.ctx);
+    assert.equal(outOfScope.block, true);
+
+    // The following run carries no envelope and no pending: nothing remains.
+    await inputText(env.fake, "continue");
+    assert.equal(ext.getAuthority(), null);
+    assert.equal(ext.getPendingAuthority(), null);
+
+    // A lead_tiny envelope pasted into a direct message still has no route.
+    await inputText(env.fake, envelopeText({
+      version: 1, grant_kind: "lead_tiny", role: "lead", issuer: "human",
+      agent_id: "agent-7", task_id: "t-1", objective: "tiny fix",
+      capabilities: ["edit"], scope: "src", protocol_digest: digestOf(validProtocol),
+    }));
+    assert.equal(ext.getAuthority(), null);
+    assert.match(ext.getAuthorityReason(), /no route in this slice/);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+    process.chdir(previous);
+  }
+});
+
+test("command: supervisor-recovery binds provider/workspace/handoff, never grants write tools", async () => {
+  const ext = await freshExtension();
+  const env = await governedCommandFixture(ext, { role: "supervisor", activeTools: ["read", "bash", "mcp"] });
+  try {
+    const handler = env.fake.commands.get("pi-paseo-orchestration:supervisor-recovery").handler;
+    assert.notEqual(handler, undefined);
+
+    const inputs = ["t-2", "Recover the lead after a crash", "ws-1", "h-9"];
+    env.fake.ctx.ui = {
+      ...env.fake.ctx.ui,
+      input: async () => inputs.shift(),
+      select: async () => "anthropic",
+      confirm: async () => true,
+    };
+    await handler("", env.fake.ctx);
+    const pending = ext.getPendingAuthority();
+    assert.notEqual(pending, null);
+    assert.equal(pending.grant_kind, "supervisor_recovery");
+    assert.equal(pending.role, "lead");
+    assert.equal(pending.agent_id, "agent-7");
+    assert.deepEqual(pending.capabilities, []);
+    assert.equal(pending.provider, "anthropic");
+    assert.equal(pending.workspace_id, "ws-1");
+    assert.equal(pending.handoff_id, "h-9");
+
+    // Next input activates the recovery authority; the fields stay bound.
+    await inputText(env.fake, "recover");
+    const auth = ext.getAuthority();
+    assert.notEqual(auth, null);
+    assert.equal(auth.envelope.grant_kind, "supervisor_recovery");
+    assert.equal(auth.envelope.provider, "anthropic");
+    assert.equal(auth.envelope.workspace_id, "ws-1");
+    assert.equal(auth.envelope.handoff_id, "h-9");
+    assert.equal(ext.getPendingAuthority(), null);
+
+    // No edit/commit capability: write stays blocked for the supervisor.
+    const write = await env.fake.handlers.get("tool_call")({ toolName: "write", input: { path: "/x" } }, env.fake.ctx);
+    assert.equal(write.block, true);
+    const commit = await env.fake.handlers.get("tool_call")({ toolName: "bash", input: { command: "git commit -m x" } }, env.fake.ctx);
+    assert.equal(commit.block, true);
+
+    // A recovery envelope pasted into a direct message has no route.
+    await inputText(env.fake, envelopeText({
+      version: 1, grant_kind: "supervisor_recovery", role: "lead", issuer: "human",
+      agent_id: "agent-7", task_id: "t-2", objective: "recover",
+      provider: "anthropic", workspace_id: "ws-1", handoff_id: "h-9",
+    }));
+    assert.equal(ext.getAuthority(), null);
+    assert.match(ext.getAuthorityReason(), /no route in this slice/);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+  }
+});
+
+test("command: wrong role and mid-run processes are rejected without storing anything", async () => {
+  const ext = await freshExtension();
+  const env = await governedCommandFixture(ext, { role: "peer", activeTools: ["read", "bash"] });
+  try {
+    const tiny = env.fake.commands.get("pi-paseo-orchestration:lead-tiny").handler;
+    const recovery = env.fake.commands.get("pi-paseo-orchestration:supervisor-recovery").handler;
+    await tiny("", env.fake.ctx);
+    await recovery("", env.fake.ctx);
+    assert.equal(ext.getPendingAuthority(), null);
+    assert.equal(env.fake.notifications.some(([msg]) => /active lead process/.test(msg)), true);
+    assert.equal(env.fake.notifications.some(([msg]) => /active supervisor process/.test(msg)), true);
+    assert.equal(env.fake.notifications.some(([, level]) => level === "error"), true);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+  }
+
+  // Mid-run (not idle) lead: rejected before any field is collected.
+  const repo = await gitRepoFixture();
+  const previous = process.cwd();
+  process.chdir(repo.dir);
+  const ext2 = await freshExtension();
+  const env2 = await governedCommandFixture(ext2, { role: "lead", activeTools: ["read", "bash", "mcp", "write", "edit"] });
+  try {
+    env2.fake.ctx.isIdle = () => false;
+    const tiny = env2.fake.commands.get("pi-paseo-orchestration:lead-tiny").handler;
+    await tiny("", env2.fake.ctx);
+    assert.equal(ext2.getPendingAuthority(), null);
+    assert.equal(env2.fake.notifications.some(([msg]) => /requires an idle process/.test(msg)), true);
+  } finally {
+    await rm(env2.dir, { recursive: true, force: true });
+    await rm(env2.profiles, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+    process.chdir(previous);
+  }
+});
+
+test("command: declined confirmation and a new session clear the pending authority", async () => {
+  const repo = await gitRepoFixture();
+  const previous = process.cwd();
+  process.chdir(repo.dir);
+  const ext = await freshExtension();
+  const env = await governedCommandFixture(ext, { role: "lead", activeTools: ["read", "bash", "mcp", "write", "edit"] });
+  try {
+    const handler = env.fake.commands.get("pi-paseo-orchestration:lead-tiny").handler;
+
+    // Declined confirmation stores nothing.
+    const inputs = ["t-1", "tiny fix", "src", ""];
+    env.fake.ctx.ui = {
+      ...env.fake.ctx.ui,
+      input: async () => inputs.shift(),
+      select: async () => "edit",
+      confirm: async () => false,
+    };
+    await handler("", env.fake.ctx);
+    assert.equal(ext.getPendingAuthority(), null);
+    assert.equal(env.fake.notifications.some(([msg]) => /Not stored/.test(msg)), true);
+
+    // Confirmed flow stores a pending authority...
+    const inputs2 = ["t-1", "tiny fix", "src", ""];
+    env.fake.ctx.ui.input = async () => inputs2.shift();
+    env.fake.ctx.ui.confirm = async () => true;
+    await handler("", env.fake.ctx);
+    assert.notEqual(ext.getPendingAuthority(), null);
+
+    // ...and a new/resumed/forked session clears it before any run.
+    await env.fake.handlers.get("session_start")({ reason: "new", previousSessionFile: "x" }, env.fake.ctx);
+    assert.equal(ext.getPendingAuthority(), null);
+    await inputText(env.fake, "hi");
+    assert.equal(ext.getAuthority(), null);
   } finally {
     await rm(env.dir, { recursive: true, force: true });
     await rm(env.profiles, { recursive: true, force: true });
