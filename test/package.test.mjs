@@ -82,6 +82,7 @@ const fakePi = (ctxOverrides = {}) => {
       setModel: (model) => { holder.modelCalls.push(["setModel", model.provider, model.id]); return true; },
       setThinkingLevel: (level) => { holder.modelCalls.push(["setThinkingLevel", level]); holder.thinking = level; },
       getThinkingLevel: () => holder.thinking,
+      sendUserMessage: (message) => { holder.sentUserMessage = message; },
     },
     ctx: {
       ui,
@@ -110,7 +111,7 @@ const validDoc = {
 test("manifest declares one Pi extension and the two packaged skills", () => {
   assert.deepEqual(manifest.pi, {
     extensions: ["./extensions/pi-paseo-orchestration.ts"],
-    skills: ["./skills/workspace-protocol/SKILL.md", "./skills/full-topology-test/SKILL.md"],
+    skills: ["./skills/workspace-protocol/SKILL.md", "./skills/ppo-orchestrate/SKILL.md"],
   });
   assert.deepEqual(manifest.scripts, { test: "node --test test/package.test.mjs", typecheck: "tsc --noEmit", "release:smoke": "node test/release-smoke.mjs" });
 
@@ -137,12 +138,14 @@ test("declared resources and private profiles are nonempty files", async () => {
 
   assert.equal(JSON.stringify(manifest.pi).includes("profiles"), false);
   const skill = await readFile(join(root, manifest.pi.skills[0]), "utf8");
-  const topologySkill = await readFile(join(root, manifest.pi.skills[1]), "utf8");
+  const orchestrationSkill = await readFile(join(root, manifest.pi.skills[1]), "utf8");
   const guide = await readFile(join(root, "skills/workspace-protocol/AUTHORING-GUIDE.md"), "utf8");
   assert.match(skill, /^---\nname: workspace-protocol\ndescription: .+\n---/);
   assert.match(skill, /\.\/AUTHORING-GUIDE\.md/);
-  assert.match(topologySkill, /^---\nname: full-topology-test\ndescription: .+\ndisable-model-invocation: true\n/);
-  assert.match(topologySkill, /scripts\/run\.mjs/);
+  assert.match(orchestrationSkill, /^---\nname: ppo-orchestrate\ndescription: .+\ncompatibility: .+\n---/);
+  assert.match(orchestrationSkill, /paseo_create_agent/);
+  assert.match(orchestrationSkill, /paseo_send_agent_prompt/);
+  assert.doesNotMatch(orchestrationSkill, /full-topology-test|scripts\/run\.mjs/);
   assert.match(guide, /^# Workspace Protocol Authoring Guide\n/);
   assert.deepEqual(guide.match(/^## \d+\..+$/gm), [
     "## 1. Protocol boundary",
@@ -164,6 +167,37 @@ test("declared resources and private profiles are nonempty files", async () => {
   assert.match(guide, /optional `Anti-patterns` section/);
   assert.doesNotMatch(guide, /[^\x00-\x7F]/);
   assert.doesNotMatch(`${skill}\n${guide}`, /reference orchestration model/i);
+});
+
+test("bootstrap validates a real repository task and dispatches the orchestration skill contract", async () => {
+  const ext = await freshExtension();
+  const repo = await gitRepoFixture();
+  const config = await mkdtemp(join(tmpdir(), "ppo-bootstrap-"));
+  try {
+    await ext.writeSettings(config, validDoc);
+    const fake = fakePi({ activeTools: ["mcp"], env: { PI_CODING_AGENT_DIR: config }, ctx: { cwd: repo.dir, isIdle: () => true } });
+    ext.default(fake.pi);
+    const result = await fake.commands.get("ppo:bootstrap").handler("inspect the architecture", fake.ctx);
+    assert.deepEqual(result, { ok: true });
+    assert.match(fake.holder.sentUserMessage, /^Load the ppo-orchestrate skill/);
+    assert.match(fake.holder.sentUserMessage, /PPO_BOOTSTRAP_V1/);
+    assert.match(fake.holder.sentUserMessage, /inspect the architecture/);
+    assert.match(fake.holder.sentUserMessage, /"lead_alias":"ppo-lead"/);
+    assert.match(fake.holder.sentUserMessage, /"supervisor_alias":"ppo-supervisor"/);
+  } finally {
+    await rm(repo.dir, { recursive: true, force: true });
+    await rm(config, { recursive: true, force: true });
+  }
+});
+
+test("bootstrap rejects missing/unbounded tasks and unavailable coordinator MCP", async () => {
+  const ext = await freshExtension();
+  const fake = fakePi({ ctx: { cwd: root, isIdle: () => true } });
+  ext.default(fake.pi);
+  assert.equal((await fake.commands.get("ppo:bootstrap").handler("", fake.ctx)).ok, false);
+  assert.equal((await fake.commands.get("ppo:bootstrap").handler("x".repeat(2001), fake.ctx)).ok, false);
+  assert.equal((await fake.commands.get("ppo:bootstrap").handler("valid task", fake.ctx)).ok, false);
+  assert.equal(fake.holder.sentUserMessage, undefined);
 });
 
 test("settings document is closed: valid doc passes, every drift fails", () => {
@@ -262,6 +296,7 @@ test("extension registers the settings command and a handler that never calls a 
   const ext = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
   ext.default(fake.pi);
   assert.deepEqual([...fake.commands.keys()].sort(), [
+    "ppo:bootstrap",
     "ppo:doctor",
     "ppo:lead-tiny",
     "ppo:notebook-init",
@@ -599,6 +634,22 @@ test("checkToolCall: create_agent is role-bound to exact alias, model, thinking,
   assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_create_agent", args: recoveryArgs }, { ...base, role: "supervisor" }).block, true);
 });
 
+test("checkToolCall: Lead lifecycle routes target only Peers created by that Lead process", () => {
+  const createdPeerIds = new Set(["peer-1"]);
+  const policy = {
+    role: "lead",
+    allowed: ["mcp"],
+    mcpTargets: { paseo: new Set(["paseo_send_agent_prompt", "paseo_get_agent_status", "paseo_get_agent_activity", "paseo_cancel_agent", "paseo_archive_agent"]) },
+    createdPeerIds,
+  };
+  for (const tool of ["paseo_get_agent_status", "paseo_get_agent_activity", "paseo_cancel_agent", "paseo_archive_agent"]) {
+    assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool, args: { agentId: "peer-1" } }, policy), undefined);
+    assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool, args: { agentId: "other" } }, policy).block, true);
+  }
+  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_send_agent_prompt", args: { agentId: "peer-1", prompt: "Return exact evidence" } }, policy), undefined);
+  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_send_agent_prompt", args: { agentId: "peer-1", prompt: "" } }, policy).block, true);
+});
+
 test("wiring: passive env stays ungoverned; governed blocks input, injects profile, shapes tools, gates calls", async () => {
   const ext = await freshExtension();
   const profiles = await profileDirFixture();
@@ -616,7 +667,7 @@ test("wiring: passive env stays ungoverned; governed blocks input, injects profi
     fake.pi.getActiveTools = () => [...fake.holder.activeTools];
     ext.default(fake.pi);
 
-    assert.deepEqual([...fake.handlers.keys()].sort(), ["agent_end", "before_agent_start", "input", "session_before_fork", "session_before_switch", "session_start", "tool_call"]);
+    assert.deepEqual([...fake.handlers.keys()].sort(), ["agent_end", "before_agent_start", "input", "session_before_fork", "session_before_switch", "session_start", "tool_call", "tool_result"]);
 
     // session_start activates with exact model application.
     const registry = fake.ctx.modelRegistry;
@@ -3237,8 +3288,7 @@ test("package resources resolve from canonical loaded-module provenance: real ro
   assert.equal(resolved.resources.extension, join(realRoot, manifest.pi.extensions[0]));
   assert.equal(resolved.resources.skill, join(realRoot, manifest.pi.skills[0]));
   assert.equal(resolved.resources.guide, join(realRoot, "skills/workspace-protocol/AUTHORING-GUIDE.md"));
-  assert.equal(resolved.resources.topology_skill, join(realRoot, manifest.pi.skills[1]));
-  assert.equal(resolved.resources.topology_runner, join(realRoot, "skills/full-topology-test/scripts/run.mjs"));
+  assert.equal(resolved.resources.orchestration_skill, join(realRoot, manifest.pi.skills[1]));
   assert.deepEqual(Object.keys(resolved.resources.profiles).sort(), ["lead", "peer", "supervisor"]);
   for (const [role, rel] of [["supervisor", "profiles/supervisor.md"], ["lead", "profiles/lead.md"], ["peer", "profiles/peer.md"]]) {
     assert.equal(resolved.resources.profiles[role], join(realRoot, rel));
@@ -3253,8 +3303,7 @@ test("package resources resolve from canonical loaded-module provenance: real ro
     assert.equal(copied.ok, true, copied.error);
     assert.notEqual(copied.resources.package_root, realRoot);
     assert.equal(copied.resources.guide, join(copied.resources.package_root, "skills/workspace-protocol/AUTHORING-GUIDE.md"));
-    assert.equal(copied.resources.topology_skill, join(copied.resources.package_root, manifest.pi.skills[1]));
-    assert.equal(copied.resources.topology_runner, join(copied.resources.package_root, "skills/full-topology-test/scripts/run.mjs"));
+    assert.equal(copied.resources.orchestration_skill, join(copied.resources.package_root, manifest.pi.skills[1]));
     assert.deepEqual(copied.resources.profiles, {
       supervisor: join(copied.resources.package_root, "profiles/supervisor.md"),
       lead: join(copied.resources.package_root, "profiles/lead.md"),

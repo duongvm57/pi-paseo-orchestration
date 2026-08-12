@@ -16,7 +16,7 @@
     ],
     "skills": [
       "./skills/workspace-protocol/SKILL.md",
-      "./skills/full-topology-test/SKILL.md"
+      "./skills/ppo-orchestrate/SKILL.md"
     ]
   },
   "devDependencies": {

@@ -94,6 +94,8 @@ export async function writeSettings(dir, doc) {
 export const ROLE_ENV = "PI_PASEO_ORCHESTRATION_ROLE";
 export const PROFILES_ENV = "PI_PASEO_ORCHESTRATION_PROFILES_DIR";
 export const PEER_ALIAS_ENV = "PI_PASEO_ORCHESTRATION_PEER_ALIAS";
+export const SUPERVISOR_ALIAS_ENV = "PI_PASEO_ORCHESTRATION_SUPERVISOR_ALIAS";
+export const LEAD_ALIAS_ENV = "PI_PASEO_ORCHESTRATION_LEAD_ALIAS";
 export const AGENT_ENV = "PASEO_AGENT_ID";
 
 // Closed role ceilings: Peer is read+Bash; Supervisor and Lead add the outer
@@ -106,14 +108,16 @@ export const CEILINGS = {
   peer: ["read", "bash"],
 };
 
-// Validated outer-MCP inner targets. v0.1 opens only the creation route needed
-// for the governed Supervisor → Lead → Peer topology; every call is then bound
-// to the role-specific model, thinking, alias, workspace, and authority below.
+// Validated outer-MCP inner targets. Lead lifecycle calls are restricted to
+// exact child IDs minted in this process; Paseo remains the control plane.
 export const MCP_TARGETS = {
-  supervisor: { paseo: new Set(["paseo_create_agent"]) },
-  lead: { paseo: new Set(["paseo_create_agent"]) },
+  supervisor: { paseo: new Set(["paseo_create_agent", "paseo_list_agents", "paseo_get_agent_status", "paseo_get_agent_activity"]) },
+  lead: { paseo: new Set(["paseo_create_agent", "paseo_send_agent_prompt", "paseo_get_agent_status", "paseo_get_agent_activity", "paseo_cancel_agent", "paseo_archive_agent"]) },
   peer: {},
 };
+
+const PASEO_CHILD_TOOLS = new Set(["paseo_send_agent_prompt", "paseo_get_agent_status", "paseo_get_agent_activity", "paseo_cancel_agent", "paseo_archive_agent"]);
+const createdPeerIds = new Set();
 
 // Read-family tools whose targets are checked against the protocol path by the
 // peer read gate inside checkToolCall.
@@ -487,8 +491,28 @@ export function checkToolCall(toolName, input, policy) {
     if (input.args !== undefined && (input.args === null || typeof input.args !== "object" || Array.isArray(input.args))) {
       return block("outer mcp args must be an object");
     }
-    if (input.server === "paseo" && input.tool === "paseo_create_agent") {
+      if (input.server === "paseo" && input.tool === "paseo_create_agent") {
       return validateCreateAgentArgs(input.args, policy);
+    }
+    if (input.server === "paseo" && PASEO_CHILD_TOOLS.has(input.tool)) {
+      if (policy.role === "supervisor" && (input.tool === "paseo_get_agent_status" || input.tool === "paseo_get_agent_activity")) {
+        if (!closedKeys(input.args, ["agentId"])) return block(`${input.tool} arguments must contain exactly agentId`);
+        return undefined;
+      }
+      if (policy.role !== "lead") return block(`${input.tool} is restricted to the Lead role`);
+      if (!closedKeys(input.args, ["agentId"], input.tool === "paseo_send_agent_prompt" ? ["prompt", "background", "notifyOnFinish"] : [])) {
+        return block(`${input.tool} arguments are not the closed child-specific shape`);
+      }
+      if (!policy.createdPeerIds?.has(input.args.agentId)) return block(`${input.tool} target is not a Peer created by this Lead process`);
+      if (input.tool === "paseo_send_agent_prompt" && (typeof input.args.prompt !== "string" || input.args.prompt.trim() === "")) {
+        return block("paseo_send_agent_prompt prompt must be nonempty");
+      }
+    }
+    if (input.server === "paseo" && input.tool === "paseo_list_agents") {
+      if (policy.role !== "supervisor" || !closedKeys(input.args ?? {}, [], ["includeArchived", "cwd", "sinceHours", "statuses", "limit"])) {
+        return block("paseo_list_agents is restricted to bounded Supervisor observation");
+      }
+      return undefined;
     }
     return undefined;
   }
@@ -4072,7 +4096,6 @@ export function getProtocolPin() {
 // containment pattern from validateProfileDir).
 const BUNDLED_PROFILE_FILES = ["supervisor.md", "lead.md", "peer.md"];
 const BUNDLED_SKILL_GUIDE_FILE = "AUTHORING-GUIDE.md";
-const BUNDLED_TOPOLOGY_RUNNER_FILE = "scripts/run.mjs";
 const MANIFEST_DEPENDENCY_FIELDS = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"];
 const MANIFEST_INSTALL_SCRIPTS = ["preinstall", "install", "postinstall"];
 
@@ -4133,11 +4156,10 @@ export async function resolvePackageResources(moduleUrl = import.meta.url) {
     ["extension", manifest.pi.extensions[0]],
     ["skill", manifest.pi.skills[0]],
     ["guide", join(dirname(manifest.pi.skills[0]), BUNDLED_SKILL_GUIDE_FILE)],
-    ["topology skill", manifest.pi.skills[1]],
-    ["topology runner", join(dirname(manifest.pi.skills[1]), BUNDLED_TOPOLOGY_RUNNER_FILE)],
+    ["orchestration skill", manifest.pi.skills[1]],
     ...BUNDLED_PROFILE_FILES.map((file) => [`profile ${file}`, join("profiles", file)]),
   ];
-  const resources = { package_root: realRoot, profiles: {}, extension: null, skill: null, guide: null, topology_skill: null, topology_runner: null };
+  const resources = { package_root: realRoot, profiles: {}, extension: null, skill: null, guide: null, orchestration_skill: null };
   for (const [label, rel] of declared) {
     if (isAbsolute(rel)) return { ok: false, error: `${label} must be a direct descendant of the package root (absolute path)` };
     const full = join(realRoot, rel);
@@ -4157,8 +4179,7 @@ export async function resolvePackageResources(moduleUrl = import.meta.url) {
     if (!(await stat(real)).isFile()) return { ok: false, error: `${label} must be a regular file (${rel})` };
     if ((await readFile(real, "utf8")).trim() === "") return { ok: false, error: `${label} must be nonempty (${rel})` };
     if (label === "extension" || label === "skill" || label === "guide") resources[label] = real;
-    else if (label === "topology skill") resources.topology_skill = real;
-    else if (label === "topology runner") resources.topology_runner = real;
+    else if (label === "orchestration skill") resources.orchestration_skill = real;
     else resources.profiles[label.slice("profile ".length).replace(/\.md$/, "")] = real;
   }
   // The loaded module must be the manifest-declared extension.
@@ -4334,11 +4355,92 @@ function blockWith(ctx, reason) {
   ctx.ui?.notify?.(`pi-paseo-orchestration blocked: ${reason}`, "error");
 }
 
+function createdAgentIdFromResult(event) {
+  const direct = event?.details?.structuredContent?.agentId ?? event?.details?.agentId;
+  if (typeof direct === "string" && direct.trim() !== "") return direct;
+  const blocks = Array.isArray(event?.content) ? event.content : [];
+  for (const block of blocks) {
+    const text = typeof block === "string" ? block : block?.text;
+    if (typeof text !== "string") continue;
+    const match = /"agentId"\s*:\s*"([^"]+)"/.exec(text);
+    if (match) return match[1];
+  }
+  return null;
+}
+
 function registerCommand(pi, name, definition) {
   pi.registerCommand(`ppo:${name}`, definition);
 }
 
+function bootstrapPrompt(task, cwd, settings, env) {
+  const supervisorAlias = env[SUPERVISOR_ALIAS_ENV] || "ppo-supervisor";
+  const leadAlias = env[LEAD_ALIAS_ENV] || "ppo-lead";
+  if (!validProviderAlias(supervisorAlias) || !validProviderAlias(leadAlias)) throw new Error("PPO Supervisor/Lead aliases must be nonblank names without slashes");
+  return [
+    "Load the ppo-orchestrate skill and execute its Bootstrap coordinator workflow.",
+    "PPO_BOOTSTRAP_V1",
+    JSON.stringify({ version: 1, cwd, task, supervisor_alias: supervisorAlias, lead_alias: leadAlias, supervisor: settings.roles.supervisor, lead: settings.roles.lead }),
+    "Create the governed Lead and Supervisor now. Do not implement the task in this coordinator session.",
+  ].join("\n");
+}
+
+export async function runBootstrap(args, ctx, pi) {
+  const task = String(args ?? "").trim();
+  if (task === "" || task.length > OBJECTIVE_MAX) {
+    ctx.ui?.notify?.(`Usage: /ppo:bootstrap <task> (1-${OBJECTIVE_MAX} characters)`, "warning");
+    return { ok: false, error: "task must be nonempty and bounded" };
+  }
+  if (!processIsIdle(ctx)) {
+    ctx.ui?.notify?.("pi-paseo-orchestration: bootstrap requires an idle process", "error");
+    return { ok: false, error: "process is busy" };
+  }
+  const role = parseRole(envOf(ctx));
+  if (!role.ok || role.role !== null || latch !== null || blockedReason !== null) {
+    ctx.ui?.notify?.("pi-paseo-orchestration: bootstrap must run from a healthy ungoverned coordinator process", "error");
+    return { ok: false, error: "governed or blocked process cannot bootstrap" };
+  }
+  const tools = readActiveTools(pi);
+  if (!tools.ok || !tools.tools.includes("mcp")) {
+    ctx.ui?.notify?.("pi-paseo-orchestration: bootstrap requires the active outer mcp tool", "error");
+    return { ok: false, error: "outer mcp tool is unavailable" };
+  }
+  let settings;
+  try { settings = await readSettings(configDir(envOf(ctx))); } catch (err) {
+    ctx.ui?.notify?.(`pi-paseo-orchestration: ${err.message}`, "error");
+    return { ok: false, error: err.message };
+  }
+  if (settings === null) {
+    ctx.ui?.notify?.("pi-paseo-orchestration: run /ppo:settings before bootstrap", "error");
+    return { ok: false, error: "settings are missing" };
+  }
+  const repoRoot = await findRepoRoot(ctx.cwd);
+  if (repoRoot === null) {
+    ctx.ui?.notify?.("pi-paseo-orchestration: bootstrap requires a Git repository", "error");
+    return { ok: false, error: "repository is unavailable" };
+  }
+  const protocol = await readAndValidateProtocol(repoRoot);
+  if (!protocol.ok) {
+    ctx.ui?.notify?.(`pi-paseo-orchestration: ${protocol.error}`, "error");
+    return { ok: false, error: protocol.error };
+  }
+  let prompt;
+  try { prompt = bootstrapPrompt(task, repoRoot, settings, envOf(ctx)); } catch (err) {
+    ctx.ui?.notify?.(`pi-paseo-orchestration: ${err.message}`, "error");
+    return { ok: false, error: err.message };
+  }
+  if (typeof pi.sendUserMessage !== "function") {
+    ctx.ui?.notify?.("pi-paseo-orchestration: Pi sendUserMessage API is unavailable", "error");
+    return { ok: false, error: "sendUserMessage API is unavailable" };
+  }
+  pi.sendUserMessage(prompt);
+  return { ok: true };
+}
+
 export default function (pi) {
+  registerCommand(pi, "bootstrap", {
+    description: "Create a governed Supervisor and Lead for one task in the current Paseo workspace",
+    handler: (args, ctx) => runBootstrap(args, ctx, pi),
+  });
   registerCommand(pi, "settings", {
     description: "Choose the exact provider, model, and thinking level for Supervisor, Lead, and Peer roles",
     handler: runSettings,
@@ -4399,6 +4501,7 @@ export default function (pi) {
   pi.on("session_start", async (_event, ctx) => {
     currentAuthority = null; // new/resumed/forked sessions inherit no authority
     pendingAuthority = null; // ...and clear any pending slash-command authority
+    createdPeerIds.clear();
     lastPeerReport = null;
     lastAcceptance = null;
     authorityReason = null;
@@ -4550,6 +4653,15 @@ export default function (pi) {
     return { action: "continue" };
   });
 
+  pi.on("tool_result", (event) => {
+    if (latch?.role !== "lead" || event?.toolName !== "mcp"
+        || event?.input?.server !== "paseo" || event?.input?.tool !== "paseo_create_agent"
+        || event?.isError === true) return undefined;
+    const childId = createdAgentIdFromResult(event);
+    if (childId !== null) createdPeerIds.add(childId);
+    return undefined;
+  });
+
   pi.on("agent_end", async (event, ctx) => {
     if (latch?.role !== "peer") return undefined;
     const messages = Array.isArray(event?.messages) ? event.messages : [];
@@ -4654,6 +4766,7 @@ export default function (pi) {
       currentAgentId: latch.agentId,
       envelope: currentAuthority?.envelope ?? null,
       repoRoot,
+      createdPeerIds,
     });
     if (decision?.block) {
       ctx.ui?.notify?.(`Blocked ${event.toolName}: ${decision.reason}`, "error");

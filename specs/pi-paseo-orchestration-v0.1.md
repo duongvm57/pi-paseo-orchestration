@@ -96,7 +96,7 @@ Supervisor observations persist in a Human-owned, append-only, project-scoped No
 
 ### Installed surface
 
-- The package manifest declares exactly one extension and one Workspace Protocol authoring skill, plus a standard-library test script. It declares no prompts, themes, examples, install lifecycle scripts, or adapter dependency.
+- The package manifest declares exactly one extension, one Workspace Protocol authoring skill, one PPO orchestration skill, and a standard-library test script. It declares no prompts, themes, examples, install lifecycle scripts, or adapter dependency.
 - The extension owns role settings, activation, prompt injection, capability shaping, call-time guardrails, strict contract parsing, doctor, candidate/verdict/acceptance validation, reporting constraints, and Supervisor Notebook surfaces. No speculative extension split is introduced.
 - Three nonempty private profile resources are package data for Supervisor, Lead, and Peer. They are not discoverable Pi prompts or skills and contain no secrets.
 - README documentation covers full-commit Git installation, update, rollback, three user-renamable Paseo provider aliases, role settings, independent adapter setup, doctor invocation, the cooperative non-sandbox boundary, and release smoke verification.
@@ -245,7 +245,7 @@ Supervisor observations persist in a Human-owned, append-only, project-scoped No
 
 ### Mandatory hermetic coverage
 
-1. **Package and relocation:** exactly one extension and two skills (Workspace Protocol authoring plus the user-invoked live topology proof); profiles remain private; no prompt/theme/example; no adapter dependency or install script; fresh config roots, copied development roots, and unrelated cwd resolve resources; missing/empty/non-regular/symlink-escaped resources block.
+1. **Package and relocation:** exactly one extension and two skills (Workspace Protocol authoring plus model-invoked PPO orchestration); profiles remain private; no prompt/theme/example; no adapter dependency or install script; fresh config roots, copied development roots, and unrelated cwd resolve resources; missing/empty/non-regular/symlink-escaped resources block.
 2. **Settings, activation, and policy:** settings is available without a model in passive/governed/blocked states; cancel and invalid input preserve the prior file; one confirmed complete replacement is stored only at the effective Pi config path; all three roles resolve/apply exact model and thinking; missing/unavailable/clamped or file/runtime-drifted settings block. Also cover passive/invalid role, process-latched identity/profile snapshot, complete profile override, session reset, baseline intersection, required and forbidden surfaces, no tool re-enablement, guarded outer MCP targets/arguments, unauthorized edit/write/commit, and blocked publication/deployment routes.
 3. **Strict contracts:** valid and adversarial fixtures for Task Authority Envelope, Workspace Protocol, Peer Report, Lead verdict, Local Acceptance, Notebook manifest, and Notebook entry. Unknown, duplicate, mistyped, misplaced, stale, mismatched, malformed, or unsupported-version data fails closed.
 4. **Authority lifetime and scope:** no-envelope base, run-to-run revocation, route-bound Peer/Lead/recovery grants, tool unavailable behavior, protocol mismatch, candidate-base mismatch, normalized exact scope/exclusions, traversal/absolute/glob/ambiguous/symlink rejection, and no prose-based widening.

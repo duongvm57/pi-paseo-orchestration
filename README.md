@@ -9,15 +9,16 @@ package.json
 extensions/pi-paseo-orchestration.ts
 profiles/{supervisor,lead,peer}.md
 skills/workspace-protocol/{SKILL.md,AUTHORING-GUIDE.md}
-skills/full-topology-test/{SKILL.md,scripts/run.mjs}
+skills/ppo-orchestrate/SKILL.md
 test/package.test.mjs
 test/release-smoke.mjs
 ```
 
-The manifest exposes exactly one extension and two skills: Workspace Protocol authoring and the user-invoked live full-topology proof. Their guides/scripts are packaged references, not additional discoverable skills. The three Role Profiles are private package data: they are not Pi prompts or independently discoverable skills, and contain no secrets.
+The manifest exposes exactly one extension and two skills: Workspace Protocol authoring and model-invoked PPO orchestration. The three Role Profiles are private package data: they are not Pi prompts or independently discoverable skills, and contain no secrets.
 
 The extension registers these package surfaces:
 
+- `/ppo:bootstrap <task>`
 - `/ppo:settings`
 - `/ppo:lead-tiny`
 - `/ppo:supervisor-recovery`
@@ -53,12 +54,12 @@ Lower layers cannot widen a higher-layer ceiling. The policy guardrail is cooper
 This package deliberately does not add a second lifecycle or orchestration control plane. The following remain release/runtime prerequisites rather than hidden fallbacks:
 
 - public `pi-mcp-adapter` current-agent observation and live Paseo integration;
-- lifecycle operations beyond the validated Supervisor recovery and Lead-to-Peer `paseo_create_agent` routes (follow-up/update/cancel/archive remain closed);
-- production candidate/verdict/acceptance workflow wiring into live Paseo sessions;
+- generic lifecycle authority: Lead follow-up/cancel/archive is restricted to Peers created by that exact Lead process;
+- automated Human grants and Local Acceptance; both remain direct Human actions;
 - Supervisor Workspace Protocol authoring writes (the declared skill is guidance; it grants no authority);
 - full pinned-install/update/rollback proof in the release smoke.
 
-The adapter is intentionally not bundled, vendored, imported through private modules, or declared as a dependency. `MCP_TARGETS` exposes only Paseo `paseo_create_agent` for Supervisor and Lead; role-specific argument validation is repeated at call time and every other inner target remains closed. Missing required capability fails closed.
+The adapter is intentionally not bundled, vendored, imported through private modules, or declared as a dependency. `MCP_TARGETS` exposes bounded observation to Supervisor and child-specific creation/follow-up/cancel/archive to Lead; role-specific argument validation is repeated at call time and every other inner target remains closed. Missing required capability fails closed.
 
 ## Installation and provider aliases
 
@@ -108,8 +109,15 @@ Update or rollback by reviewing and installing the exact full commit in a fresh 
 }
 ```
 
-Restart Paseo after changing aliases. Launch roots with the role alias and the
-Pi model ID, for example `ppo-supervisor/openai-codex/gpt-5.6-luna`. A Lead
+Restart Paseo after changing aliases. Optional `PI_PASEO_ORCHESTRATION_SUPERVISOR_ALIAS` and `PI_PASEO_ORCHESTRATION_LEAD_ALIAS` override the bootstrap defaults `ppo-supervisor` and `ppo-lead`.
+
+From an ungoverned Pi session in the repository, start normal work with:
+
+```text
+/ppo:bootstrap <task>
+```
+
+The command validates settings and the Workspace Protocol, then invokes the packaged orchestration skill. It creates sibling Supervisor and Lead roots in the same Paseo workspace; the Lead creates bounded Peer children. Launch individual governed roots manually only for diagnostics or recovery. A Lead
 may create a Peer only with the alias from
 `PI_PASEO_ORCHESTRATION_PEER_ALIAS`, its snapshotted Peer model/thinking,
 the inherited workspace, exact current Lead ID in `parent_lead_agent_id`, and
@@ -124,10 +132,9 @@ role proof.
 npm test
 npm run release:smoke
 git diff --check
-node skills/full-topology-test/scripts/run.mjs --workspace <paseo-workspace-id>
 ```
 
-The standard-library test suite covers package resources, settings, activation, policy, strict contracts, Git candidate checks, Notebook behavior, doctor observation, release gating, and mutation boundaries. The live runner proves Supervisor → Lead → Peer identities, doctor policy, and Peer Report correlation, then archives its agents. `notifyOnFinish` is only an attention signal for the created child run; it is not a mailbox or delivery guarantee for a report emitted by a later follow-up. The release smoke proves relocation and local package seams, and exits non-zero while required live adapter/Paseo/install facts remain unproven.
+The standard-library test suite covers package resources, bootstrap, settings, activation, policy, strict contracts, Git candidate checks, Notebook behavior, doctor observation, release gating, and mutation boundaries. Live workflow validation starts with `/ppo:bootstrap <task>` and follows Paseo finish notifications; `notifyOnFinish` is an attention signal, not acceptance. The release smoke proves relocation and local package seams, and exits non-zero while required live adapter/Paseo/install facts remain unproven.
 
 ## Public Pi seam
 
