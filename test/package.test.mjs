@@ -3502,3 +3502,37 @@ test("settings command: thinking picker offers only the selected model's support
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("settings command: Esc mid-flow goes back instead of cancelling; Esc at the first field cancels", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ppo-cmd-esc-"));
+  try {
+    // Esc (undefined) at the model step of supervisor → back to provider, redo.
+    const queue = [
+      "anthropic", undefined, "anthropic", "claude-sonnet-4-5", "high",
+      "anthropic", "claude-sonnet-4-5", "medium",
+      "openai", "gpt-5", "off",
+    ];
+    const fake = fakePi({ ui: { select: async () => queue.shift() ?? null, confirm: async () => true } });
+    await runSettingsWith(fake, { ...process.env, PI_CODING_AGENT_DIR: dir });
+    assert.deepEqual(
+      JSON.parse(await readFile(join(dir, "pi-paseo-orchestration", "settings.json"), "utf8")),
+      validDoc,
+      "Esc mid-flow must re-prompt, not cancel",
+    );
+    assert.equal(fake.notifications.some(([, level]) => level === "error"), false);
+
+    // Esc at the very first field cancels and preserves prior bytes.
+    const prior = { ...validDoc, roles: { ...validDoc.roles, peer: { ...validDoc.roles.peer, thinking: "low" } } };
+    await writeSettings(dir, prior);
+    const fakeCancel = fakePi({ ui: { select: async () => null, confirm: async () => true } });
+    await runSettingsWith(fakeCancel, { ...process.env, PI_CODING_AGENT_DIR: dir });
+    assert.deepEqual(
+      JSON.parse(await readFile(join(dir, "pi-paseo-orchestration", "settings.json"), "utf8")),
+      prior,
+      "Esc at the first field must cancel and preserve prior bytes",
+    );
+    assert.equal(fakeCancel.notifications.some(([msg]) => /Cancelled/.test(msg)), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

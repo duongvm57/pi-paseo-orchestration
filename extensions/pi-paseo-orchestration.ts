@@ -3768,10 +3768,12 @@ export function thinkingLevelsFor(model) {
 
 const BACK_OPTION = "← Back";
 
+// Esc (select returns undefined) and the "← Back" option both mean back one
+// step. The whole flow cancels only at its very first field — a wizard-style
+// exit instead of a mid-flow abort.
 async function pickWithBack(ctx, title, options) {
   const choice = await ctx.ui.select(title, [BACK_OPTION, ...options]);
-  if (choice === null || choice === undefined) return { cancelled: true };
-  if (choice === BACK_OPTION) return { back: true };
+  if (choice === null || choice === undefined || choice === BACK_OPTION) return { back: true };
   return { value: choice };
 }
 
@@ -3804,7 +3806,6 @@ async function runSettings(_args, ctx) {
     const role = ROLES[roleIdx];
     if (field === 0) {
       const res = await pickWithBack(ctx, `Provider for ${role}:`, providers);
-      if (res.cancelled) { notify(cancelNote, "info"); return; }
       if (res.back) {
         if (roleIdx === 0) { notify(cancelNote, "info"); return; } // first field: back = cancel
         roleIdx -= 1;
@@ -3818,7 +3819,6 @@ async function runSettings(_args, ctx) {
     if (field === 1) {
       const ids = models.filter((m) => m.provider === chosen[role].provider).map((m) => m.id).sort();
       const res = await pickWithBack(ctx, `Model for ${role}:`, ids);
-      if (res.cancelled) { notify(cancelNote, "info"); return; }
       if (res.back) { field = 0; continue; }
       chosen[role].model = res.value;
       chosen[role].modelEntry = models.find(
@@ -3829,7 +3829,6 @@ async function runSettings(_args, ctx) {
     }
     const levels = thinkingLevelsFor(chosen[role].modelEntry);
     const res = await pickWithBack(ctx, `Thinking level for ${role}:`, levels);
-    if (res.cancelled) { notify(cancelNote, "info"); return; }
     if (res.back) { field = 1; continue; }
     roles[role] = { provider: chosen[role].provider, model: chosen[role].model, thinking: res.value };
     roleIdx += 1;
