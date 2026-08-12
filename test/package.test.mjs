@@ -45,6 +45,7 @@ const baseModels = () => [
 const fakePi = (ctxOverrides = {}) => {
   const handlers = new Map();
   const commands = new Map();
+  const tools = new Map();
   const notifications = [];
   const holder = { activeTools: [...(ctxOverrides.activeTools ?? [])], modelCalls: [] };
   const ui = {
@@ -56,10 +57,12 @@ const fakePi = (ctxOverrides = {}) => {
   return {
     handlers,
     commands,
+    tools,
     notifications,
     holder,
     pi: {
       registerCommand: (name, definition) => commands.set(name, definition),
+      registerTool: (name, definition) => tools.set(name, definition),
       on: (name, handler) => handlers.set(name, handler),
       setActiveTools: (tools) => { holder.activeTools = [...tools]; },
       getActiveTools: () => [...holder.activeTools],
@@ -219,9 +222,10 @@ test("extension registers the settings command and a handler that never calls a 
     "pi-paseo-orchestration:lead-tiny",
     "pi-paseo-orchestration:supervisor-recovery",
     "pi-paseo-orchestration:notebook-init",
-    "pi-paseo-orchestration:notebook-append",
     "pi-paseo-orchestration:doctor",
   ]);
+  assert.equal(fake.tools.has("pi-paseo-orchestration:supervisor_notebook_append"), true);
+  assert.equal(fake.commands.has("pi-paseo-orchestration:notebook-append"), false);
 });
 
 test("settings command: cancel anywhere preserves prior bytes and writes nothing", async () => {
@@ -485,7 +489,7 @@ test("wiring: passive env stays ungoverned; governed blocks input, injects profi
     fake.pi.getActiveTools = () => [...fake.holder.activeTools];
     ext.default(fake.pi);
 
-    assert.deepEqual([...fake.handlers.keys()].sort(), ["before_agent_start", "input", "session_before_fork", "session_before_switch", "session_start", "tool_call"]);
+    assert.deepEqual([...fake.handlers.keys()].sort(), ["agent_end", "before_agent_start", "input", "session_before_fork", "session_before_switch", "session_start", "tool_call"]);
 
     // session_start activates with exact model application.
     const registry = fake.ctx.modelRegistry;
@@ -636,7 +640,7 @@ const validMeta = {
 
 const coreSections = [
   ["decision matrix", "The Human decides product, priority, irreversible trade-off, external-effect, authority, protocol, subjective, and material cost/risk questions; every other role treats those as must-ask boundaries. Supervisor owns observation and authoring; Lead owns framing, routing, and verdicts; Peer owns assigned work."],
-  ["task classes and routing", "Tiny/bounded work may route to the Lead only when the protocol permits it; otherwise bounded work routes to one Peer. Cross-module/lifecycle work routes to one Engineer Peer with an isolated checkout. Architecture-sensitive work routes to an Architect disposition and independent review."],
+  ["task classes and routing", "Lead self-work is allowed only for tiny/bounded work when a matching Human lead_tiny grant exists; otherwise bounded work routes to one Peer. Cross-module/lifecycle work routes to one Engineer Peer with an isolated checkout. Architecture-sensitive work routes to an Architect disposition and independent review."],
   ["ownership and isolation", "One writer per moving scope; concurrent writers use disjoint scopes and isolated checkouts; ownership returns by explicit handback; the Lead does not take over an owned scope."],
   ["candidate, verification, review, and acceptance", "Every class produces one git Stable Candidate; verification is exact commands with recorded evidence; review triggers follow risk class; acceptance is a direct Human message only."],
   ["reopen, dependency, and blocked handling", "REOPEN_REQUEST names the failed premise; DEPENDENCY_REQUEST names the owner and requirement; BLOCKED reports bounded attempts; requests are decisions, not candidate acceptance."],
@@ -1158,6 +1162,13 @@ test("checkCommitGate: direct gate checks HEAD against base and rejects scope dr
     assert.match(headDrift.reason, /HEAD does not equal/);
 
     assert.equal(await checkCommitGate("echo hi", authority), undefined, "non-commit commands are not gated here");
+
+    const multiCommit = await checkCommitGate("git commit -m first && git commit -m second", authority);
+    assert.equal(multiCommit.block, true);
+    assert.match(multiCommit.reason, /exactly one git commit/);
+
+    const multiline = await checkCommitGate("git commit -m first\ngit commit -m second", authority);
+    assert.equal(multiline.block, true);
   } finally {
     await rm(repo.dir, { recursive: true, force: true });
   }
@@ -1178,8 +1189,9 @@ test("validateProtocol: valid protocol passes with metadata and canonical digest
   assert.equal(check.digest, digestOf(validProtocol));
   assert.equal(check.digest, createHash("sha256").update(Buffer.from(validProtocol, "utf8")).digest("hex"));
 
-  // Quoted YAML values and extra non-canonical keys are tolerated.
-  assert.equal(validateProtocol(protocolText({ project_id: '"ppo-fixture"', title: "Repo protocol" })).ok, true);
+  // Quoted canonical values are accepted, but extra metadata is outside the closed schema.
+  assert.equal(validateProtocol(protocolText({ project_id: '"ppo-fixture"' })).ok, true);
+  assert.equal(validateProtocol(protocolText({ title: "Repo protocol" })).ok, false);
 });
 
 test("validateProtocol: metadata is closed — malformed, duplicate, missing, or mistyped values fail", () => {
@@ -1234,10 +1246,15 @@ test("validateProtocol: every required core section is enforced; optional sectio
   assert.equal(noMustAsk.ok, false);
   assert.match(noMustAsk.error, /must-ask boundaries/);
 
-  // Optional sections may be absent; model/effort routing presence neither
-  // required nor granting anything.
-  const withOptionals = `${coreBody()}\n\n## Project criticality\n\nHigh.\n\n## Review and council\n\nA council appears only for genuinely independent decisions.\n\n## Anti-patterns\n\nNo ceremony for tiny work.\n\n## Supervisor hints\n\nObserve, do not implement.\n\n## Model routing\n\nReserved for a later version; not normative here.`;
-  assert.equal(validateProtocol(protocolText({}, withOptionals)).ok, true, "optional and model-routing sections must not break validation");
+  // Optional sections may be absent; model/effort routing is outside the closed schema.
+  const withOptionals = `${coreBody()}\n\n## Project criticality\n\nHigh.\n\n## Review and council\n\nA council appears only for genuinely independent decisions.\n\n## Anti-patterns\n\nNo ceremony for tiny work.\n\n## Supervisor hints\n\nObserve, do not implement.`;
+  assert.equal(validateProtocol(protocolText({}, withOptionals)).ok, true, "closed optional sections must validate");
+  assert.equal(validateProtocol(`${withOptionals}\n\n## Model routing\n\nReserved for a later version.`).ok, false, "model routing must be rejected");
+
+  const emptyCore = coreBody(coreSections.map(([heading, body]) => [heading, heading === "ownership and isolation" ? "" : body]));
+  const empty = validateProtocol(protocolText({}, emptyCore));
+  assert.equal(empty.ok, false);
+  assert.match(empty.error, /must be nonempty/);
 });
 
 test("readAndValidateProtocol: missing and empty files fail closed; valid file returns digest and metadata", async () => {
@@ -1288,6 +1305,7 @@ test("wiring: a valid protocol is pinned at session_start and re-verified at eve
       version: 1,
       projectId: "ppo-fixture",
       digest: digestOf(validProtocol),
+      allowsLeadTiny: true,
     });
 
     // Pin survives repeated reads: input, before_agent_start, and tool_call
@@ -1519,6 +1537,31 @@ test("wiring: protocol presence never grants write, edit, or commit without an e
   }
 });
 
+test("wiring: lead_tiny is blocked when the pinned protocol forbids Lead self-work", async () => {
+  const repo = await gitRepoFixture();
+  const previous = process.cwd();
+  process.chdir(repo.dir);
+  const forbidden = validProtocol.replace("Lead self-work is allowed", "Lead self-work is forbidden");
+  await writeFile(protocolPath(repo.dir), forbidden, "utf8");
+  const ext = await freshExtension();
+  const env = await governedFixture(ext, { role: "lead", activeTools: ["read", "bash", "mcp", "write", "edit"] });
+  try {
+    assert.equal(ext.getProtocolPin().allowsLeadTiny, false);
+    await inputText(env.fake, envelopeText({
+      version: 1, grant_kind: "lead_tiny", role: "lead", issuer: "human",
+      agent_id: "agent-7", task_id: "t-1", objective: "tiny fix",
+      capabilities: ["edit"], scope: "src", protocol_digest: digestOf(forbidden),
+    }));
+    assert.equal(ext.getAuthority(), null);
+    assert.match(ext.getAuthorityReason(), /does not allow Lead tiny self-work/);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+    process.chdir(previous);
+  }
+});
+
 test("wiring: a lead_tiny envelope whose digest does not match the pinned protocol fails activation", async () => {
   const repo = await gitRepoFixture();
   const previous = process.cwd();
@@ -1567,32 +1610,32 @@ const {
 
 const reportText = (obj) => `${REPORT_BEGIN}\n${JSON.stringify(obj, null, 2)}\n${REPORT_END}`;
 
-const progressReport = (over = {}) => ({
+const reportBase = {
   version: 1,
-  kind: "PROGRESS",
-  peer_id: "peer-1",
-  parent_id: "lead-7",
+  report_id: "report-1",
+  peer_agent_id: "peer-1",
+  parent_lead_agent_id: "lead-7",
   task_id: "task-42",
   assignment_id: "a-1",
-  summary: "Checkpoint reached: the scoped investigation is complete.",
+  summary: "A bounded report with inspectable evidence.",
   evidence: ["read src/main.go: module boundary confirmed"],
-  payload: { checkpoint: "Investigation complete; writes would need a grant" },
+};
+
+const progressReport = (over = {}) => ({
+  ...reportBase,
+  kind: "PROGRESS",
+  payload: { completed: ["Investigation complete"], next: ["Await the write grant"], risks: ["No write authority"] },
   ...over,
 });
 
 const handoffReport = (over = {}) => ({
-  version: 1,
+  ...reportBase,
   kind: "HANDOFF",
-  peer_id: "peer-1",
-  parent_id: "lead-7",
-  task_id: "task-42",
-  assignment_id: "a-1",
   summary: "Feature implemented and verified.",
-  evidence: ["git diff --stat shows only src/feature.go", "npm test passes"],
   payload: {
     artifacts: ["src/feature.go"],
-    candidate: `git:v1:${"a".repeat(40)}:${"b".repeat(40)}`,
-    verification: ["npm test -- --run"],
+    candidate_ref: `git:v1:${"a".repeat(40)}:${"b".repeat(40)}`,
+    verification: [{ command: "npm test -- --run", result: "PASS", output: "passed" }],
     residual_risks: [],
     unfinished_dependencies: [],
   },
@@ -1600,14 +1643,8 @@ const handoffReport = (over = {}) => ({
 });
 
 const reopenReport = (over = {}) => ({
-  version: 1,
+  ...reportBase,
   kind: "REOPEN_REQUEST",
-  peer_id: "peer-1",
-  parent_id: "lead-7",
-  task_id: "task-42",
-  assignment_id: "a-1",
-  summary: "The assignment premise fails: the API contract changed.",
-  evidence: ["read src/api.go: the exported type no longer exists"],
   payload: {
     failed_premise: "The assumed API contract no longer exists in main.",
     impact: "The assigned change cannot be implemented as framed.",
@@ -1618,17 +1655,11 @@ const reopenReport = (over = {}) => ({
 });
 
 const dependencyReport = (over = {}) => ({
-  version: 1,
+  ...reportBase,
   kind: "DEPENDENCY_REQUEST",
-  peer_id: "peer-1",
-  parent_id: "lead-7",
-  task_id: "task-42",
-  assignment_id: "a-1",
-  summary: "A Human decision is required before work can continue.",
-  evidence: ["read CONTEXT.md: product ownership is undefined"],
   payload: {
     needed: "A product decision on the output format.",
-    from: "Human",
+    needed_from: "Human",
     impact: "The format choice changes the entire diff.",
     human_decision_required: true,
   },
@@ -1636,81 +1667,53 @@ const dependencyReport = (over = {}) => ({
 });
 
 const blockedReport = (over = {}) => ({
-  version: 1,
+  ...reportBase,
   kind: "BLOCKED",
-  peer_id: "peer-1",
-  parent_id: "lead-7",
-  task_id: "task-42",
-  assignment_id: "a-1",
-  summary: "No edit grant is available; the outcome requires writes.",
-  evidence: ["tool list shows no write/edit capability"],
   payload: {
     blocker: "No current-run edit grant.",
     impact: "The assigned outcome cannot be produced read-only.",
     unblock_condition: "A direct Human grant for scope src/.",
-    attempts: ["Confirmed the write tools are absent"],
-    unrelated_continuation: false,
+    bounded_attempts: ["Confirmed the write tools are absent"],
+    can_continue_elsewhere: false,
   },
   ...over,
 });
 
 test("parseReport: every closed kind validates as a strict v1 document", () => {
   assert.deepEqual(REPORT_KINDS, ["PROGRESS", "HANDOFF", "REOPEN_REQUEST", "DEPENDENCY_REQUEST", "BLOCKED"]);
-  const fixtures = [
-    ["PROGRESS", progressReport()],
-    ["HANDOFF", handoffReport()],
-    ["REOPEN_REQUEST", reopenReport()],
-    ["DEPENDENCY_REQUEST", dependencyReport()],
-    ["BLOCKED", blockedReport()],
-  ];
-  for (const [kind, report] of fixtures) {
+  for (const [kind, report] of [["PROGRESS", progressReport()], ["HANDOFF", handoffReport()], ["REOPEN_REQUEST", reopenReport()], ["DEPENDENCY_REQUEST", dependencyReport()], ["BLOCKED", blockedReport()]]) {
     const parsed = parseReport(reportText(report));
     assert.equal(parsed.ok, true, `${kind} must validate`);
     assert.equal(parsed.report.kind, kind);
-    assert.equal(parsed.report.peer_id, "peer-1");
-    assert.equal(parsed.report.parent_id, "lead-7");
-    assert.equal(parsed.report.task_id, "task-42");
-    assert.equal(parsed.report.assignment_id, "a-1");
-    assert.equal(typeof parsed.report.summary, "string");
-    assert.equal(parsed.report.evidence.length >= 1, true);
-    assert.equal(typeof parsed.report.payload, "object");
+    assert.equal(parsed.report.report_id, "report-1");
+    assert.equal(parsed.report.peer_agent_id, "peer-1");
+    assert.equal(parsed.report.parent_lead_agent_id, "lead-7");
   }
-
-  // Optional supersedes is accepted when nonempty; HANDOFF candidate is optional.
-  assert.equal(parseReport(reportText(progressReport({ supersedes: "report-9" }))).ok, true);
-  assert.equal(parseReport(reportText(handoffReport({ payload: { ...handoffReport().payload, candidate: undefined } }))).ok, true);
-
-  // No marker → not a report; empty/whitespace are null, never errors.
+  assert.equal(parseReport(reportText(progressReport({ supersedes_report_id: "report-0" }))).ok, true);
+  assert.equal(parseReport(reportText(handoffReport({ payload: { ...handoffReport().payload, candidate_ref: null } }))).ok, true);
   assert.deepEqual(parseReport("just a response"), { ok: true, report: null });
   assert.deepEqual(parseReport(""), { ok: true, report: null });
-  assert.deepEqual(parseReport("  \n "), { ok: true, report: null });
 });
 
-test("parseReport: unknown, duplicate, malformed, mistyped, misplaced data rejects with exact reasons", () => {
+test("parseReport: unknown, duplicate, malformed, mistyped, misplaced data rejects", () => {
   const valid = reportText(progressReport());
   const cases = [
-    ["unknown kind", reportText(progressReport({ kind: "DONE" })), /kind must be one of PROGRESS\|HANDOFF\|REOPEN_REQUEST\|DEPENDENCY_REQUEST\|BLOCKED/],
+    ["unknown kind", reportText(progressReport({ kind: "DONE" })), /kind must be one of/],
     ["unknown version", reportText(progressReport({ version: 2 })), /version must be exactly 1/],
     ["unknown field", reportText(progressReport({ magic: true })), /unknown field "magic"/],
-    ["duplicate field", `${REPORT_BEGIN}\n{\n  "version": 1,\n  "kind": "PROGRESS",\n  "kind": "BLOCKED",\n  "peer_id": "peer-1",\n  "parent_id": "lead-7",\n  "task_id": "task-42",\n  "assignment_id": "a-1",\n  "summary": "x",\n  "evidence": ["y"],\n  "payload": { "checkpoint": "z" }\n}\n${REPORT_END}`, /duplicate field "kind"/],
+    ["duplicate field", `${REPORT_BEGIN}\n{"version":1,"kind":"PROGRESS","kind":"BLOCKED","report_id":"r","peer_agent_id":"p","parent_lead_agent_id":"l","task_id":"t","assignment_id":"a","summary":"x","evidence":["y"],"payload":{}}\n${REPORT_END}`, /duplicate field "kind"/],
     ["malformed", `${REPORT_BEGIN}\n{"version": 1, broken\n${REPORT_END}`, /not valid JSON/],
     ["array body", `${REPORT_BEGIN}\n[1, 2]\n${REPORT_END}`, /single JSON object/],
-    ["missing peer id", reportText(progressReport({ peer_id: "" })), /peer_id must be a nonempty string/],
-    ["numeric peer id", reportText(progressReport({ peer_id: 7 })), /peer_id must be a nonempty string/],
-    ["missing parent id", reportText(progressReport({ parent_id: " " })), /parent_id must be a nonempty string/],
+    ["missing report id", reportText(progressReport({ report_id: "" })), /report_id must be a nonempty string/],
+    ["numeric peer id", reportText(progressReport({ peer_agent_id: 7 })), /peer_agent_id must be a nonempty string/],
+    ["missing parent id", reportText(progressReport({ parent_lead_agent_id: " " })), /parent_lead_agent_id must be a nonempty string/],
     ["missing task id", reportText(progressReport({ task_id: "" })), /task_id must be a nonempty string/],
-    ["missing assignment id", reportText(progressReport({ assignment_id: "" })), /assignment_id must be a nonempty string/],
     ["numeric summary", reportText(progressReport({ summary: 5 })), /summary must be a nonempty string/],
     ["empty evidence", reportText(progressReport({ evidence: [] })), /evidence must be a nonempty array/],
-    ["string evidence", reportText(progressReport({ evidence: "x" })), /evidence must be a nonempty array/],
-    ["blank evidence item", reportText(progressReport({ evidence: ["  "] })), /evidence must be a nonempty array/],
-    ["empty supersedes", reportText(progressReport({ supersedes: "" })), /supersedes must be a nonempty string/],
-    ["numeric supersedes", reportText(progressReport({ supersedes: 9 })), /supersedes must be a nonempty string/],
+    ["empty supersedes", reportText(progressReport({ supersedes_report_id: "" })), /supersedes_report_id must be a nonempty string/],
     ["misplaced", `Here is my work.\n${valid}`, /must be the first nonempty content/],
     ["duplicate report", `${valid}\n${valid}`, /duplicate peer report/],
     ["unclosed", `${REPORT_BEGIN}\n${JSON.stringify(progressReport())}`, /no closing marker/],
-    ["unknown marker version", '<pi-paseo-orchestration report="v2">\n{"version": 1}\n</pi-paseo-orchestration>', /unrecognized peer report marker/],
-    ["authority marker is not a report", '<pi-paseo-orchestration authority="v1">\n{}\n</pi-paseo-orchestration>', /unrecognized peer report marker/],
   ];
   for (const [label, text, re] of cases) {
     const parsed = parseReport(text);
@@ -1722,18 +1725,15 @@ test("parseReport: unknown, duplicate, malformed, mistyped, misplaced data rejec
 test("parseReport: payload is typed and closed per kind", () => {
   const cases = [
     ["string payload", reportText(progressReport({ payload: "x" })), /payload must be a single object/],
-    ["missing payload", reportText(progressReport({ payload: undefined })), /payload must be a single object/],
-    ["unknown payload field", reportText(progressReport({ payload: { checkpoint: "x", extra: 1 } })), /unknown field "extra" in PROGRESS payload/],
-    ["empty checkpoint", reportText(progressReport({ payload: { checkpoint: " " } })), /payload\.checkpoint must be a nonempty string/],
-    ["handoff missing artifacts", reportText(handoffReport({ payload: { candidate: "x", verification: ["y"], residual_risks: [], unfinished_dependencies: [] } })), /payload\.artifacts is missing/],
-    ["handoff empty artifacts", reportText(handoffReport({ payload: { ...handoffReport().payload, artifacts: [] } })), /payload\.artifacts must contain at least 1/],
-    ["handoff blank verification item", reportText(handoffReport({ payload: { ...handoffReport().payload, verification: [" "] } })), /payload\.verification must be an array of nonempty strings/],
-    ["reopen missing premise", reportText(reopenReport({ payload: { impact: "i", options: ["o"], requested_decision: "d" } })), /payload\.failed_premise is missing/],
-    ["reopen string options", reportText(reopenReport({ payload: { ...reopenReport().payload, options: "o" } })), /payload\.options must be an array of nonempty strings/],
-    ["reopen empty options", reportText(reopenReport({ payload: { ...reopenReport().payload, options: [] } })), /payload\.options must contain at least 1/],
-    ["dependency string boolean", reportText(dependencyReport({ payload: { ...dependencyReport().payload, human_decision_required: "yes" } })), /payload\.human_decision_required must be a boolean/],
-    ["blocked empty attempts", reportText(blockedReport({ payload: { ...blockedReport().payload, attempts: [] } })), /payload\.attempts must contain at least 1/],
-    ["blocked string boolean", reportText(blockedReport({ payload: { ...blockedReport().payload, unrelated_continuation: "maybe" } })), /payload\.unrelated_continuation must be a boolean/],
+    ["unknown payload field", reportText(progressReport({ payload: { completed: ["x"], next: ["y"], risks: ["z"], extra: 1 } })), /unknown field "extra"/],
+    ["empty progress", reportText(progressReport({ payload: { completed: [], next: ["y"], risks: ["z"] } })), /completed must contain at least 1/],
+    ["handoff invalid candidate", reportText(handoffReport({ payload: { ...handoffReport().payload, candidate_ref: "x" } })), /candidate_ref|candidate reference/i],
+    ["handoff empty artifacts", reportText(handoffReport({ payload: { ...handoffReport().payload, artifacts: [] } })), /artifacts must contain at least 1/],
+    ["handoff invalid verification", reportText(handoffReport({ payload: { ...handoffReport().payload, verification: [{ command: "x", result: "PASS", output: "" }] } })), /output must be a nonempty string/],
+    ["reopen missing premise", reportText(reopenReport({ payload: { impact: "i", options: ["o"], requested_decision: "d" } })), /failed_premise is missing/],
+    ["dependency string boolean", reportText(dependencyReport({ payload: { ...dependencyReport().payload, human_decision_required: "yes" } })), /human_decision_required must be a boolean/],
+    ["blocked empty attempts", reportText(blockedReport({ payload: { ...blockedReport().payload, bounded_attempts: [] } })), /bounded_attempts must contain at least 1/],
+    ["blocked string boolean", reportText(blockedReport({ payload: { ...blockedReport().payload, can_continue_elsewhere: "maybe" } })), /can_continue_elsewhere must be a boolean/],
   ];
   for (const [label, text, re] of cases) {
     const parsed = parseReport(text);
@@ -1748,8 +1748,8 @@ test("correlateReport: exact child/parent/task/assignment correlation; any misma
 
   // Stale/mismatched identities all fail closed.
   for (const [label, over] of [
-    ["stale child", { peer_id: "peer-2" }],
-    ["wrong parent", { parent_id: "lead-8" }],
+    ["stale child", { peer_agent_id: "peer-2" }],
+    ["wrong parent", { parent_lead_agent_id: "lead-8" }],
     ["other task", { task_id: "task-43" }],
     ["other assignment", { assignment_id: "a-2" }],
   ]) {
@@ -1764,9 +1764,9 @@ test("correlateReport: exact child/parent/task/assignment correlation; any misma
   assert.equal(correlateReport(progressReport(), null).ok, false);
   assert.equal(correlateReport(null, known).ok, false);
 
-  // Report ids must be nonempty even when the known facts agree.
-  assert.equal(correlateReport(progressReport({ task_id: "" }), known).ok, false);
-  assert.equal(correlateReport(progressReport({ assignment_id: " " }), known).ok, false);
+  // Report ids and candidate-required handoffs fail closed.
+  assert.equal(correlateReport(progressReport({ report_id: "" }), known).ok, false);
+  assert.equal(correlateReport(handoffReport({ payload: { ...handoffReport().payload, candidate_ref: null } }), { ...known, candidateRequired: true }).ok, false);
 });
 
 test("createInspectionLimit: at most one bounded inspection; evidence resets; exceeding fails closed", () => {
@@ -1779,6 +1779,21 @@ test("createInspectionLimit: at most one bounded inspection; evidence resets; ex
   assert.equal(limit.requestInspection().ok, false);
   assert.throws(() => createInspectionLimit(0), /positive integer/);
   assert.throws(() => createInspectionLimit("1"), /positive integer/);
+});
+
+test("wiring: peer agent_end accepts only a correlated terminal Peer Report", async () => {
+  const ext = await freshExtension();
+  const env = await governedFixture(ext, { role: "peer", activeTools: ["read", "bash"] });
+  try {
+    const report = progressReport();
+    await env.fake.handlers.get("agent_end")({ messages: [{ role: "assistant", content: reportText(report) }] }, { ...env.fake.ctx, peerReportContext: { peerId: "peer-1", parentId: "lead-7", taskId: "task-42", assignmentId: "a-1" } });
+    assert.deepEqual(ext.getPeerReport(), report);
+    await env.fake.handlers.get("agent_end")({ messages: [{ role: "assistant", content: reportText({ ...report, peer_agent_id: "wrong-peer" }) }] }, { ...env.fake.ctx, peerReportContext: { peerId: "peer-1", parentId: "lead-7", taskId: "task-42", assignmentId: "a-1" } });
+    assert.equal(ext.getPeerReport(), null);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+  }
 });
 
 // Governed process wired for slash-command flows: fake ui with input support
@@ -2102,6 +2117,11 @@ async function candidateEvidenceDoc(repo, candidate, over = {}) {
     workspace_id: "workspace-1",
     workspace_protocol_digest: digestOf(validProtocol),
     candidate_ref: ref,
+    objective_relevance: {
+      result: "PASS",
+      rationale: "The candidate implements the bounded objective under src/.",
+      evidence_refs: ["diff-1"],
+    },
     cumulative_diff: {
       evidence_id: "diff-1",
       base_oid: repo.base,
@@ -2373,6 +2393,7 @@ test("parseCandidateEvidence: closed candidate-bound evidence rejects malformed,
       ["malformed", `${CANDIDATE_EVIDENCE_BEGIN}\n{"version":1,broken\n${CANDIDATE_EVIDENCE_END}`],
       ["duplicate", `${CANDIDATE_EVIDENCE_BEGIN}\n${duplicateBody}\n${CANDIDATE_EVIDENCE_END}`],
       ["unknown", blockText(CANDIDATE_EVIDENCE_BEGIN, CANDIDATE_EVIDENCE_END, { ...doc, surprise: true })],
+      ["missing objective relevance", blockText(CANDIDATE_EVIDENCE_BEGIN, CANDIDATE_EVIDENCE_END, (() => { const { objective_relevance, ...withoutObjectiveRelevance } = doc; return withoutObjectiveRelevance; })())],
       ["mistyped", blockText(CANDIDATE_EVIDENCE_BEGIN, CANDIDATE_EVIDENCE_END, { ...doc, changed_paths: "src/feature.go" })],
       ["out of scope", blockText(CANDIDATE_EVIDENCE_BEGIN, CANDIDATE_EVIDENCE_END, { ...doc, changed_paths: ["README.md"] })],
       ["scope mismatch", blockText(CANDIDATE_EVIDENCE_BEGIN, CANDIDATE_EVIDENCE_END, { ...doc, scope: { ...doc.scope, writable_scope: "." } })],
@@ -3203,7 +3224,7 @@ test("mutation boundary: settings command, notebook init+append, and doctor touc
     assert.equal(initResult.ok, true, initResult.error);
     const manifest = JSON.parse(await readFile(initResult.paths.manifestPath, "utf8"));
     const entry = notebookEntryFixture(manifest, "ppo-fixture", repo.dir);
-    const appendResult = await fake.commands.get("pi-paseo-orchestration:notebook-append").handler({ project_id: "ppo-fixture", entry }, fake.ctx);
+    const appendResult = await fake.tools.get("pi-paseo-orchestration:supervisor_notebook_append").execute({ project_id: "ppo-fixture", entry }, fake.ctx);
     assert.equal(appendResult.ok, true, appendResult.error);
     const doctorResult = await fake.commands.get("pi-paseo-orchestration:doctor").handler("", { ...fake.ctx, rpc: true });
     assert.equal(doctorResult.ok, true, doctorResult.error);

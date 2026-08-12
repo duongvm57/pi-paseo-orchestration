@@ -115,7 +115,12 @@ const PROTOCOL_READ_TOOLS = ["read", "grep", "ls", "find"];
 // flag forms (`git --no-pager commit`) by scanning the command line for the
 // subcommand after any `git` invocation.
 const GIT_COMMIT = /\bgit\b[^\n;&|]*\bcommit\b/; // commits need a current-run local_commit grant
+const GIT_COMMIT_INVOCATION = /\bgit\b[^\n;&|]*\bcommit\b/g;
 const GIT_AMEND = /\bgit\b[^\n;&|]*\bcommit\b[^\n;&|]*--amend\b/; // amend is forbidden even with a grant
+
+function recognizableCommitCount(command) {
+  return String(command ?? "").replace(/\r?\n/g, ";").match(GIT_COMMIT_INVOCATION)?.length ?? 0;
+}
 const PUBLICATION = [
   /\bgit\b[^\n;&|]*\b(?:push|merge)\b/, // push/merge never allowed
   /\bgh\s+pr\b/,
@@ -219,7 +224,11 @@ export async function activate({ env, dir, profileDir, models, setModel, setThin
   if (!source.ok) return source;
 
   let profileText;
+  const profileDigests = {};
   try {
+    for (const role of ROLES) {
+      profileDigests[role] = profileDigest(await readProfile(profileDir, role));
+    }
     profileText = await readProfile(profileDir, roleCheck.role);
   } catch (err) {
     return { ok: false, error: err.message };
@@ -256,15 +265,32 @@ export async function activate({ env, dir, profileDir, models, setModel, setThin
     agentId,
     settings: structuredClone(settings),
     profileDir,
+    profileOverride: env[PROFILES_ENV] ?? null,
     profileText,
     profileDigest: profileDigest(profileText),
+    profileDigests,
+    selectedModel: { provider: sel.provider, id: sel.model },
+    selectedThinking: sel.thinking,
   };
   return { ok: true, latch };
 }
 
-export async function verifyLatch(latch, env, dir) {
+function verifyRuntimeSelection(latch, ctx) {
+  if (ctx?.model !== undefined) {
+    if (!isRecord(ctx.model) || ctx.model.provider !== latch.selectedModel?.provider || ctx.model.id !== latch.selectedModel?.id) {
+      return { ok: false, error: "runtime model drifted from the latched role setting" };
+    }
+  }
+  if (ctx?.thinkingLevel !== undefined && ctx.thinkingLevel !== latch.selectedThinking) {
+    return { ok: false, error: "runtime thinking level drifted from the latched role setting" };
+  }
+  return { ok: true };
+}
+
+export async function verifyLatch(latch, env, dir, ctx) {
   if (parseRole(env).role !== latch.role) return { ok: false, error: "role environment drifted" };
   if ((env[AGENT_ENV] ?? "").trim() !== latch.agentId) return { ok: false, error: "Paseo agent identity drifted" };
+  if ((env[PROFILES_ENV] ?? null) !== latch.profileOverride) return { ok: false, error: "profile source drifted" };
   let current;
   try {
     current = await readSettings(dir);
@@ -274,13 +300,14 @@ export async function verifyLatch(latch, env, dir) {
   if (current === null || JSON.stringify(current) !== JSON.stringify(latch.settings)) {
     return { ok: false, error: "role settings document drifted" };
   }
-  let text;
   try {
-    text = await readProfile(latch.profileDir, latch.role);
+    for (const role of ROLES) {
+      const digest = profileDigest(await readProfile(latch.profileDir, role));
+      if (digest !== latch.profileDigests?.[role]) return { ok: false, error: `role profile ${role}.md content drifted` };
+    }
   } catch (err) {
     return { ok: false, error: err.message };
   }
-  if (profileDigest(text) !== latch.profileDigest) return { ok: false, error: "role profile content drifted" };
   return { ok: true };
 }
 
@@ -660,7 +687,11 @@ export async function checkCommitGate(command, authority) {
   if (!envelope.capabilities.includes("local_commit")) {
     return { block: true, reason: "git commit requires a current-run local_commit grant" };
   }
-  if (!GIT_COMMIT.test(command ?? "")) return undefined;
+  const commitCount = recognizableCommitCount(command);
+  if (commitCount === 0) return undefined;
+  if (commitCount > 1) {
+    return { block: true, reason: "git commit blocked: one candidate-producing run may contain exactly one git commit" };
+  }
   const head = await gitOut(repoRoot, ["rev-parse", "HEAD"]);
   if (head !== envelope.base) {
     return { block: true, reason: "git commit blocked: current HEAD does not equal the granted candidate base" };
@@ -694,77 +725,48 @@ export const REPORT_KINDS = ["PROGRESS", "HANDOFF", "REOPEN_REQUEST", "DEPENDENC
 // per kind, and optional superseded report ID. Unknown, duplicate, malformed,
 // mistyped, misplaced, or mismatched data rejects the report.
 const REPORT_FIELDS = [
-  "version", "kind", "peer_id", "parent_id", "task_id", "assignment_id",
-  "summary", "evidence", "payload", "supersedes",
+  "version", "kind", "report_id", "peer_agent_id", "parent_lead_agent_id",
+  "task_id", "assignment_id", "summary", "evidence", "payload", "supersedes_report_id",
 ];
 
-// Typed payload per kind (closed per the spec's kind descriptions): `string`
-// is a nonempty string, `strings` is an array of nonempty strings (min = lower
-// bound), `boolean` is a strict boolean. `optional` fields may be absent but
-// must match their type when present.
 const REPORT_PAYLOAD = {
-  PROGRESS: {
-    checkpoint: { type: "string" }, // a meaningful terminal checkpoint, not timer/polling output
-  },
-  HANDOFF: {
-    artifacts: { type: "strings", min: 1 },
-    candidate: { type: "string", optional: true }, // conditional candidate reference
-    verification: { type: "strings", min: 1 },
-    residual_risks: { type: "strings" },
-    unfinished_dependencies: { type: "strings" },
-  },
-  REOPEN_REQUEST: {
-    failed_premise: { type: "string" },
-    impact: { type: "string" },
-    options: { type: "strings", min: 1 },
-    requested_decision: { type: "string" },
-  },
-  DEPENDENCY_REQUEST: {
-    needed: { type: "string" },
-    from: { type: "string" },
-    impact: { type: "string" },
-    human_decision_required: { type: "boolean" },
-  },
-  BLOCKED: {
-    blocker: { type: "string" },
-    impact: { type: "string" },
-    unblock_condition: { type: "string" },
-    attempts: { type: "strings", min: 1 },
-    unrelated_continuation: { type: "boolean" },
-  },
+  PROGRESS: { completed: { type: "strings", min: 1 }, next: { type: "strings", min: 1 }, risks: { type: "strings", min: 1 } },
+  HANDOFF: { artifacts: { type: "strings", min: 1 }, candidate_ref: { type: "candidate" }, verification: { type: "verification", min: 1 }, residual_risks: { type: "strings" }, unfinished_dependencies: { type: "strings" } },
+  REOPEN_REQUEST: { failed_premise: { type: "string" }, impact: { type: "string" }, options: { type: "strings", min: 1 }, requested_decision: { type: "string" } },
+  DEPENDENCY_REQUEST: { needed: { type: "string" }, needed_from: { type: "string" }, impact: { type: "string" }, human_decision_required: { type: "boolean" } },
+  BLOCKED: { blocker: { type: "string" }, impact: { type: "string" }, unblock_condition: { type: "string" }, bounded_attempts: { type: "strings", min: 1 }, can_continue_elsewhere: { type: "boolean" } },
 };
 
 function checkReportPayload(payload, kind) {
   const err = (error) => ({ ok: false, error });
-  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
-    return err(`payload must be a single object for kind ${kind}`);
-  }
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return err(`payload must be a single object for kind ${kind}`);
   const schema = REPORT_PAYLOAD[kind];
   for (const field of Object.keys(payload)) {
-    if (!Object.prototype.hasOwnProperty.call(schema, field)) {
-      return err(`unknown field ${JSON.stringify(field)} in ${kind} payload`);
-    }
+    if (!Object.prototype.hasOwnProperty.call(schema, field)) return err(`unknown field ${JSON.stringify(field)} in ${kind} payload`);
   }
   for (const [field, rule] of Object.entries(schema)) {
-    if (!Object.prototype.hasOwnProperty.call(payload, field)) {
-      if (rule.optional) continue;
-      return err(`payload.${field} is missing for kind ${kind}`);
-    }
+    if (!Object.prototype.hasOwnProperty.call(payload, field)) return err(`payload.${field} is missing for kind ${kind}`);
     const value = payload[field];
     if (rule.type === "string") {
-      if (typeof value !== "string" || value.trim() === "") {
-        return err(`payload.${field} must be a nonempty string`);
-      }
+      if (typeof value !== "string" || value.trim() === "") return err(`payload.${field} must be a nonempty string`);
     } else if (rule.type === "boolean") {
-      if (typeof value !== "boolean") {
-        return err(`payload.${field} must be a boolean`);
-      }
+      if (typeof value !== "boolean") return err(`payload.${field} must be a boolean`);
+    } else if (rule.type === "candidate") {
+      if (value !== null && (typeof value !== "string" || value.trim() === "")) return err(`payload.${field} must be a candidate reference string or null`);
+      if (typeof value === "string" && !parseCandidateRef(value).ok) return err(`payload.${field} must be a valid Stable Candidate reference`);
     } else if (rule.type === "strings") {
-      if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.trim() === "")) {
-        return err(`payload.${field} must be an array of nonempty strings`);
-      }
-      if (rule.min !== undefined && value.length < rule.min) {
-        return err(`payload.${field} must contain at least ${rule.min} item(s)`);
+      if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.trim() === "")) return err(`payload.${field} must be an array of nonempty strings`);
+      if (rule.min !== undefined && value.length < rule.min) return err(`payload.${field} must contain at least ${rule.min} item(s)`);
+    } else if (rule.type === "verification") {
+      if (!Array.isArray(value) || value.length < (rule.min ?? 0)) return err(`payload.${field} must be a nonempty verification array`);
+      for (const [index, item] of value.entries()) {
+        const closed = checkClosedObject(item, ["command", "result", "output"], `payload.${field}[${index}]`);
+        if (!closed.ok) return closed;
+        for (const key of ["command", "output"]) {
+          const check = checkNonemptyString(item[key], `payload.${field}[${index}].${key}`);
+          if (!check.ok) return check;
+        }
+        if (!COMMAND_RESULTS.includes(item.result)) return err(`payload.${field}[${index}].result must be PASS|FAIL|NOT_RUN`);
       }
     }
   }
@@ -784,19 +786,15 @@ function validateReportShape(obj) {
   }
   const extra = Object.keys(obj).find((k) => !REPORT_FIELDS.includes(k));
   if (extra !== undefined) return err(`unknown field ${JSON.stringify(extra)} in peer report`);
-  for (const field of ["peer_id", "parent_id", "task_id", "assignment_id"]) {
-    if (typeof obj[field] !== "string" || obj[field].trim() === "") {
-      return err(`${field} must be a nonempty string`);
-    }
+  for (const field of ["report_id", "peer_agent_id", "parent_lead_agent_id", "task_id", "assignment_id"]) {
+    if (typeof obj[field] !== "string" || obj[field].trim() === "") return err(`${field} must be a nonempty string`);
   }
-  if (typeof obj.summary !== "string" || obj.summary.trim() === "") {
-    return err("summary must be a nonempty string");
-  }
+  if (typeof obj.summary !== "string" || obj.summary.trim() === "") return err("summary must be a nonempty string");
   if (!Array.isArray(obj.evidence) || obj.evidence.length === 0 || obj.evidence.some((item) => typeof item !== "string" || item.trim() === "")) {
     return err("evidence must be a nonempty array of nonempty strings");
   }
-  if (obj.supersedes !== undefined && (typeof obj.supersedes !== "string" || obj.supersedes.trim() === "")) {
-    return err("supersedes must be a nonempty string when present");
+  if (obj.supersedes_report_id !== undefined && (typeof obj.supersedes_report_id !== "string" || obj.supersedes_report_id.trim() === "")) {
+    return err("supersedes_report_id must be a nonempty string when present");
   }
   const payload = checkReportPayload(obj.payload, obj.kind);
   if (!payload.ok) return payload;
@@ -853,9 +851,10 @@ export function correlateReport(report, known) {
   if (known === null || typeof known !== "object" || Array.isArray(known)) {
     return err("correlation requires the known child/parent/task/assignment identities");
   }
+  if (typeof report.report_id !== "string" || report.report_id.trim() === "") return err("report_id must be a nonempty string");
   const pairs = [
-    ["peerId", "peer_id", "child peer agent"],
-    ["parentId", "parent_id", "parent lead agent"],
+    ["peerId", "peer_agent_id", "child peer agent"],
+    ["parentId", "parent_lead_agent_id", "parent lead agent"],
     ["taskId", "task_id", "task"],
     ["assignmentId", "assignment_id", "assignment"],
   ];
@@ -870,6 +869,12 @@ export function correlateReport(report, known) {
     if (report[field] !== knownValue) {
       return err(`report ${field} ${JSON.stringify(report[field])} does not match the known ${label} id ${JSON.stringify(knownValue)}`);
     }
+  }
+  if (known.candidateRequired === true && report.kind === "HANDOFF" && report.payload.candidate_ref === null) {
+    return err("candidate-required HANDOFF must contain a Stable Candidate reference");
+  }
+  if (known.reportVersion !== undefined && report.version !== known.reportVersion) {
+    return err("report version does not match the pinned assignment report version");
   }
   return { ok: true };
 }
@@ -1047,6 +1052,10 @@ async function candidateGitFacts({ candidateRef, repoRoot, grantedBase, scope, e
   if (parentParts[1] !== grantedBase) {
     return { ok: false, error: "candidate parent does not equal the granted candidate base" };
   }
+  const runCommitCount = await gitOut(repoRoot, ["rev-list", "--count", `${grantedBase}..${candidateOid}`]);
+  if (runCommitCount !== "1") {
+    return { ok: false, error: "candidate-producing run must create exactly one commit" };
+  }
 
   if (await gitOut(repoRoot, ["merge-base", "--is-ancestor", taskBaseOid, candidateOid]) === null) {
     return { ok: false, error: "candidate is not a descendant of the referenced task base" };
@@ -1093,7 +1102,7 @@ const EVIDENCE_FIELDS = [
   "version", "evidence_id", "project_id", "task_id", "task_revision",
   "assignment_id", "writer_id", "parent_id", "repository_root", "workspace_id",
   "workspace_protocol_digest", "candidate_ref", "cumulative_diff",
-  "changed_paths", "scope", "verification", "post_commit", "clean",
+  "changed_paths", "scope", "objective_relevance", "verification", "post_commit", "clean",
   "residual_risks", "unfinished_dependencies",
 ];
 
@@ -1175,6 +1184,18 @@ function validateCandidateEvidenceShape(object, authority) {
     }
   }
   check = checkStringList(object.scope.evidence_refs, "scope.evidence_refs", { min: 1, unique: true });
+  if (!check.ok) return check;
+
+  check = checkClosedObject(object.objective_relevance,
+    ["result", "rationale", "evidence_refs"], "candidate evidence objective_relevance");
+  if (!check.ok) return check;
+  if (object.objective_relevance.result !== "PASS") {
+    return { ok: false, error: "objective_relevance.result must be PASS" };
+  }
+  check = checkNonemptyString(object.objective_relevance.rationale, "objective_relevance.rationale");
+  if (!check.ok) return check;
+  check = checkStringList(object.objective_relevance.evidence_refs,
+    "objective_relevance.evidence_refs", { min: 1, unique: true });
   if (!check.ok) return check;
 
   if (!Array.isArray(object.verification) || object.verification.length === 0) {
@@ -1744,9 +1765,8 @@ export async function validateAcceptance({
 // and checkToolCall never consults it.
 
 // Required core section headings, normalized (lowercase, whitespace-collapsed).
-// Optional sections (criticality, review/council rules, anti-patterns,
-// Supervisor hints — and even model/effort routing) may be absent; their
-// presence grants nothing.
+// Optional sections are limited to the closed set below; their presence grants
+// no capability.
 const REQUIRED_CORE_SECTIONS = [
   "decision matrix",
   "task classes and routing",
@@ -1755,6 +1775,13 @@ const REQUIRED_CORE_SECTIONS = [
   "reopen, dependency, and blocked handling",
   "evolution",
 ];
+const OPTIONAL_PROTOCOL_SECTIONS = new Set([
+  "project criticality",
+  "review and council rules",
+  "review and council",
+  "anti-patterns",
+  "supervisor hints",
+]);
 
 export function protocolPath(repoRoot) {
   return join(repoRoot, ".orchestration", "workspace-protocol.md");
@@ -1762,9 +1789,8 @@ export function protocolPath(repoRoot) {
 
 // Line-based YAML frontmatter subset — no parser framework: the protocol is
 // markdown with a small `key: value` header, so a closed line reader is
-// enough. Rejects missing/malformed/duplicate metadata with the exact reason;
-// extra non-canonical keys are tolerated (the five canonical keys are still
-// required and individually validated).
+// enough. Rejects missing, malformed, duplicate, and non-canonical metadata
+// with the exact reason.
 function parseFrontmatter(text) {
   const lines = String(text).split(/\r?\n/);
   if (lines[0] !== "---") {
@@ -1803,6 +1829,8 @@ function parseFrontmatter(text) {
       return { ok: false, error: `metadata ${key} is missing` };
     }
   }
+  const extra = Object.keys(meta).find((key) => !required.includes(key));
+  if (extra !== undefined) return { ok: false, error: `unknown metadata key ${JSON.stringify(extra)}` };
   if (meta.status === "") return { ok: false, error: "metadata status must be a nonempty string" };
   if (!/^\d+$/.test(meta.version) || !Number.isSafeInteger(Number(meta.version)) || Number(meta.version) < 1) {
     return { ok: false, error: "metadata version must be a positive integer" };
@@ -1844,6 +1872,10 @@ function checkCoreSections(text, bodyStart) {
   for (let i = bodyStart; i < lines.length; i++) {
     const heading = normalizedHeading(lines[i]);
     if (heading !== null) {
+      if (/^#\s+/.test(lines[i])) continue;
+      if (bodies.has(heading)) {
+        return { ok: false, error: `duplicate protocol section ${JSON.stringify(heading)}` };
+      }
       current = heading;
       bodies.set(heading, []);
     } else if (current !== null) {
@@ -1854,12 +1886,23 @@ function checkCoreSections(text, bodyStart) {
     if (!bodies.has(required)) {
       return { ok: false, error: `missing required core section "${required}"` };
     }
+    if (bodies.get(required).join("\n").trim() === "") {
+      return { ok: false, error: `required protocol section "${required}" must be nonempty` };
+    }
+  }
+  for (const heading of bodies.keys()) {
+    if (heading === "workspace protocol" || REQUIRED_CORE_SECTIONS.includes(heading) || OPTIONAL_PROTOCOL_SECTIONS.has(heading)) continue;
+    return { ok: false, error: `unknown protocol section ${JSON.stringify(heading)}` };
   }
   const matrix = (bodies.get("decision matrix") ?? []).join("\n");
   if (!/must-ask|must_ask/i.test(matrix)) {
     return { ok: false, error: "the decision matrix core section must include must-ask boundaries" };
   }
-  return { ok: true };
+  const routing = (bodies.get("task classes and routing") ?? []).join("\n");
+  if (!/(?:tiny\/bounded|cross-module\/lifecycle|architecture-sensitive)/i.test(routing)) {
+    return { ok: false, error: "task classes and routing must name tiny/bounded, cross-module/lifecycle, and architecture-sensitive classes" };
+  }
+  return { ok: true, allowsLeadTiny: /lead self-work\s+(?:is\s+)?(?:allowed|permitted)/i.test(routing) };
 }
 
 // Validates protocol text: nonempty, frontmatter metadata, required core
@@ -1883,6 +1926,7 @@ export function validateProtocol(text) {
       repository_root: frontmatter.meta.repository_root,
     },
     digest: createHash("sha256").update(text).digest("hex"),
+    allowsLeadTiny: sections.allowsLeadTiny,
   };
 }
 
@@ -1906,7 +1950,7 @@ export async function readAndValidateProtocol(repoRoot) {
   const digest = createHash("sha256").update(buffer).digest("hex");
   const check = validateProtocol(buffer.toString("utf8"));
   if (!check.ok) return check;
-  return { ok: true, protocol: { repoRoot, path, digest, meta: check.meta } };
+  return { ok: true, protocol: { repoRoot, path, digest, meta: check.meta, allowsLeadTiny: check.allowsLeadTiny } };
 }
 
 // Protocol pin (process-latched like the role latch): the Lead pins
@@ -1930,6 +1974,7 @@ async function ensureProtocolPin() {
       version: read.protocol.meta.version,
       projectId: read.protocol.meta.project_id,
       digest: read.protocol.digest,
+      allowsLeadTiny: read.protocol.allowsLeadTiny,
     };
     return { ok: true };
   }
@@ -1943,6 +1988,9 @@ async function ensureProtocolPin() {
   }
   if (read.protocol.digest !== protocolPin.digest) {
     return { ok: false, error: "workspace protocol bytes drifted from the pinned digest; a fresh process is required" };
+  }
+  if (read.protocol.allowsLeadTiny !== protocolPin.allowsLeadTiny) {
+    return { ok: false, error: "workspace protocol Lead self-work allowance drifted; a fresh process is required" };
   }
   return { ok: true };
 }
@@ -1973,6 +2021,9 @@ async function activateEnvelope(envelope, route = "direct") {
     }
     if (envelope.protocol_digest !== protocolPin.digest) {
       return { ok: false, error: "protocol_digest does not match the pinned workspace protocol digest" };
+    }
+    if (!protocolPin.allowsLeadTiny) {
+      return { ok: false, error: "workspace protocol does not allow Lead tiny self-work" };
     }
   }
   if (envelope.grant_kind !== "peer") {
@@ -2005,7 +2056,6 @@ export const NOTEBOOK_ENTRY_CONTRACT = "pi-paseo-supervisor-notebook-entry";
 export const NOTEBOOK_CONTRACT_VERSION = "v1";
 export const NOTEBOOK_STORAGE_VERSION = "v1";
 export const NOTEBOOK_INIT_COMMAND = "pi-paseo-orchestration:notebook-init";
-export const NOTEBOOK_APPEND_COMMAND = "pi-paseo-orchestration:notebook-append";
 export const NOTEBOOK_APPEND_TOOL = "pi-paseo-orchestration:supervisor_notebook_append";
 
 const NOTEBOOK_MANIFEST_FIELDS = [
@@ -2057,15 +2107,7 @@ export function deriveNotebookProjectKey(projectId) {
   return createHash("sha256").update(Buffer.from(projectId, "utf8")).digest("hex").toLowerCase();
 }
 
-// Short alias kept as a test seam; it still hashes the exact, untrimmed ID.
-export const projectKey = deriveNotebookProjectKey;
-export const deriveProjectKey = deriveNotebookProjectKey;
-
-export function supervisorNotebookStorageRoot(configRoot) {
-  return notebookStorageRoot(configRoot);
-}
-
-export function notebookPaths(configRoot, projectId) {
+function notebookPaths(configRoot, projectId) {
   const root = notebookStorageRoot(configRoot);
   const key = deriveNotebookProjectKey(projectId);
   const projectRoot = join(root, "projects", key);
@@ -2080,11 +2122,6 @@ export function notebookPaths(configRoot, projectId) {
     projectKey: key,
   };
 }
-
-export function notebookProjectPath(configRoot, projectId) { return notebookPaths(configRoot, projectId).projectRoot; }
-export function notebookManifestPath(configRoot, projectId) { return notebookPaths(configRoot, projectId).manifestPath; }
-export function notebookEntriesPath(configRoot, projectId) { return notebookPaths(configRoot, projectId).entriesRoot; }
-export const notebookRoot = supervisorNotebookStorageRoot;
 
 function canonicalNotebookValue(value) {
   if (Array.isArray(value)) return value.map(canonicalNotebookValue);
@@ -2504,14 +2541,21 @@ async function readValidNotebookEntries(prepared, manifest) {
 
 async function syncNotebookDirectory(path) {
   let handle;
+  let failure = null;
   try {
     handle = await open(path, "r");
     await handle.sync();
   } catch (err) {
-    throw new Error(`directory durability sync failed for ${path}: ${err.message}`);
-  } finally {
-    await handle?.close().catch(() => {});
+    failure = new Error(`directory durability sync failed for ${path}: ${err.message}`);
   }
+  if (handle !== undefined) {
+    try {
+      await handle.close();
+    } catch (err) {
+      failure ??= new Error(`directory durability close failed for ${path}: ${err.message}`);
+    }
+  }
+  if (failure !== null) throw failure;
 }
 
 // One package-private publication primitive: complete private staging, fsync,
@@ -2544,48 +2588,60 @@ export async function publishNotebookCreateOnly({ storageRoot, finalParent, fina
 
   const stagePath = join(stagingRoot, `.stage-${randomUUID()}`);
   let handle;
-  let linked = false;
+  let stageCreated = false;
+  let result;
+  let cleanupError = null;
   try {
     handle = await open(stagePath, "wx", 0o600);
+    stageCreated = true;
     let offset = 0;
     while (offset < bytes.length) {
-      const result = await handle.write(bytes, offset, bytes.length - offset);
-      if (!result.bytesWritten) throw new Error("staging write made no progress");
-      offset += result.bytesWritten;
+      const written = await handle.write(bytes, offset, bytes.length - offset);
+      if (!written.bytesWritten) throw new Error("staging write made no progress");
+      offset += written.bytesWritten;
     }
     await handle.sync();
     await handle.close();
     handle = null;
     const finalSafe = await assertNoSymlinkComponents(storageRoot, finalParent, "notebook final parent");
-    if (!finalSafe.ok) return finalSafe;
-    try {
-      await link(stagePath, finalPath);
-      linked = true;
-    } catch (err) {
-      if (err.code === "EEXIST") {
-        const existing = await readFile(finalPath);
-        const incomingDigest = rawDigest(bytes);
-        const existingDigest = rawDigest(existing);
-        return existingDigest === incomingDigest
-          ? { ok: true, status: "idempotent", path: finalPath, digest: existingDigest }
-          : { ok: false, status: "conflict", error: "notebook final path already contains different bytes", path: finalPath, existing_digest: existingDigest, incoming_digest: incomingDigest };
+    if (!finalSafe.ok) {
+      result = finalSafe;
+    } else {
+      try {
+        await link(stagePath, finalPath);
+        await syncNotebookDirectory(finalParent);
+        result = { ok: true, status: "created", path: finalPath, digest: rawDigest(bytes) };
+      } catch (err) {
+        if (err.code === "EEXIST") {
+          const existing = await readFile(finalPath);
+          const incomingDigest = rawDigest(bytes);
+          const existingDigest = rawDigest(existing);
+          result = existingDigest === incomingDigest
+            ? { ok: true, status: "idempotent", path: finalPath, digest: existingDigest }
+            : { ok: false, status: "conflict", error: "notebook final path already contains different bytes", path: finalPath, existing_digest: existingDigest, incoming_digest: incomingDigest };
+        } else if (["EXDEV", "EOPNOTSUPP", "ENOTSUP", "EPERM"].includes(err.code)) {
+          result = { ok: false, error: `no-replace notebook publication is unsupported: ${err.message}` };
+        } else {
+          result = { ok: false, error: `notebook publication link failed: ${err.message}` };
+        }
       }
-      if (["EXDEV", "EOPNOTSUPP", "ENOTSUP", "EPERM"].includes(err.code)) {
-        return { ok: false, error: `no-replace notebook publication is unsupported: ${err.message}` };
-      }
-      return { ok: false, error: `notebook publication link failed: ${err.message}` };
     }
-    await syncNotebookDirectory(finalParent);
-    return { ok: true, status: "created", path: finalPath, digest: rawDigest(bytes) };
   } catch (err) {
-    return { ok: false, error: `notebook publication failed: ${err.message}` };
+    result = { ok: false, error: `notebook publication failed: ${err.message}` };
   } finally {
-    await handle?.close().catch(() => {});
+    try { await handle?.close(); } catch (err) { cleanupError ??= `staging handle close failed: ${err.message}`; }
     // A linked inode is already durable evidence; only the private staging name
-    // is cleaned.  Failure to remove it leaves a private orphan, never evidence.
-    await unlink(stagePath).catch(() => {});
-    await syncNotebookDirectory(stagingRoot).catch(() => {});
+    // is cleaned. Cleanup failures are surfaced rather than silently accepted.
+    try {
+      await unlink(stagePath);
+    } catch (err) {
+      if (err.code !== "ENOENT" || stageCreated) cleanupError ??= `staging cleanup failed: ${err.message}`;
+    }
+    try { await syncNotebookDirectory(stagingRoot); }
+    catch (err) { cleanupError ??= err.message; }
   }
+  if (cleanupError !== null) return { ok: false, error: cleanupError };
+  return result ?? { ok: false, error: "notebook publication produced no result" };
 }
 
 async function findNotebookIdElsewhere(prepared, notebookId) {
@@ -2842,7 +2898,7 @@ export async function snapshotNotebook({ env = process.env, projectId, protocolP
   const loaded = await loadNotebook(prepared);
   if (!loaded.ok) return loaded;
   const physical = loaded.entries.files.sort((a, b) => a.filename.localeCompare(b.filename));
-  const physicalDigest = `sha256:${createHash("sha256").update(canonicalNotebookJson({ manifest_digest: loaded.rawDigest, entries: physical })).digest("hex")}`;
+  const snapshotDigest = `sha256:${createHash("sha256").update(canonicalNotebookJson({ manifest_digest: loaded.rawDigest, entries: physical })).digest("hex")}`;
   const projection = loaded.entries.valid.sort((a, b) => a.entry_id.localeCompare(b.entry_id));
   return {
     ok: true,
@@ -2850,20 +2906,12 @@ export async function snapshotNotebook({ env = process.env, projectId, protocolP
       manifest_digest: loaded.rawDigest,
       manifest_canonical_digest: loaded.manifest.manifest_digest,
       physical_entries: physical,
-      entries: physical,
-      physical_digest: physicalDigest,
-      snapshot_digest: physicalDigest,
-      digest: physicalDigest,
+      snapshot_digest: snapshotDigest,
       valid_causal_projection: projection,
-      causal_projection: projection,
       invalid_entries: loaded.entries.invalid,
     },
   };
 }
-
-export const initNotebook = initializeNotebook;
-export const appendNotebook = appendNotebookEntry;
-export const readNotebookSnapshot = snapshotNotebook;
 
 async function notebookContextFromPi(ctx, env) {
   const cwd = ctx?.cwd ?? process.cwd();
@@ -3031,6 +3079,33 @@ function doctorPackageSource() {
   };
 }
 
+function validatePaseoObservation(observation, agentId) {
+  if (!isRecord(observation)) return { ok: false, error: "observer result must be an object" };
+  if (agentId === "" || observation.agent_id !== agentId) return { ok: false, error: "observer agent_id does not match the current Paseo agent" };
+  for (const [field, value] of [["daemon_id", observation.daemon_id ?? observation.daemon?.id], ["status", observation.status], ["cwd", observation.cwd ?? observation.agent_cwd], ["provider", observation.provider]]) {
+    if (typeof value !== "string" || value.trim() === "") return { ok: false, error: `observer ${field} is missing` };
+  }
+  if (observation.provider !== "pi") return { ok: false, error: "observer provider must be pi" };
+  const workspace = isRecord(observation.workspace) ? observation.workspace : {};
+  const workspaceId = observation.workspace_id ?? workspace.id;
+  const projectId = observation.project_id ?? workspace.project_id;
+  if (typeof workspaceId !== "string" || workspaceId.trim() === "") return { ok: false, error: "observer typed workspace_id is missing" };
+  if (typeof projectId !== "string" || projectId.trim() === "") return { ok: false, error: "observer workspace project_id is missing" };
+  if (observation.workspace_typed !== true && workspace.typed !== true) return { ok: false, error: "observer typed workspace binding is not attested" };
+  if (!Object.prototype.hasOwnProperty.call(observation, "parent_id") && !Object.prototype.hasOwnProperty.call(observation, "parent")) return { ok: false, error: "observer parentage is missing" };
+  const parent = isRecord(observation.parent) ? observation.parent : {};
+  const parentId = Object.prototype.hasOwnProperty.call(observation, "parent_id") ? observation.parent_id : (parent.id ?? null);
+  if (parentId !== null && typeof parentId !== "string") return { ok: false, error: "observer parent_id is malformed" };
+  if (parentId !== null && observation.parent_resolvable !== true && parent.resolvable !== true) return { ok: false, error: "observer parent resolvability is not attested" };
+  const runtime = observation.runtimeInfo ?? observation.runtime_info;
+  if (!isRecord(runtime)) return { ok: false, error: "observer runtimeInfo is missing" };
+  const model = runtime.model;
+  if (!(typeof model === "string" && model.trim() !== "") && !(isRecord(model) && typeof model.id === "string" && model.id.trim() !== "")) return { ok: false, error: "observer runtimeInfo.model is missing" };
+  if (typeof runtime.thinkingOptionId !== "string" || runtime.thinkingOptionId.trim() === "") return { ok: false, error: "observer runtimeInfo.thinkingOptionId is missing" };
+  if (observation.mcp_configuration_attested !== true && observation.mcpConfigurationAttested !== true) return { ok: false, error: "observer MCP configuration attestation is missing" };
+  return { ok: true };
+}
+
 async function doctorPaseoObservation(ctx, env, role) {
   const agentId = (env[AGENT_ENV] ?? "").trim();
   const observer = ctx?.observeCurrentAgent
@@ -3059,10 +3134,11 @@ async function doctorPaseoObservation(ctx, env, role) {
   if (!observation || observation.__timeout) {
     return { status: role === "lead" || role === "supervisor" ? "BLOCKED" : "WARN", reason: "adapter observer timed out", observation: null, agentId };
   }
-  if (!isRecord(observation) || observation.agent_id !== agentId || agentId === "") {
-    return { status: role === "lead" || role === "supervisor" ? "BLOCKED" : "WARN", reason: "adapter observer returned an unbound current-agent identity", observation: null, agentId };
+  const shape = validatePaseoObservation(observation, agentId);
+  if (!shape.ok) {
+    return { status: role === "lead" || role === "supervisor" ? "BLOCKED" : "WARN", reason: shape.error, observation, agentId };
   }
-  return { status: "PASS", reason: "public current-agent observer returned the exact current identity", observation, agentId };
+  return { status: "PASS", reason: "public current-agent observer returned the complete current-agent tuple", observation, agentId };
 }
 
 function doctorActivation(roleCheck) {
@@ -3142,7 +3218,8 @@ export async function buildDoctorReport({ ctx = {}, pi = {}, now, reportId } = {
   checks.push(doctorCheck("PACKAGE_PROVENANCE", "loaded extension provenance", packageStatus, "one canonical package source is observable", packageSource.source, [{ kind: "api", source: "import.meta.url", digest: packageSource.digest, output: packageSource.source }], { owner: "operator", action: "Load the reviewed package source once and rerun doctor." }));
 
   const paseo = await doctorPaseoObservation(ctx, env, role);
-  const paseoIdentityStatus = role && (env[AGENT_ENV] ?? "").trim() === "" ? "BLOCKED" : (role ? "PASS" : "WARN");
+  const paseoIdentityStatus = role && (env[AGENT_ENV] ?? "").trim() === "" ? "BLOCKED"
+    : role ? (paseo.status === "PASS" && paseo.observation?.agent_id === (env[AGENT_ENV] ?? "").trim() ? "PASS" : "BLOCKED") : "WARN";
   checks.push(doctorCheck("PASEO_IDENTITY", "Paseo current-agent identity", paseoIdentityStatus, role ? "PASEO_AGENT_ID is nonempty" : "identity is not required for passive mode", (env[AGENT_ENV] ?? "").trim() || "absent", [{ kind: "env", source: AGENT_ENV, output: (env[AGENT_ENV] ?? "").trim() ? "present" : "absent" }], { owner: "operator", action: "Set the exact Paseo agent identity before governed work." }));
   const observerOwner = role === "supervisor" ? "supervisor" : role === "lead" ? "lead" : "operator";
   checks.push(doctorCheck("ADAPTER_OBSERVER", "public current-agent observation capability", paseo.status, "the already-loaded adapter proves exact current-agent observation", paseo.reason, [{ kind: "api", source: "public current-agent observer", output: paseo.observation ? "verified" : "unavailable" }], { owner: observerOwner, action: paseo.status === "BLOCKED" ? "Install/configure the public adapter current-agent observer, then rerun doctor." : "Use a configured adapter observer when governed live facts are needed." }));
@@ -3225,8 +3302,8 @@ export async function buildDoctorReport({ ctx = {}, pi = {}, now, reportId } = {
     repository_root: repoRoot,
     pi_session_id: ctx.sessionId ?? ctx.piSessionId ?? ctx.session?.id ?? null,
     paseo_agent_id: (env[AGENT_ENV] ?? "").trim() || null,
-    workspace_id: paseoObservation?.workspace_id ?? ctx.workspaceId ?? ctx.paseoWorkspaceId ?? null,
-    paseo_project_id: paseoObservation?.project_id ?? ctx.paseoProjectId ?? ctx.paseo_project_id ?? null,
+    workspace_id: paseoObservation?.workspace_id ?? paseoObservation?.workspace?.id ?? ctx.workspaceId ?? ctx.paseoWorkspaceId ?? null,
+    paseo_project_id: paseoObservation?.project_id ?? paseoObservation?.workspace?.project_id ?? ctx.paseoProjectId ?? ctx.paseo_project_id ?? null,
     protocol_project_id: protocol?.ok ? protocol.protocol.meta.project_id : null,
     role,
   };
@@ -3263,14 +3340,21 @@ export async function buildDoctorReport({ ctx = {}, pi = {}, now, reportId } = {
   // Keep the authority variable intentionally local to the observation block;
   // it is not included in raw prompt form and does not alter current authority.
   void authorityEnvelope;
+  if (paseo.status === "PASS") {
+    const finalPaseo = await doctorPaseoObservation(ctx, env, role);
+    if (finalPaseo.status !== "PASS" || canonicalNotebookJson(finalPaseo.observation) !== canonicalNotebookJson(paseo.observation)) {
+      checks.push(doctorCheck("OBSERVATION_DRIFT", "critical Paseo identity recheck", "BLOCKED", "the bounded observation remained identical through output", finalPaseo.reason, [{ kind: "api", source: "public current-agent observer", output: finalPaseo.status }], { owner: "operator", action: "Start a fresh governed process and rerun doctor." }));
+      checks.sort((left, right) => left.code.localeCompare(right.code));
+      report.checks = checks;
+      report.overall_status = "BLOCKED";
+    }
+  }
   return report;
 }
 
 export function formatDoctorReport(report) {
   return `${DOCTOR_REPORT_BEGIN}\n${canonicalNotebookJson(report)}\n${DOCTOR_REPORT_END}`;
 }
-
-export const doctorReport = buildDoctorReport;
 
 export function formatDoctorTable(report) {
   const lines = [
@@ -3632,6 +3716,10 @@ let protocolPin = null;
 // Current-run authority record: { envelope, repoRoot, scope, exclusions } or
 // null when the run carries no valid grant. Replaced on every input event.
 let currentAuthority = null;
+// Last validated terminal Peer Report / acceptance are process-local evidence only;
+// no mailbox, registry, or durable workflow state is created.
+let lastPeerReport = null;
+let lastAcceptance = null;
 // Last explicit no-authority reason (diagnostics; doctor reads it later).
 let authorityReason = null;
 
@@ -3642,6 +3730,14 @@ export function getAuthority() {
 
 export function getAuthorityReason() {
   return authorityReason;
+}
+
+export function getPeerReport() {
+  return lastPeerReport === null ? null : structuredClone(lastPeerReport);
+}
+
+export function getLastAcceptance() {
+  return lastAcceptance === null ? null : structuredClone(lastAcceptance);
 }
 
 // Pending authority from a confirmed idle slash-command (lead_tiny /
@@ -3849,10 +3945,16 @@ function envOf(ctx) {
 }
 
 async function verifyOrBlock(ctx, dir) {
-  const check = await verifyLatch(latch, envOf(ctx), dir);
+  const check = await verifyLatch(latch, envOf(ctx), dir, ctx);
   if (!check.ok) {
     blockedReason = check.error;
     ctx.ui?.notify?.(`pi-paseo-orchestration blocked: ${check.error}`, "error");
+    return false;
+  }
+  const runtime = verifyRuntimeSelection(latch, ctx);
+  if (!runtime.ok) {
+    blockedReason = runtime.error;
+    ctx.ui?.notify?.(`pi-paseo-orchestration blocked: ${runtime.error}`, "error");
     return false;
   }
   return true;
@@ -3891,10 +3993,6 @@ export default function (pi) {
     description: "Create a Human-confirmed immutable Supervisor Notebook manifest (Supervisor only)",
     handler: runNotebookInit,
   });
-  pi.registerCommand(NOTEBOOK_APPEND_COMMAND, {
-    description: "Append one typed immutable Supervisor Notebook observation (Supervisor only)",
-    handler: runNotebookAppend,
-  });
   pi.registerCommand("pi-paseo-orchestration:doctor", {
     description: "Report bounded observation-only readiness for the current Pi/Paseo context",
     handler: (args, ctx) => runDoctor(args, ctx, pi),
@@ -3923,6 +4021,8 @@ export default function (pi) {
   pi.on("session_start", async (_event, ctx) => {
     currentAuthority = null; // new/resumed/forked sessions inherit no authority
     pendingAuthority = null; // ...and clear any pending slash-command authority
+    lastPeerReport = null;
+    lastAcceptance = null;
     authorityReason = null;
     const env = envOf(ctx);
     const dir = configDir(env);
@@ -3988,6 +4088,30 @@ export default function (pi) {
         return { action: "handled" };
       }
     }
+    const acceptance = parseAcceptance(event.text ?? "", event.source);
+    if (acceptance.ok && acceptance.acceptance !== null) {
+      const chain = ctx.acceptanceChain;
+      if (!chain || typeof chain !== "object") {
+        authorityReason = "local acceptance evidence chain is unavailable";
+        ctx.ui?.notify?.(`pi-paseo-orchestration: local acceptance blocked (${authorityReason})`, "error");
+        return { action: "handled" };
+      }
+      const checked = await validateAcceptance({ ...chain, acceptance: acceptance.acceptance });
+      if (!checked.ok) {
+        authorityReason = checked.error;
+        ctx.ui?.notify?.(`pi-paseo-orchestration: local acceptance blocked (${checked.error})`, "error");
+        return { action: "handled" };
+      }
+      lastAcceptance = acceptance.acceptance;
+      ctx.ui?.notify?.("pi-paseo-orchestration: LOCAL_ACCEPT validated for the exact candidate", "info");
+      return { action: "handled" };
+    }
+    if (!acceptance.ok && String(event.text ?? "").includes(ACCEPTANCE_BEGIN)) {
+      authorityReason = acceptance.error;
+      ctx.ui?.notify?.(`pi-paseo-orchestration: local acceptance blocked (${acceptance.error})`, "error");
+      return { action: "handled" };
+    }
+
     // Authority lifetime: every run (input) replaces the internal current-run
     // authority record — including replacement with NO authority when the
     // message carries no valid envelope. A Human-confirmed slash-command grant
@@ -4035,6 +4159,38 @@ export default function (pi) {
     return { action: "continue" };
   });
 
+  pi.on("agent_end", async (event, ctx) => {
+    if (latch?.role !== "peer") return undefined;
+    const messages = Array.isArray(event?.messages) ? event.messages : [];
+    let text = "";
+    for (const message of [...messages].reverse()) {
+      if (message?.role && message.role !== "assistant") continue;
+      const content = message?.content ?? message?.text;
+      if (typeof content === "string") { text = content; break; }
+      if (Array.isArray(content)) {
+        const parts = content.map((item) => typeof item === "string" ? item : item?.text ?? "").filter(Boolean);
+        if (parts.length > 0) { text = parts.join("\n"); break; }
+      }
+    }
+    const parsed = parseReport(text);
+    if (!parsed.ok || parsed.report === null) {
+      lastPeerReport = null;
+      ctx.ui?.notify?.(`pi-paseo-orchestration: Peer run ended without a valid terminal report (${parsed.error ?? "missing report"})`, "error");
+      return undefined;
+    }
+    const known = ctx.peerReportContext;
+    if (known !== undefined) {
+      const correlated = correlateReport(parsed.report, known);
+      if (!correlated.ok) {
+        lastPeerReport = null;
+        ctx.ui?.notify?.(`pi-paseo-orchestration: Peer report rejected (${correlated.error})`, "error");
+        return undefined;
+      }
+    }
+    lastPeerReport = parsed.report;
+    return undefined;
+  });
+
   pi.on("before_agent_start", async (event, ctx) => {
     if (latch === null) return undefined;
     if (blockedReason !== null) {
@@ -4049,7 +4205,6 @@ export default function (pi) {
         return undefined;
       }
     }
-    if (baseline === null) baseline = event.systemPromptOptions?.selectedTools ?? [];
     const tools = requireBaselineTools(baseline, latch.role);
     if (!tools.ok) {
       blockWith(ctx, tools.error);

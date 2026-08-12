@@ -237,8 +237,10 @@ async function main() {
   };
   const handlers = new Map();
   const commands = new Map();
+  const tools = new Map();
   const pi = {
     registerCommand: (name, definition) => commands.set(name, definition),
+    registerTool: (name, definition) => tools.set(name, definition),
     on: (name, handler) => handlers.set(name, handler),
     setActiveTools: (tools) => { holder.activeTools = [...tools]; },
     getActiveTools: () => [...holder.activeTools],
@@ -284,7 +286,7 @@ async function main() {
   let appendOk = false;
   if (initOk) {
     const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-    const appendResult = await commands.get("pi-paseo-orchestration:notebook-append").handler(
+    const appendResult = await tools.get("pi-paseo-orchestration:supervisor_notebook_append").execute(
       { project_id: "smoke-project", entry: smokeEntry(extension, manifest, "smoke-project", project) }, ctx,
     );
     const entryPath = join(join(manifestPath, ".."), "entries", "entry-1.json");
@@ -309,6 +311,7 @@ async function main() {
 
   const adapterCheck = rpcResult.report?.checks?.find((check) => check.code === "ADAPTER_OBSERVER");
   const adapterBlocked = adapterCheck?.status === "BLOCKED" && /adapter observer not yet verified/.test(adapterCheck.observed ?? "");
+  const adapterObserverOk = adapterCheck?.status === "PASS";
   report("adapter-gated doctor check is BLOCKED with the exact reason", adapterBlocked,
     adapterCheck ? `${adapterCheck.status}: ${adapterCheck.observed}` : "ADAPTER_OBSERVER check missing");
   const piApiOk = rpcResult.report?.checks?.find((check) => check.code === "PI_CAPABILITIES")?.status === "PASS";
@@ -332,7 +335,7 @@ async function main() {
     mutation_boundaries: mutationOk,
     capabilities: {
       pi_api: piApiOk,
-      adapter_current_agent_observer: false, // the known release blocker in this environment
+      adapter_current_agent_observer: adapterObserverOk,
     },
   });
   console.log(gate.ok ? "  gate: PASS" : `  gate: BLOCKED (${gate.blockers.length} blocker${gate.blockers.length === 1 ? "" : "s"})`);
