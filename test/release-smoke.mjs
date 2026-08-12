@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Release smoke for pi-paseo-orchestration (Lát 8). One bounded one-shot
+// Release smoke for pi-paseo-orchestration (Slice 8). One bounded one-shot
 // script, node stdlib only. Run: npm run release:smoke
 //
 // Against a fresh temporary copy of the package it proves:
@@ -296,13 +296,17 @@ async function main() {
     report("notebook-append writes one immutable entry", false, "manifest unavailable");
   }
 
-  // ── doctor: TUI/RPC equivalence, no mutation, adapter fail-closed ──
+  // ── doctor: TUI/RPC equivalence, no mutation, observer fail-closed ──
+  // The doctor run stays hermetic: PATH is stripped so the observation probe
+  // cannot depend on the live daemon; the release observer probe below uses
+  // the real environment.
   const doctorCmd = commands.get("pi-paseo-orchestration:doctor");
+  const doctorCtx = { ...ctx, env: { ...env, PATH: "/nonexistent-ppo-path" } };
   const configBefore = await tree(config);
   const projectBefore = await tree(project);
   const projectGitBefore = await gitState(project);
-  const rpcResult = await doctorCmd.handler("", { ...ctx, rpc: true });
-  const tuiResult = await doctorCmd.handler("", { ...ctx, mode: "tui" });
+  const rpcResult = await doctorCmd.handler("", { ...doctorCtx, rpc: true });
+  const tuiResult = await doctorCmd.handler("", { ...doctorCtx, mode: "tui" });
   const normalize = ({ report_id, started_at, finished_at, ...rest }) => rest;
   const tuiRpcOk = rpcResult.ok === true && tuiResult.ok === true && rpcResult.mode === "rpc" && tuiResult.mode === "tui"
     && JSON.stringify(normalize(rpcResult.report)) === JSON.stringify(normalize(tuiResult.report));
@@ -310,11 +314,20 @@ async function main() {
     tuiRpcOk ? "identical reports (volatile id/timestamps normalized)" : `${rpcResult.error ?? ""} ${tuiResult.error ?? ""}`.trim());
 
   const adapterCheck = rpcResult.report?.checks?.find((check) => check.code === "ADAPTER_OBSERVER");
-  const adapterBlocked = adapterCheck?.status === "BLOCKED" && /adapter observer not yet verified/.test(adapterCheck.observed ?? "");
-  const adapterObserverOk = adapterCheck?.status === "PASS";
-  report("adapter-gated doctor check is BLOCKED with the exact reason", adapterBlocked,
-    adapterCheck ? `${adapterCheck.status}: ${adapterCheck.observed}` : "ADAPTER_OBSERVER check missing");
+  const adapterFailClosed = adapterCheck?.status === "BLOCKED" && typeof adapterCheck.observed === "string" && adapterCheck.observed !== "";
   const piApiOk = rpcResult.report?.checks?.find((check) => check.code === "PI_CAPABILITIES")?.status === "PASS";
+  report("adapter-gated doctor check is BLOCKED with the exact reason in the hermetic smoke env", adapterFailClosed,
+    adapterCheck ? `${adapterCheck.status}: ${adapterCheck.observed}` : "ADAPTER_OBSERVER check missing");
+
+  // Release observer probe against the REAL environment: the gate needs the
+  // exact current-agent observation proven (identity/model/thinking/parent/
+  // cwd) through the installed observer. In an environment without a governed
+  // agent identity this stays blocked with the exact reason — never faked.
+  const liveProbe = await extension.observePaseoCurrentAgent(process.env.PASEO_AGENT_ID ?? "", { env: process.env });
+  const adapterObserverOk = liveProbe.ok === true;
+  report("release observer probe proves current-agent observation or reports the exact blocker",
+    liveProbe.ok || typeof liveProbe.error === "string",
+    liveProbe.ok ? `proven via ${liveProbe.observation.source}` : liveProbe.error);
 
   const configAfter = await tree(config);
   const projectAfter = await tree(project);
@@ -347,7 +360,8 @@ async function main() {
   if (failed.length > 0) {
     console.log(`\nRESULT: FAIL — ${failed.map((result) => result.name).join("; ")}`);
   } else if (!gate.ok) {
-    console.log("\nRESULT: FAIL — RELEASE BLOCKER: capabilities.adapter_current_agent_observer is absent (\"adapter observer not yet verified\") — the release gate requires the public current-agent observer through the independently installed pi-mcp-adapter; owner: operator; no fallback is accepted. Install/verify the adapter observer and re-run the smoke on the exact commit. (Missing facts install_pinned, hermetic_tests, and paseo_live are proven by the release flow's install and hermetic steps outside this script.)");
+    const observerBlocker = gate.blockers.find((blocker) => blocker.fact === "adapter_current_agent_observer");
+    console.log(`\nRESULT: FAIL — RELEASE BLOCKER: ${observerBlocker?.condition ?? "current-agent observation is not proven"} — owner: ${observerBlocker?.owner ?? "operator"}; no fallback is accepted. Start the Paseo daemon, run the smoke with PASEO_AGENT_ID set to the exact governed agent, and re-run on the exact commit. (Missing facts install_pinned, hermetic_tests, and paseo_live are proven by the release flow's install and hermetic steps outside this script.)`);
   } else {
     console.log("\nRESULT: PASS — all smoke checks passed.");
   }

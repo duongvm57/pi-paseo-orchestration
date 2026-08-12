@@ -96,7 +96,7 @@ test("manifest declares only one Pi extension and one Pi skill", () => {
     extensions: ["./extensions/pi-paseo-orchestration.ts"],
     skills: ["./skills/workspace-protocol/SKILL.md"],
   });
-  assert.deepEqual(manifest.scripts, { test: "node --test test/package.test.mjs", "release:smoke": "node test/release-smoke.mjs" });
+  assert.deepEqual(manifest.scripts, { test: "node --test test/package.test.mjs", typecheck: "tsc --noEmit", "release:smoke": "node test/release-smoke.mjs" });
 
   for (const field of ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]) {
     assert.equal(manifest[field]?.["pi-mcp-adapter"], undefined);
@@ -300,7 +300,7 @@ test("settings command: malformed prior settings block with an explicit error, b
   }
 });
 
-// ─── Lát 2: role activation & policy guardrail ───────────────────────────────
+// ─── Slice 2: role activation & policy guardrail ───────────────────────────────
 
 const { parseRole, resolveProfileSource, activate, verifyLatch, intersectTools, checkToolCall } = extension;
 
@@ -605,7 +605,7 @@ test("wiring: missing read or outer mcp baseline blocks a governed lead", async 
   }
 });
 
-// ─── Lát 3: Task Authority Envelope ──────────────────────────────────────────
+// ─── Slice 3: Task Authority Envelope ──────────────────────────────────────────
 
 const {
   ENVELOPE_BEGIN,
@@ -1174,7 +1174,7 @@ test("checkCommitGate: direct gate checks HEAD against base and rejects scope dr
   }
 });
 
-// ─── Lát 4: Workspace Protocol ───────────────────────────────────────────────
+// ─── Slice 4: Workspace Protocol ───────────────────────────────────────────────
 
 const { protocolPath, validateProtocol, readAndValidateProtocol, getProtocolPin } = extension;
 
@@ -1597,7 +1597,7 @@ test("wiring: a lead_tiny envelope whose digest does not match the pinned protoc
   }
 });
 
-// ─── Lát 5: Peer Reports & Lead–Peer orchestration ───────────────────────────
+// ─── Slice 5: Peer Reports & Lead–Peer orchestration ───────────────────────────
 
 const {
   REPORT_BEGIN,
@@ -2034,7 +2034,7 @@ test("command: declined confirmation and a new session clear the pending authori
   }
 });
 
-// ─── Lát 6: Stable Candidate, review, verdict, Local Acceptance ─────────────
+// ─── Slice 6: Stable Candidate, review, verdict, Local Acceptance ─────────────
 
 const {
   CANDIDATE_EVIDENCE_BEGIN,
@@ -2659,7 +2659,7 @@ test("status, passing tests, HANDOFF, Reviewer APPROVE, and READY verdict are ea
   }
 });
 
-// ─── Lát 7: Supervisor Notebook and observation-only Doctor ──────────────────
+// ─── Slice 7: Supervisor Notebook and observation-only Doctor ──────────────────
 
 function notebookEntryFixture(manifest, projectId, repoRoot, over = {}) {
   const now = "2026-01-02T03:04:05.000Z";
@@ -2825,7 +2825,7 @@ test("Doctor: passive warning/report parsing, no output channel probe, and gover
     });
     assert.equal(passive.overall_status, "WARN");
     assert.equal(passive.checks.find((check) => check.code === "ADAPTER_OBSERVER").status, "WARN");
-    assert.match(passive.checks.find((check) => check.code === "ADAPTER_OBSERVER").observed, /adapter observer not yet verified/);
+    assert.match(passive.checks.find((check) => check.code === "ADAPTER_OBSERVER").observed, /no Paseo agent identity to observe/);
     const block = extension.formatDoctorReport(passive);
     assert.equal(extension.parseDoctorReport(block).ok, true);
     assert.deepEqual(passive.checks.map((check) => check.code), [...passive.checks].map((check) => check.code).sort());
@@ -2843,7 +2843,7 @@ test("Doctor: passive warning/report parsing, no output channel probe, and gover
     const settingsDir = await mkdtemp(join(tmpdir(), "ppo-doctor-governed-"));
     const fake = fakePi({
       activeTools: ["read", "bash", "mcp"],
-      env: { PI_CODING_AGENT_DIR: settingsDir, PI_PASEO_ORCHESTRATION_ROLE: "supervisor", PASEO_AGENT_ID: "supervisor-1", PI_PASEO_ORCHESTRATION_PROFILES_DIR: profiles },
+      env: { PI_CODING_AGENT_DIR: settingsDir, PI_PASEO_ORCHESTRATION_ROLE: "supervisor", PASEO_AGENT_ID: "supervisor-1", PI_PASEO_ORCHESTRATION_PROFILES_DIR: profiles, PATH: "/nonexistent-ppo-path" },
     });
     await writeSettings(settingsDir, validDoc);
     fake.ctx.cwd = repo.dir;
@@ -2851,7 +2851,7 @@ test("Doctor: passive warning/report parsing, no output channel probe, and gover
     await fake.handlers.get("session_start")({}, fake.ctx);
     const governed = await ext.buildDoctorReport({ ctx: fake.ctx, pi: fake.pi, now: "2026-01-01T00:00:00.000Z", reportId: "doctor-supervisor" });
     assert.equal(governed.checks.find((check) => check.code === "ADAPTER_OBSERVER").status, "BLOCKED");
-    assert.match(governed.checks.find((check) => check.code === "ADAPTER_OBSERVER").observed, /adapter observer not yet verified/);
+    assert.match(governed.checks.find((check) => check.code === "ADAPTER_OBSERVER").observed, /paseo inspect failed/);
     assert.equal(governed.overall_status, "BLOCKED");
     await writeSettings(settingsDir, { ...validDoc, roles: { ...validDoc.roles, supervisor: { ...validDoc.roles.supervisor, thinking: "low" } } });
     const drifted = await ext.buildDoctorReport({ ctx: fake.ctx, pi: fake.pi, now: "2026-01-01T00:00:00.000Z", reportId: "doctor-drift" });
@@ -2948,7 +2948,7 @@ test("Doctor: secret-shaped values are redacted from the report", async () => {
   }
 });
 
-// ─── Lát 8: package verification and release gate ───────────────────────────
+// ─── Slice 8: package verification and release gate ───────────────────────────
 
 const { resolvePackageResources, releaseGate } = extension;
 
@@ -3137,7 +3137,7 @@ test("releaseGate fails closed on every missing fact, the absent adapter observe
   assert.equal(adapterBlocker.observed, false);
   assert.equal(adapterBlocker.owner, "operator");
   assert.match(adapterBlocker.condition, /current-agent observer/);
-  assert.match(adapterBlocker.action, /no fallback/);
+  assert.match(adapterBlocker.action, /rerun the release smoke on the exact commit/);
 
   // Unknown and non-boolean facts fail closed.
   const unproven = releaseGate({ ...allReleaseFacts(), install_pinned: "pending" });
@@ -3176,10 +3176,10 @@ test("release smoke script exists, is node-stdlib-only, runs, and reports the ab
     code = err.code ?? 1;
     stdout = err.stdout ?? "";
   }
-  assert.notEqual(code, 0, "the smoke must exit non-zero while the adapter capability is absent");
+  assert.notEqual(code, 0, "the smoke must exit non-zero while the observer capability is absent");
   assert.equal(code, 1);
-  assert.match(stdout, /RELEASE BLOCKER: capabilities\.adapter_current_agent_observer is absent/);
-  assert.match(stdout, /adapter observer not yet verified/);
+  assert.match(stdout, /RELEASE BLOCKER/);
+  assert.match(stdout, /release observer probe proves current-agent observation or reports the exact blocker/);
   assert.match(stdout, /relocation: resource set and digests are identical from the copy/);
 });
 
@@ -3251,6 +3251,94 @@ test("mutation boundary: settings command, notebook init+append, and doctor touc
   } finally {
     await rm(config, { recursive: true, force: true });
     await rm(repo.dir, { recursive: true, force: true });
+    await rm(profiles, { recursive: true, force: true });
+  }
+});
+
+// ─── Slice 7b: Paseo CLI current-agent observer ────────────────────────────────
+
+// Fake `paseo` executable: `inspect <id> --json` returns the current live
+// agent tuple with the fixed identity "agent-42", so requesting any other id
+// is an identity mismatch; `--version` prints a version. The fail variant
+// exits 1 like a daemon-down CLI.
+async function fakePaseoBin({ fail = false } = {}) {
+  const bin = await mkdtemp(join(tmpdir(), "ppo-paseo-bin-"));
+  const script = fail
+    ? `#!/bin/sh\necho "daemon unreachable" >&2\nexit 1\n`
+    : `#!/bin/sh\nif [ "$1" = "--version" ] || [ "$1" = "-v" ]; then echo "0.3.1-test"; exit 0; fi\nif [ "$1" = "inspect" ]; then\n  [ -z "$2" ] && { echo "agent id required" >&2; exit 2; }\n  printf '{"Id":"agent-42","Provider":"pi","Model":"claude-sonnet-4-5","Thinking":"medium","Status":"running","Cwd":"/tmp/repo","ParentAgentId":"lead-9"}'\n  exit 0\nfi\necho "unknown command" >&2\nexit 1\n`;
+  await writeFile(join(bin, "paseo"), script, { mode: 0o755 });
+  return bin;
+}
+
+test("observePaseoCurrentAgent: maps the exact agent tuple from the installed CLI", async () => {
+  const bin = await fakePaseoBin();
+  try {
+    const env = { ...process.env, PATH: bin };
+    const ok = await extension.observePaseoCurrentAgent("agent-42", { env });
+    assert.equal(ok.ok, true, ok.error);
+    assert.equal(ok.observation.agent_id, "agent-42");
+    assert.equal(ok.observation.provider, "pi");
+    assert.equal(ok.observation.status, "running");
+    assert.equal(ok.observation.cwd, "/tmp/repo");
+    assert.equal(ok.observation.parent_agent_id, "lead-9");
+    assert.equal(ok.observation.runtimeInfo.model, "claude-sonnet-4-5");
+    assert.equal(ok.observation.runtimeInfo.thinkingOptionId, "medium");
+    assert.equal(ok.observation.source, "paseo-cli");
+  } finally {
+    await rm(bin, { recursive: true, force: true });
+  }
+});
+
+test("observePaseoCurrentAgent: blank identity, identity mismatch, and CLI failure fail closed", async () => {
+  const bin = await fakePaseoBin();
+  const failBin = await fakePaseoBin({ fail: true });
+  try {
+    assert.equal((await extension.observePaseoCurrentAgent("", { env: { PATH: bin } })).ok, false);
+
+    const mismatch = await extension.observePaseoCurrentAgent("agent-1", { env: { PATH: bin } });
+    assert.equal(mismatch.ok, false);
+    assert.match(mismatch.error, /instead of the requested agent/);
+
+    const down = await extension.observePaseoCurrentAgent("agent-2", { env: { PATH: failBin } });
+    assert.equal(down.ok, false);
+    assert.match(down.error, /paseo inspect failed/);
+  } finally {
+    await rm(bin, { recursive: true, force: true });
+    await rm(failBin, { recursive: true, force: true });
+  }
+});
+
+test("Doctor: paseo CLI observer proves identity/model/thinking; attestation stays an explicit WARN", async () => {
+  const bin = await fakePaseoBin();
+  const repo = await gitRepoFixture();
+  const config = await mkdtemp(join(tmpdir(), "ppo-doctor-cli-"));
+  const profiles = await profileDirFixture();
+  try {
+    await writeSettings(config, validDoc);
+    const ext = await freshExtension();
+    const fake = fakePi({
+      activeTools: ["read", "bash", "mcp"],
+      env: { PI_CODING_AGENT_DIR: config, PI_PASEO_ORCHESTRATION_ROLE: "supervisor", PASEO_AGENT_ID: "agent-42", PI_PASEO_ORCHESTRATION_PROFILES_DIR: profiles, PATH: bin },
+    });
+    fake.ctx.cwd = repo.dir;
+    ext.default(fake.pi);
+    await fake.handlers.get("session_start")({}, fake.ctx);
+    const report = await ext.buildDoctorReport({
+      ctx: fake.ctx, pi: fake.pi,
+      now: "2026-01-01T00:00:00.000Z", reportId: "doctor-cli",
+    });
+    const observer = report.checks.find((check) => check.code === "ADAPTER_OBSERVER");
+    assert.equal(observer.status, "PASS");
+    assert.match(observer.observed, /proved identity, model, thinking, parent, and cwd/);
+    const attestation = report.checks.find((check) => check.code === "OBSERVER_ATTESTATION");
+    assert.equal(attestation.status, "WARN");
+    assert.match(attestation.observed, /workspace_binding, mcp_configuration_attestation/);
+    assert.equal(report.overall_status, "WARN", "proven core with unverified attestation must be WARN, never a lie");
+    assert.equal(extension.parseDoctorReport(extension.formatDoctorReport(report)).ok, true);
+  } finally {
+    await rm(bin, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+    await rm(config, { recursive: true, force: true });
     await rm(profiles, { recursive: true, force: true });
   }
 });

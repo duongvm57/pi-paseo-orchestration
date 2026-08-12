@@ -3,7 +3,10 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, posix, relative, sep } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+
+const execFileAsync = promisify(execFile);
 
 export const ROLES = ["supervisor", "lead", "peer"];
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -174,12 +177,12 @@ export async function resolveProfileSource(env, bundledDir) {
   const override = env[PROFILES_ENV];
   if (override !== undefined && override !== null && override !== "") {
     const check = await validateProfileDir(override);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
     return { ok: true, dir: override, source: "override" };
   }
   if (!bundledDir) return { ok: false, error: "no profile source (bundled profiles unavailable)" };
   const check = await validateProfileDir(bundledDir);
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   return { ok: true, dir: bundledDir, source: "bundled" };
 }
 
@@ -206,7 +209,7 @@ async function findModel(models, provider, id) {
 // this latch; a fresh Paseo process is required to change the role.
 export async function activate({ env, dir, profileDir, models, setModel, setThinkingLevel }) {
   const roleCheck = parseRole(env);
-  if (!roleCheck.ok) return roleCheck;
+  if (!roleCheck.ok) return { ok: false, error: roleCheck.error };
   if (roleCheck.role === null) return { ok: true, latch: null };
 
   const agentId = (env[AGENT_ENV] ?? "").trim();
@@ -221,7 +224,7 @@ export async function activate({ env, dir, profileDir, models, setModel, setThin
   if (settings === null) return { ok: false, error: `settings document is missing; run /pi-paseo-orchestration:settings first` };
 
   const source = await validateProfileDir(profileDir);
-  if (!source.ok) return source;
+  if (!source.ok) return { ok: false, error: source.error };
 
   let profileText;
   const profileDigests = {};
@@ -287,7 +290,7 @@ function verifyRuntimeSelection(latch, ctx) {
   return { ok: true };
 }
 
-export async function verifyLatch(latch, env, dir, ctx) {
+export async function verifyLatch(latch, env, dir, ctx = {}) {
   if (parseRole(env).role !== latch.role) return { ok: false, error: "role environment drifted" };
   if ((env[AGENT_ENV] ?? "").trim() !== latch.agentId) return { ok: false, error: "Paseo agent identity drifted" };
   if ((env[PROFILES_ENV] ?? null) !== latch.profileOverride) return { ok: false, error: "profile source drifted" };
@@ -436,42 +439,41 @@ function findDuplicateKey(jsonText) {
 // mistyped, conflicting (e.g. base without local_commit), and role-mismatched
 // data all fail closed with an explicit reason.
 function validateEnvelopeShape(obj) {
-  const err = (error) => ({ ok: false, error });
   if (obj === null || typeof obj !== "object" || Array.isArray(obj)) {
-    return err("authority envelope body must be a single JSON object");
+    return { ok: false, error: "authority envelope body must be a single JSON object" };
   }
   if (obj.version !== 1) {
-    return err(`authority envelope version must be exactly 1 (got ${JSON.stringify(obj.version)})`);
+    return { ok: false, error: `authority envelope version must be exactly 1 (got ${JSON.stringify(obj.version)})` };
   }
   const kind = obj.grant_kind;
   if (!Object.prototype.hasOwnProperty.call(GRANT_KIND_ROLE, kind)) {
-    return err(`grant_kind must be one of peer|lead_tiny|supervisor_recovery (got ${JSON.stringify(kind)})`);
+    return { ok: false, error: `grant_kind must be one of peer|lead_tiny|supervisor_recovery (got ${JSON.stringify(kind)})` };
   }
   if (obj.role !== GRANT_KIND_ROLE[kind]) {
-    return err(`grant_kind ${kind} requires role ${GRANT_KIND_ROLE[kind]} (got ${JSON.stringify(obj.role)})`);
+    return { ok: false, error: `grant_kind ${kind} requires role ${GRANT_KIND_ROLE[kind]} (got ${JSON.stringify(obj.role)})` };
   }
   if (obj.issuer !== "human") {
-    return err(`issuer must be exactly "human" (got ${JSON.stringify(obj.issuer)})`);
+    return { ok: false, error: `issuer must be exactly "human" (got ${JSON.stringify(obj.issuer)})` };
   }
   for (const field of ["agent_id", "task_id"]) {
     if (typeof obj[field] !== "string" || obj[field].trim() === "") {
-      return err(`${field} must be a nonempty string`);
+      return { ok: false, error: `${field} must be a nonempty string` };
     }
   }
   if (typeof obj.objective !== "string" || obj.objective.trim() === "") {
-    return err("objective must be a nonempty string");
+    return { ok: false, error: "objective must be a nonempty string" };
   }
   if (obj.objective.length > OBJECTIVE_MAX) {
-    return err(`objective exceeds the ${OBJECTIVE_MAX}-character bound`);
+    return { ok: false, error: `objective exceeds the ${OBJECTIVE_MAX}-character bound` };
   }
 
   if (kind === "supervisor_recovery") {
     const fields = ["version", "grant_kind", "role", "issuer", "agent_id", "task_id", "objective", "provider", "workspace_id", "handoff_id"];
     const extra = Object.keys(obj).find((k) => !fields.includes(k));
-    if (extra !== undefined) return err(`unknown field ${JSON.stringify(extra)} in supervisor_recovery envelope`);
+    if (extra !== undefined) return { ok: false, error: `unknown field ${JSON.stringify(extra)} in supervisor_recovery envelope` };
     for (const field of ["provider", "workspace_id", "handoff_id"]) {
       if (typeof obj[field] !== "string" || obj[field].trim() === "") {
-        return err(`${field} must be a nonempty string`);
+        return { ok: false, error: `${field} must be a nonempty string` };
       }
     }
     return { ok: true, envelope: { ...obj, capabilities: [] } };
@@ -480,40 +482,40 @@ function validateEnvelopeShape(obj) {
   const fields = ["version", "grant_kind", "role", "issuer", "agent_id", "task_id", "objective", "capabilities", "scope", "exclusions", "base"];
   if (kind === "lead_tiny") fields.push("protocol_digest");
   const extra = Object.keys(obj).find((k) => !fields.includes(k));
-  if (extra !== undefined) return err(`unknown field ${JSON.stringify(extra)} in ${kind} envelope`);
+  if (extra !== undefined) return { ok: false, error: `unknown field ${JSON.stringify(extra)} in ${kind} envelope` };
 
   if (!Array.isArray(obj.capabilities) || obj.capabilities.length === 0) {
-    return err("capabilities must be a nonempty array");
+    return { ok: false, error: "capabilities must be a nonempty array" };
   }
   if (new Set(obj.capabilities).size !== obj.capabilities.length) {
-    return err("capabilities must not repeat");
+    return { ok: false, error: "capabilities must not repeat" };
   }
   for (const cap of obj.capabilities) {
     if (typeof cap !== "string" || !CAPABILITY_NAMES.includes(cap)) {
-      return err(`unknown capability ${JSON.stringify(cap)}`);
+      return { ok: false, error: `unknown capability ${JSON.stringify(cap)}` };
     }
   }
   if (typeof obj.scope !== "string" || obj.scope === "") {
-    return err("scope must be a nonempty repository-relative string");
+    return { ok: false, error: "scope must be a nonempty repository-relative string" };
   }
   let exclusions = [];
   if (obj.exclusions !== undefined) {
-    if (!Array.isArray(obj.exclusions)) return err("exclusions must be an array");
+    if (!Array.isArray(obj.exclusions)) return { ok: false, error: "exclusions must be an array" };
     for (const e of obj.exclusions) {
-      if (typeof e !== "string" || e === "") return err("each exclusion must be a nonempty string");
+      if (typeof e !== "string" || e === "") return { ok: false, error: "each exclusion must be a nonempty string" };
     }
     exclusions = obj.exclusions;
   }
   const commitGranted = obj.capabilities.includes("local_commit");
   if (commitGranted) {
     if (typeof obj.base !== "string" || !FULL_SHA.test(obj.base)) {
-      return err("base must be a full git commit SHA when local_commit is granted");
+      return { ok: false, error: "base must be a full git commit SHA when local_commit is granted" };
     }
   } else if (obj.base !== undefined) {
-    return err("base is only valid when local_commit is granted");
+    return { ok: false, error: "base is only valid when local_commit is granted" };
   }
   if (kind === "lead_tiny" && (typeof obj.protocol_digest !== "string" || !SHA256_HEX.test(obj.protocol_digest))) {
-    return err("protocol_digest must be a full sha256 hex digest");
+    return { ok: false, error: "protocol_digest must be a full sha256 hex digest" };
   }
   return { ok: true, envelope: { ...obj, exclusions } };
 }
@@ -620,11 +622,11 @@ async function checkScopePath(repoRoot, p, label) {
 // checked at envelope activation against the real repository filesystem.
 export async function validateScope(repoRoot, scope, exclusions = []) {
   const scopeCheck = await checkScopePath(repoRoot, scope, "scope");
-  if (!scopeCheck.ok) return scopeCheck;
+  if (!scopeCheck.ok) return { ok: false, error: scopeCheck.error };
   const canonical = [];
   for (const exclusion of exclusions) {
     const check = await checkScopePath(repoRoot, exclusion, `exclusion ${JSON.stringify(exclusion)}`);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
     if (!isPathInScope(exclusion, scope, [])) {
       return { ok: false, error: `exclusion ${JSON.stringify(exclusion)} must lie within scope ${JSON.stringify(scope)}` };
     }
@@ -645,15 +647,11 @@ export function effectiveTools(baseline, role, authority = null) {
 }
 
 function gitOut(repoRoot, args, trim = true) {
-  return new Promise((resolve) => {
-    execFile("git", args, {
-      cwd: repoRoot,
-      timeout: 15000,
-      env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
-    }, (err, stdout) => {
-      resolve(err ? null : (trim ? stdout.trim() : stdout));
-    });
-  });
+  return execFileAsync("git", args, {
+    cwd: repoRoot,
+    timeout: 15000,
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+  }).then(({ stdout }) => (trim ? stdout.trim() : stdout)).catch(() => null);
 }
 
 function findRepoRoot(cwd = process.cwd()) {
@@ -738,35 +736,40 @@ const REPORT_PAYLOAD = {
 };
 
 function checkReportPayload(payload, kind) {
-  const err = (error) => ({ ok: false, error });
-  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return err(`payload must be a single object for kind ${kind}`);
-  const schema = REPORT_PAYLOAD[kind];
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return { ok: false, error: `payload must be a single object for kind ${kind}` };
+  const schema =
+    kind === "PROGRESS" ? REPORT_PAYLOAD.PROGRESS
+    : kind === "HANDOFF" ? REPORT_PAYLOAD.HANDOFF
+    : kind === "REOPEN_REQUEST" ? REPORT_PAYLOAD.REOPEN_REQUEST
+    : kind === "DEPENDENCY_REQUEST" ? REPORT_PAYLOAD.DEPENDENCY_REQUEST
+    : kind === "BLOCKED" ? REPORT_PAYLOAD.BLOCKED
+    : undefined;
   for (const field of Object.keys(payload)) {
-    if (!Object.prototype.hasOwnProperty.call(schema, field)) return err(`unknown field ${JSON.stringify(field)} in ${kind} payload`);
+    if (!Object.prototype.hasOwnProperty.call(schema, field)) return { ok: false, error: `unknown field ${JSON.stringify(field)} in ${kind} payload` };
   }
   for (const [field, rule] of Object.entries(schema)) {
-    if (!Object.prototype.hasOwnProperty.call(payload, field)) return err(`payload.${field} is missing for kind ${kind}`);
+    if (!Object.prototype.hasOwnProperty.call(payload, field)) return { ok: false, error: `payload.${field} is missing for kind ${kind}` };
     const value = payload[field];
     if (rule.type === "string") {
-      if (typeof value !== "string" || value.trim() === "") return err(`payload.${field} must be a nonempty string`);
+      if (typeof value !== "string" || value.trim() === "") return { ok: false, error: `payload.${field} must be a nonempty string` };
     } else if (rule.type === "boolean") {
-      if (typeof value !== "boolean") return err(`payload.${field} must be a boolean`);
+      if (typeof value !== "boolean") return { ok: false, error: `payload.${field} must be a boolean` };
     } else if (rule.type === "candidate") {
-      if (value !== null && (typeof value !== "string" || value.trim() === "")) return err(`payload.${field} must be a candidate reference string or null`);
-      if (typeof value === "string" && !parseCandidateRef(value).ok) return err(`payload.${field} must be a valid Stable Candidate reference`);
+      if (value !== null && (typeof value !== "string" || value.trim() === "")) return { ok: false, error: `payload.${field} must be a candidate reference string or null` };
+      if (typeof value === "string" && !parseCandidateRef(value).ok) return { ok: false, error: `payload.${field} must be a valid Stable Candidate reference` };
     } else if (rule.type === "strings") {
-      if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.trim() === "")) return err(`payload.${field} must be an array of nonempty strings`);
-      if (rule.min !== undefined && value.length < rule.min) return err(`payload.${field} must contain at least ${rule.min} item(s)`);
+      if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.trim() === "")) return { ok: false, error: `payload.${field} must be an array of nonempty strings` };
+      if ("min" in rule && value.length < rule.min) return { ok: false, error: `payload.${field} must contain at least ${rule.min} item(s)` };
     } else if (rule.type === "verification") {
-      if (!Array.isArray(value) || value.length < (rule.min ?? 0)) return err(`payload.${field} must be a nonempty verification array`);
+      if (!Array.isArray(value) || value.length < ("min" in rule ? rule.min : 0)) return { ok: false, error: `payload.${field} must be a nonempty verification array` };
       for (const [index, item] of value.entries()) {
         const closed = checkClosedObject(item, ["command", "result", "output"], `payload.${field}[${index}]`);
-        if (!closed.ok) return closed;
+        if (!closed.ok) return { ok: false, error: closed.error };
         for (const key of ["command", "output"]) {
           const check = checkNonemptyString(item[key], `payload.${field}[${index}].${key}`);
-          if (!check.ok) return check;
+          if (!check.ok) return { ok: false, error: check.error };
         }
-        if (!COMMAND_RESULTS.includes(item.result)) return err(`payload.${field}[${index}].result must be PASS|FAIL|NOT_RUN`);
+        if (!COMMAND_RESULTS.includes(item.result)) return { ok: false, error: `payload.${field}[${index}].result must be PASS|FAIL|NOT_RUN` };
       }
     }
   }
@@ -774,30 +777,29 @@ function checkReportPayload(payload, kind) {
 }
 
 function validateReportShape(obj) {
-  const err = (error) => ({ ok: false, error });
   if (obj === null || typeof obj !== "object" || Array.isArray(obj)) {
-    return err("peer report body must be a single JSON object");
+    return { ok: false, error: "peer report body must be a single JSON object" };
   }
   if (obj.version !== 1) {
-    return err(`peer report version must be exactly 1 (got ${JSON.stringify(obj.version)})`);
+    return { ok: false, error: `peer report version must be exactly 1 (got ${JSON.stringify(obj.version)})` };
   }
   if (!REPORT_KINDS.includes(obj.kind)) {
-    return err(`kind must be one of ${REPORT_KINDS.join("|")} (got ${JSON.stringify(obj.kind)})`);
+    return { ok: false, error: `kind must be one of ${REPORT_KINDS.join("|")} (got ${JSON.stringify(obj.kind)})` };
   }
   const extra = Object.keys(obj).find((k) => !REPORT_FIELDS.includes(k));
-  if (extra !== undefined) return err(`unknown field ${JSON.stringify(extra)} in peer report`);
+  if (extra !== undefined) return { ok: false, error: `unknown field ${JSON.stringify(extra)} in peer report` };
   for (const field of ["report_id", "peer_agent_id", "parent_lead_agent_id", "task_id", "assignment_id"]) {
-    if (typeof obj[field] !== "string" || obj[field].trim() === "") return err(`${field} must be a nonempty string`);
+    if (typeof obj[field] !== "string" || obj[field].trim() === "") return { ok: false, error: `${field} must be a nonempty string` };
   }
-  if (typeof obj.summary !== "string" || obj.summary.trim() === "") return err("summary must be a nonempty string");
+  if (typeof obj.summary !== "string" || obj.summary.trim() === "") return { ok: false, error: "summary must be a nonempty string" };
   if (!Array.isArray(obj.evidence) || obj.evidence.length === 0 || obj.evidence.some((item) => typeof item !== "string" || item.trim() === "")) {
-    return err("evidence must be a nonempty array of nonempty strings");
+    return { ok: false, error: "evidence must be a nonempty array of nonempty strings" };
   }
   if (obj.supersedes_report_id !== undefined && (typeof obj.supersedes_report_id !== "string" || obj.supersedes_report_id.trim() === "")) {
-    return err("supersedes_report_id must be a nonempty string when present");
+    return { ok: false, error: "supersedes_report_id must be a nonempty string when present" };
   }
   const payload = checkReportPayload(obj.payload, obj.kind);
-  if (!payload.ok) return payload;
+  if (!payload.ok) return { ok: false, error: payload.error };
   return { ok: true, report: { ...obj } };
 }
 
@@ -844,14 +846,13 @@ export function parseReport(text) {
 // IDs — lifecycle, arrival path, or prose can never repair correlation, and a
 // missing fact fails closed.
 export function correlateReport(report, known) {
-  const err = (error) => ({ ok: false, error });
   if (report === null || typeof report !== "object" || Array.isArray(report)) {
-    return err("correlation requires a validated peer report object");
+    return { ok: false, error: "correlation requires a validated peer report object" };
   }
   if (known === null || typeof known !== "object" || Array.isArray(known)) {
-    return err("correlation requires the known child/parent/task/assignment identities");
+    return { ok: false, error: "correlation requires the known child/parent/task/assignment identities" };
   }
-  if (typeof report.report_id !== "string" || report.report_id.trim() === "") return err("report_id must be a nonempty string");
+  if (typeof report.report_id !== "string" || report.report_id.trim() === "") return { ok: false, error: "report_id must be a nonempty string" };
   const pairs = [
     ["peerId", "peer_agent_id", "child peer agent"],
     ["parentId", "parent_lead_agent_id", "parent lead agent"],
@@ -861,20 +862,20 @@ export function correlateReport(report, known) {
   for (const [knownKey, field, label] of pairs) {
     const knownValue = known[knownKey];
     if (typeof knownValue !== "string" || knownValue.trim() === "") {
-      return err(`the known ${label} id is missing; correlation fails closed`);
+      return { ok: false, error: `the known ${label} id is missing; correlation fails closed` };
     }
     if (typeof report[field] !== "string" || report[field].trim() === "") {
-      return err(`${field} must be a nonempty string`);
+      return { ok: false, error: `${field} must be a nonempty string` };
     }
     if (report[field] !== knownValue) {
-      return err(`report ${field} ${JSON.stringify(report[field])} does not match the known ${label} id ${JSON.stringify(knownValue)}`);
+      return { ok: false, error: `report ${field} ${JSON.stringify(report[field])} does not match the known ${label} id ${JSON.stringify(knownValue)}` };
     }
   }
   if (known.candidateRequired === true && report.kind === "HANDOFF" && report.payload.candidate_ref === null) {
-    return err("candidate-required HANDOFF must contain a Stable Candidate reference");
+    return { ok: false, error: "candidate-required HANDOFF must contain a Stable Candidate reference" };
   }
   if (known.reportVersion !== undefined && report.version !== known.reportVersion) {
-    return err("report version does not match the pinned assignment report version");
+    return { ok: false, error: "report version does not match the pinned assignment report version" };
   }
   return { ok: true };
 }
@@ -950,7 +951,7 @@ function sameList(left, right) {
     && left.length === right.length && left.every((item, index) => item === right[index]);
 }
 
-// Shared strict marker parser for the four Lát 6 documents. Like authority and
+// Shared strict marker parser for the four Slice 6 documents. Like authority and
 // report parsing, the marker must be first, duplicate JSON keys are rejected
 // before JSON.parse, and any unknown pi-paseo marker fails closed.
 function parseV1Block(text, begin, label, resultKey, validate) {
@@ -1022,7 +1023,7 @@ async function committedPaths(repoRoot, from, to) {
 
 async function candidateGitFacts({ candidateRef, repoRoot, grantedBase, scope, exclusions = [] }) {
   const parsed = parseCandidateRef(candidateRef);
-  if (!parsed.ok) return parsed;
+  if (!parsed.ok) return { ok: false, error: parsed.error };
   const { taskBaseOid, candidateOid } = parsed.candidate;
   if (typeof repoRoot !== "string" || repoRoot.trim() === "") {
     return { ok: false, error: "candidate eligibility requires an exact repository root" };
@@ -1042,7 +1043,7 @@ async function candidateGitFacts({ candidateRef, repoRoot, grantedBase, scope, e
     [grantedBase, "granted candidate base"],
   ]) {
     const check = await exactCommit(repoRoot, oid, label);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
   }
 
   const parentLine = await gitOut(repoRoot, ["rev-list", "--parents", "-n", "1", candidateOid]);
@@ -1118,19 +1119,19 @@ function authorityScope(authority) {
 
 function validateCandidateEvidenceShape(object, authority) {
   const closed = checkClosedObject(object, EVIDENCE_FIELDS, "candidate evidence");
-  if (!closed.ok) return closed;
+  if (!closed.ok) return { ok: false, error: closed.error };
   if (object.version !== 1) return { ok: false, error: "candidate evidence version must be exactly 1" };
   for (const field of [
     "evidence_id", "project_id", "task_id", "task_revision", "writer_id",
     "repository_root", "workspace_id",
   ]) {
     const check = checkNonemptyString(object[field], field);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
   }
   for (const field of ["assignment_id", "parent_id"]) {
     if (object[field] !== null) {
       const check = checkNonemptyString(object[field], field);
-      if (!check.ok) return check;
+      if (!check.ok) return { ok: false, error: check.error };
     }
   }
   if ((object.assignment_id === null) !== (object.parent_id === null)) {
@@ -1144,23 +1145,23 @@ function validateCandidateEvidenceShape(object, authority) {
 
   let check = checkClosedObject(object.cumulative_diff,
     ["evidence_id", "base_oid", "candidate_oid", "diff"], "candidate evidence cumulative_diff");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   check = checkNonemptyString(object.cumulative_diff.evidence_id, "cumulative_diff.evidence_id");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (object.cumulative_diff.base_oid !== candidate.candidate.taskBaseOid
       || object.cumulative_diff.candidate_oid !== candidate.candidate.candidateOid) {
     return { ok: false, error: "cumulative_diff object ids must match candidate_ref" };
   }
   check = checkNonemptyString(object.cumulative_diff.diff, "cumulative_diff.diff");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
 
   check = checkStringList(object.changed_paths, "changed_paths", { min: 1, unique: true });
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (!sameList(object.changed_paths, [...object.changed_paths].sort())) {
     return { ok: false, error: "changed_paths must be sorted canonically" };
   }
   const granted = authorityScope(authority);
-  if (!granted.ok) return granted;
+  if (!granted.ok) return { ok: false, error: granted.error };
   for (const path of object.changed_paths) {
     if (path.includes("\\") || isAbsolute(path) || posix.normalize(path) !== path
         || path === "." || path === ".." || path.startsWith("../")) {
@@ -1174,7 +1175,7 @@ function validateCandidateEvidenceShape(object, authority) {
   check = checkClosedObject(object.scope, [
     "writable_scope", "exclusions", "current_result", "cumulative_result", "evidence_refs",
   ], "candidate evidence scope");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (object.scope.writable_scope !== granted.scope || !sameList(object.scope.exclusions, granted.exclusions)) {
     return { ok: false, error: "candidate evidence scope and exclusions do not match the granted scope" };
   }
@@ -1184,19 +1185,19 @@ function validateCandidateEvidenceShape(object, authority) {
     }
   }
   check = checkStringList(object.scope.evidence_refs, "scope.evidence_refs", { min: 1, unique: true });
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
 
   check = checkClosedObject(object.objective_relevance,
     ["result", "rationale", "evidence_refs"], "candidate evidence objective_relevance");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (object.objective_relevance.result !== "PASS") {
     return { ok: false, error: "objective_relevance.result must be PASS" };
   }
   check = checkNonemptyString(object.objective_relevance.rationale, "objective_relevance.rationale");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   check = checkStringList(object.objective_relevance.evidence_refs,
     "objective_relevance.evidence_refs", { min: 1, unique: true });
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
 
   if (!Array.isArray(object.verification) || object.verification.length === 0) {
     return { ok: false, error: "verification must be a nonempty array" };
@@ -1204,10 +1205,10 @@ function validateCandidateEvidenceShape(object, authority) {
   const verificationIds = [];
   for (const [index, item] of object.verification.entries()) {
     check = checkClosedObject(item, ["evidence_id", "command", "result", "output"], `verification[${index}]`);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
     for (const field of ["evidence_id", "command"]) {
       check = checkNonemptyString(item[field], `verification[${index}].${field}`);
-      if (!check.ok) return check;
+      if (!check.ok) return { ok: false, error: check.error };
     }
     if (!COMMAND_RESULTS.includes(item.result)) {
       return { ok: false, error: `verification[${index}].result must be PASS|FAIL|NOT_RUN` };
@@ -1221,22 +1222,22 @@ function validateCandidateEvidenceShape(object, authority) {
 
   check = checkClosedObject(object.post_commit,
     ["head_oid", "verification_evidence_ids"], "candidate evidence post_commit");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (object.post_commit.head_oid !== candidate.candidate.candidateOid) {
     return { ok: false, error: "post_commit.head_oid must equal the candidate oid" };
   }
   check = checkStringList(object.post_commit.verification_evidence_ids,
     "post_commit.verification_evidence_ids", { min: 1, unique: true });
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (!sameList(object.post_commit.verification_evidence_ids, verificationIds)) {
     return { ok: false, error: "post_commit must bind every verification evidence id in order" };
   }
 
   check = checkClosedObject(object.clean,
     ["evidence_id", "command", "result", "output"], "candidate evidence clean");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   check = checkNonemptyString(object.clean.evidence_id, "clean.evidence_id");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (object.clean.command !== "git status --porcelain=v1 --untracked-files=all") {
     return { ok: false, error: "clean.command must be exactly git status --porcelain=v1 --untracked-files=all" };
   }
@@ -1246,7 +1247,7 @@ function validateCandidateEvidenceShape(object, authority) {
   if (typeof object.clean.output !== "string") return { ok: false, error: "clean.output must be a string" };
   for (const field of ["residual_risks", "unfinished_dependencies"]) {
     check = checkStringList(object[field], field);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
   }
   return { ok: true, evidence: object };
 }
@@ -1266,11 +1267,11 @@ const REVIEW_FIELDS = [
 
 function validateReviewShape(object) {
   let check = checkClosedObject(object, REVIEW_FIELDS, "review");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (object.version !== 1) return { ok: false, error: "review version must be exactly 1" };
   for (const field of ["review_result_id", "reviewer_id", "reviewer_assignment_id"]) {
     check = checkNonemptyString(object[field], field);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
   }
   const candidate = parseCandidateRef(object.candidate_ref);
   if (!candidate.ok) return { ok: false, error: `review ${candidate.error}` };
@@ -1282,18 +1283,19 @@ function validateReviewShape(object) {
   }
   for (const [index, command] of object.commands.entries()) {
     check = checkClosedObject(command, ["command", "result", "output_ref"], `review commands[${index}]`);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
     for (const field of ["command", "output_ref"]) {
       check = checkNonemptyString(command[field], `review commands[${index}].${field}`);
-      if (!check.ok) return check;
+      if (!check.ok) return { ok: false, error: check.error };
     }
     if (!COMMAND_RESULTS.includes(command.result)) {
       return { ok: false, error: `review commands[${index}].result must be PASS|FAIL|NOT_RUN` };
     }
   }
-  for (const [field, min] of [["evidence", 1], ["coverage", 1], ["gaps", 0]]) {
+  const mins = { evidence: 1, coverage: 1, gaps: 0 };
+  for (const [field, min] of Object.entries(mins)) {
     check = checkStringList(object[field], field, { min });
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
   }
   if (!["APPROVE", "FINDINGS"].includes(object.outcome)) {
     return { ok: false, error: "review outcome must be exactly APPROVE or FINDINGS" };
@@ -1303,16 +1305,16 @@ function validateReviewShape(object) {
   for (const [index, finding] of object.findings.entries()) {
     check = checkClosedObject(finding,
       ["finding_id", "severity", "statement", "impact", "evidence", "scope"], `finding[${index}]`);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
     for (const field of ["finding_id", "statement", "impact", "scope"]) {
       check = checkNonemptyString(finding[field], `finding[${index}].${field}`);
-      if (!check.ok) return check;
+      if (!check.ok) return { ok: false, error: check.error };
     }
     if (!["BLOCKER", "NON_BLOCKING"].includes(finding.severity)) {
       return { ok: false, error: `finding[${index}].severity must be BLOCKER or NON_BLOCKING` };
     }
     check = checkStringList(finding.evidence, `finding[${index}].evidence`, { min: 1 });
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
     findingIds.push(finding.finding_id);
   }
   if (new Set(findingIds).size !== findingIds.length) {
@@ -1332,7 +1334,7 @@ function validateReviewShape(object) {
   }
   if (correction) {
     check = checkNonemptyString(object.correction_of, "correction_of");
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
     if (!Array.isArray(object.correction_classifications) || object.correction_classifications.length === 0) {
       return { ok: false, error: "correction_classifications must be a nonempty array on a correction review" };
     }
@@ -1340,10 +1342,10 @@ function validateReviewShape(object) {
     for (const [index, classification] of object.correction_classifications.entries()) {
       check = checkClosedObject(classification,
         ["finding_id", "classification", "evidence"], `correction_classifications[${index}]`);
-      if (!check.ok) return check;
+      if (!check.ok) return { ok: false, error: check.error };
       for (const field of ["finding_id", "evidence"]) {
         check = checkNonemptyString(classification[field], `correction_classifications[${index}].${field}`);
-        if (!check.ok) return check;
+        if (!check.ok) return { ok: false, error: check.error };
       }
       if (!["resolved", "open", "obsolete"].includes(classification.classification)) {
         return { ok: false, error: `correction_classifications[${index}].classification must be resolved|open|obsolete` };
@@ -1422,18 +1424,18 @@ export function verdictStatus(document) {
 
 function validateVerdictShape(object) {
   let check = checkClosedObject(object, VERDICT_FIELDS, "verdict");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (object.version !== 1) return { ok: false, error: "verdict version must be exactly 1" };
   for (const field of [
     "verdict_id", "project_id", "task_id", "task_revision", "repository_root",
     "workspace_id", "rationale",
   ]) {
     check = checkNonemptyString(object[field], field);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
   }
   if (object.assignment_id !== null) {
     check = checkNonemptyString(object.assignment_id, "assignment_id");
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
   }
   if (typeof object.workspace_protocol_digest !== "string" || !SHA256_HEX.test(object.workspace_protocol_digest)) {
     return { ok: false, error: "workspace_protocol_digest must be a full sha256 hex digest" };
@@ -1442,12 +1444,12 @@ function validateVerdictShape(object) {
   if (!candidate.ok) return { ok: false, error: `verdict ${candidate.error}` };
 
   check = checkClosedObject(object.origin, ["kind", "evidence_id"], "verdict origin");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (!["PEER_HANDOFF", "LEAD_TINY"].includes(object.origin.kind)) {
     return { ok: false, error: "origin.kind must be PEER_HANDOFF or LEAD_TINY" };
   }
   check = checkNonemptyString(object.origin.evidence_id, "origin.evidence_id");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (object.origin.kind === "PEER_HANDOFF" && object.assignment_id === null) {
     return { ok: false, error: "PEER_HANDOFF verdict requires a non-null assignment_id" };
   }
@@ -1458,15 +1460,15 @@ function validateVerdictShape(object) {
     return { ok: false, error: "scope_result must be PASS or FAIL" };
   }
   check = checkStringList(object.scope_evidence, "scope_evidence", { unique: true });
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
 
   if (!Array.isArray(object.verification)) return { ok: false, error: "verdict verification must be an array" };
   for (const [index, item] of object.verification.entries()) {
     check = checkClosedObject(item, ["command", "result", "output_ref"], `verdict verification[${index}]`);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
     for (const field of ["command", "output_ref"]) {
       check = checkNonemptyString(item[field], `verdict verification[${index}].${field}`);
-      if (!check.ok) return check;
+      if (!check.ok) return { ok: false, error: check.error };
     }
     if (!COMMAND_RESULTS.includes(item.result)) {
       return { ok: false, error: `verdict verification[${index}].result must be PASS|FAIL|NOT_RUN` };
@@ -1475,13 +1477,13 @@ function validateVerdictShape(object) {
 
   check = checkClosedObject(object.review,
     ["required", "review_result_id", "candidate_ref", "outcome", "open_findings"], "verdict review");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (typeof object.review.required !== "boolean") return { ok: false, error: "review.required must be a boolean" };
   check = checkStringList(object.review.open_findings, "review.open_findings", { unique: true });
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (object.review.required) {
     check = checkNonemptyString(object.review.review_result_id, "review.review_result_id");
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
     const reviewCandidate = parseCandidateRef(object.review.candidate_ref);
     if (!reviewCandidate.ok) return { ok: false, error: `verdict review ${reviewCandidate.error}` };
     if (!["APPROVE", "FINDINGS"].includes(object.review.outcome)) {
@@ -1494,17 +1496,17 @@ function validateVerdictShape(object) {
 
   for (const field of ["unfinished_dependencies", "residual_risks"]) {
     check = checkStringList(object[field], field);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
   }
   if (!Array.isArray(object.human_decisions)) return { ok: false, error: "human_decisions must be an array" };
   const decisionIds = [];
   for (const [index, decision] of object.human_decisions.entries()) {
     check = checkClosedObject(decision,
       ["decision_id", "status", "evidence_ref"], `human_decisions[${index}]`);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
     for (const field of ["decision_id", "evidence_ref"]) {
       check = checkNonemptyString(decision[field], `human_decisions[${index}].${field}`);
-      if (!check.ok) return check;
+      if (!check.ok) return { ok: false, error: check.error };
     }
     if (!["RESOLVED", "UNRESOLVED"].includes(decision.status)) {
       return { ok: false, error: `human_decisions[${index}].status must be RESOLVED or UNRESOLVED` };
@@ -1531,7 +1533,7 @@ export function parseVerdict(text) {
 function validateAcceptanceShape(object) {
   let check = checkClosedObject(object,
     ["version", "decision", "candidate_ref", "project_verdict_id"], "local acceptance");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (object.version !== 1) return { ok: false, error: "local acceptance version must be exactly 1" };
   if (object.decision !== "LOCAL_ACCEPT") {
     return { ok: false, error: "local acceptance decision must be exactly LOCAL_ACCEPT" };
@@ -1539,7 +1541,7 @@ function validateAcceptanceShape(object) {
   const candidate = parseCandidateRef(object.candidate_ref);
   if (!candidate.ok) return { ok: false, error: `local acceptance ${candidate.error}` };
   check = checkNonemptyString(object.project_verdict_id, "project_verdict_id");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   return { ok: true, acceptance: object };
 }
 
@@ -1576,7 +1578,7 @@ function acceptanceAuthority(authority) {
     ["workspaceId", authority.workspaceId],
   ]) {
     const check = checkNonemptyString(value, `authority.${field}`);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
   }
   if (typeof authority.reviewRequired !== "boolean") {
     return { ok: false, error: "authority.reviewRequired must be a boolean" };
@@ -1584,17 +1586,17 @@ function acceptanceAuthority(authority) {
   if (grant.grant_kind === "peer") {
     for (const field of ["assignmentId", "parentId"]) {
       const check = checkNonemptyString(authority[field], `authority.${field}`);
-      if (!check.ok) return check;
+      if (!check.ok) return { ok: false, error: check.error };
     }
   } else if (authority.assignmentId !== null || authority.parentId !== null) {
     return { ok: false, error: "lead_tiny authority requires null assignmentId and parentId" };
   }
   for (const [field, value] of [["task_id", grant.task_id], ["agent_id", grant.agent_id]]) {
     const check = checkNonemptyString(value, `authority envelope ${field}`);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
   }
   const scope = authorityScope(authority);
-  if (!scope.ok) return scope;
+  if (!scope.ok) return { ok: false, error: scope.error };
   return { ok: true, grant, scope: scope.scope, exclusions: scope.exclusions };
 }
 
@@ -1608,20 +1610,25 @@ function mismatch(label, actual, expected) {
 // protocol, exact context and evidence references, then current Git objects,
 // HEAD, cumulative/current scope, canonical diff, and porcelain cleanliness.
 // Success is only {ok:true}; there is deliberately no write or stored state.
-export async function validateAcceptance({
-  acceptance, verdict, review, evidence, authority, repoRoot, protocolPin,
-} = {}) {
+export async function validateAcceptance(options = {}) {
+  const acceptance = options["acceptance"];
+  const verdict = options["verdict"];
+  const review = options["review"];
+  const evidence = options["evidence"];
+  const authority = options["authority"];
+  const repoRoot = options["repoRoot"];
+  const protocolPin = options["protocolPin"];
   if (!isRecord(acceptance) || acceptance[DIRECT_ACCEPTANCE] !== true) {
     return { ok: false, error: "acceptance must be a valid block parsed from the direct Human interactive route" };
   }
   let check = validateAcceptanceShape(acceptance);
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   const auth = acceptanceAuthority(authority);
-  if (!auth.ok) return auth;
-  check = validateCandidateEvidenceShape(evidence, authority);
-  if (!check.ok) return { ok: false, error: `candidate evidence invalid: ${check.error}` };
-  check = validateVerdictShape(verdict);
-  if (!check.ok) return { ok: false, error: `verdict invalid: ${check.error}` };
+  if (!auth.ok) return { ok: false, error: auth.error };
+  const evidenceCheck = validateCandidateEvidenceShape(evidence, authority);
+  if (!evidenceCheck.ok) return { ok: false, error: `candidate evidence invalid: ${evidenceCheck.error}` };
+  const verdictCheck = validateVerdictShape(verdict);
+  if (!verdictCheck.ok) return { ok: false, error: `verdict invalid: ${verdictCheck.error}` };
 
   if (typeof repoRoot !== "string" || repoRoot.trim() === "") {
     return { ok: false, error: "acceptance requires the exact repository root" };
@@ -1660,7 +1667,7 @@ export async function validateAcceptance({
   ];
   for (const [label, actual, expected] of expectedContext) {
     const failed = mismatch(label, actual, expected);
-    if (failed) return failed;
+    if (failed) return { ok: false, error: failed.error };
   }
 
   if (acceptance.candidate_ref !== evidence.candidate_ref
@@ -1716,8 +1723,8 @@ export async function validateAcceptance({
     return { ok: false, error: "verdict review requirement does not match the protocol/class authority fact" };
   }
   if (authority.reviewRequired) {
-    check = validateReviewShape(review);
-    if (!check.ok) return { ok: false, error: `required review invalid: ${check.error}` };
+    const reviewCheck = validateReviewShape(review);
+    if (!reviewCheck.ok) return { ok: false, error: `required review invalid: ${reviewCheck.error}` };
     if (!reviewValidForCandidate(review, evidence.candidate_ref)) {
       return { ok: false, error: "required review is stale for the current candidate" };
     }
@@ -1745,7 +1752,7 @@ export async function validateAcceptance({
     scope: auth.scope,
     exclusions: auth.exclusions,
   });
-  if (!facts.ok) return facts;
+  if (!facts.ok) return { ok: false, error: facts.error };
   if (!sameList(evidence.changed_paths, facts.cumulativePaths)) {
     return { ok: false, error: "candidate evidence changed_paths do not match the current cumulative Git diff" };
   }
@@ -1831,13 +1838,13 @@ function parseFrontmatter(text) {
   }
   const extra = Object.keys(meta).find((key) => !required.includes(key));
   if (extra !== undefined) return { ok: false, error: `unknown metadata key ${JSON.stringify(extra)}` };
-  if (meta.status === "") return { ok: false, error: "metadata status must be a nonempty string" };
-  if (!/^\d+$/.test(meta.version) || !Number.isSafeInteger(Number(meta.version)) || Number(meta.version) < 1) {
+  if (meta["status"] === "") return { ok: false, error: "metadata status must be a nonempty string" };
+  if (!/^\d+$/.test(meta["version"]) || !Number.isSafeInteger(Number(meta["version"])) || Number(meta["version"]) < 1) {
     return { ok: false, error: "metadata version must be a positive integer" };
   }
   // Real calendar check: Date.parse rolls over (2025-02-30 → Mar 2), so the
   // parsed components must round-trip exactly.
-  const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(meta.last_reviewed);
+  const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(meta["last_reviewed"]);
   const dateValid =
     dateMatch !== null &&
     (() => {
@@ -1851,8 +1858,8 @@ function parseFrontmatter(text) {
   if (!dateValid) {
     return { ok: false, error: "metadata last_reviewed must be a YYYY-MM-DD date" };
   }
-  if (meta.project_id === "") return { ok: false, error: "metadata project_id must be a nonempty string" };
-  if (meta.repository_root !== ".") {
+  if (meta["project_id"] === "") return { ok: false, error: "metadata project_id must be a nonempty string" };
+  if (meta["repository_root"] !== ".") {
     return { ok: false, error: 'metadata repository_root must be "." (repository-root applicability)' };
   }
   return { ok: true, meta, bodyStart: end + 1 };
@@ -1913,17 +1920,17 @@ export function validateProtocol(text) {
     return { ok: false, error: "workspace protocol must be nonempty" };
   }
   const frontmatter = parseFrontmatter(text);
-  if (!frontmatter.ok) return frontmatter;
+  if (!frontmatter.ok) return { ok: false, error: frontmatter.error };
   const sections = checkCoreSections(text, frontmatter.bodyStart);
-  if (!sections.ok) return sections;
+  if (!sections.ok) return { ok: false, error: sections.error };
   return {
     ok: true,
     meta: {
-      status: frontmatter.meta.status,
-      version: Number(frontmatter.meta.version),
-      last_reviewed: frontmatter.meta.last_reviewed,
-      project_id: frontmatter.meta.project_id,
-      repository_root: frontmatter.meta.repository_root,
+      status: frontmatter.meta["status"],
+      version: Number(frontmatter.meta["version"]),
+      last_reviewed: frontmatter.meta["last_reviewed"],
+      project_id: frontmatter.meta["project_id"],
+      repository_root: frontmatter.meta["repository_root"],
     },
     digest: createHash("sha256").update(text).digest("hex"),
     allowsLeadTiny: sections.allowsLeadTiny,
@@ -1949,7 +1956,7 @@ export async function readAndValidateProtocol(repoRoot) {
   }
   const digest = createHash("sha256").update(buffer).digest("hex");
   const check = validateProtocol(buffer.toString("utf8"));
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   return { ok: true, protocol: { repoRoot, path, digest, meta: check.meta, allowsLeadTiny: check.allowsLeadTiny } };
 }
 
@@ -1968,7 +1975,7 @@ async function ensureProtocolPin() {
   }
   if (protocolPin === null || protocolPin.repoRoot !== repoRoot) {
     const read = await readAndValidateProtocol(repoRoot);
-    if (!read.ok) return read;
+    if (!read.ok) return { ok: false, error: read.error };
     protocolPin = {
       repoRoot,
       version: read.protocol.meta.version,
@@ -1979,7 +1986,7 @@ async function ensureProtocolPin() {
     return { ok: true };
   }
   const read = await readAndValidateProtocol(repoRoot);
-  if (!read.ok) return read;
+  if (!read.ok) return { ok: false, error: read.error };
   if (read.protocol.meta.project_id !== protocolPin.projectId) {
     return { ok: false, error: "workspace protocol project identity changed from the pinned project_id; a fresh process is required" };
   }
@@ -2040,7 +2047,7 @@ async function activateEnvelope(envelope, route = "direct") {
     return { ok: false, error: "no git repository root is observable for scope validation" };
   }
   const check = await validateScope(repoRoot, envelope.scope, envelope.exclusions);
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   return { ok: true, authority: { envelope, repoRoot, scope: check.scope, exclusions: check.exclusions } };
 }
 
@@ -2199,9 +2206,10 @@ function notebookPathLocator(value, label, { allowUnknown = false } = {}) {
   return { ok: true };
 }
 
-export function validateNotebookManifest(manifest, { rawText } = {}) {
+export function validateNotebookManifest(manifest, options = {}) {
+  const rawText = options["rawText"];
   let check = notebookClosed(manifest, NOTEBOOK_MANIFEST_FIELDS, "notebook manifest");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   for (const [field, expected] of [
     ["contract", NOTEBOOK_CONTRACT], ["contract_version", NOTEBOOK_CONTRACT_VERSION], ["manifest_schema", NOTEBOOK_CONTRACT_VERSION],
   ]) {
@@ -2209,10 +2217,10 @@ export function validateNotebookManifest(manifest, { rawText } = {}) {
   }
   for (const field of ["notebook_id"]) {
     check = notebookId(manifest[field], `manifest.${field}`);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
   }
   check = notebookText(manifest.protocol_project_id, "manifest.protocol_project_id", NOTEBOOK_MAX_PROJECT_ID);
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   try {
     if (deriveNotebookProjectKey(manifest.protocol_project_id) !== manifest.project_key) {
       return { ok: false, error: "manifest.project_key does not equal lowercase sha256(protocol_project_id UTF-8 bytes)" };
@@ -2221,22 +2229,22 @@ export function validateNotebookManifest(manifest, { rawText } = {}) {
     return { ok: false, error: err.message };
   }
   check = notebookPathLocator(manifest.repository_root_at_creation, "manifest.repository_root_at_creation");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   check = notebookText(manifest.paseo_project_id_at_creation, "manifest.paseo_project_id_at_creation", 512);
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   check = notebookTimestamp(manifest.created_at, "manifest.created_at");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   check = notebookClosed(manifest.created_by, NOTEBOOK_CREATED_BY_FIELDS, "manifest.created_by");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   for (const field of NOTEBOOK_CREATED_BY_FIELDS) {
     check = notebookText(manifest.created_by[field], `manifest.created_by.${field}`, 512);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
   }
   if (manifest.creation_route !== "human_confirmed") {
     return { ok: false, error: "manifest.creation_route must be exactly human_confirmed" };
   }
   check = notebookDigestField(manifest.manifest_digest, "manifest.manifest_digest");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (manifest.manifest_digest !== notebookDigest(manifest, "manifest_digest")) {
     return { ok: false, error: "manifest.manifest_digest does not match canonical manifest bytes" };
   }
@@ -2260,19 +2268,19 @@ export function parseNotebookManifest(text) {
 
 function validateNotebookEvidenceItem(item, index) {
   let check = notebookClosed(item, NOTEBOOK_EVIDENCE_FIELDS, `notebook evidence[${index}]`);
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   for (const field of ["item_id", "kind", "source", "selected", "retained_digest"]) {
     check = notebookText(item[field], `notebook evidence[${index}].${field}`, field === "source" ? NOTEBOOK_MAX_SOURCE : NOTEBOOK_MAX_TEXT);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
   }
   check = notebookTimestamp(item.observed_at, `notebook evidence[${index}].observed_at`);
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (item.source_digest !== null) {
     check = notebookDigestField(item.source_digest, `notebook evidence[${index}].source_digest`);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
   }
   check = notebookDigestField(item.retained_digest, `notebook evidence[${index}].retained_digest`);
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (item.retained_digest !== rawDigest(Buffer.from(item.selected, "utf8"))) {
     return { ok: false, error: `notebook evidence[${index}].retained_digest does not match the retained redacted representation` };
   }
@@ -2286,85 +2294,87 @@ function validateNotebookEvidenceItem(item, index) {
 
 function validateNotebookContext(context) {
   let check = notebookClosed(context, NOTEBOOK_CONTEXT_FIELDS, "notebook entry context");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   check = notebookText(context.paseo_project_id, "context.paseo_project_id", 512);
   if (!check.ok || context.paseo_project_id === "unknown") return { ok: false, error: "context.paseo_project_id must be an exact current Paseo project identity" };
   check = notebookPathLocator(context.repository_root, "context.repository_root");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   check = notebookText(context.paseo_workspace_id, "context.paseo_workspace_id", 512);
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   check = notebookText(context.lead_agent_id, "context.lead_agent_id", 512);
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   check = notebookId(context.binding_source, "context.binding_source");
   if (!check.ok && context.binding_source !== "manifest") return check;
   if (context.protocol_pin !== null) {
     check = notebookClosed(context.protocol_pin, NOTEBOOK_PROTOCOL_PIN_FIELDS, "context.protocol_pin");
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
     if (!Number.isSafeInteger(context.protocol_pin.version) || context.protocol_pin.version < 1) {
       return { ok: false, error: "context.protocol_pin.version must be a positive integer" };
     }
     check = notebookDigestField(context.protocol_pin.digest, "context.protocol_pin.digest");
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
   }
   return { ok: true };
 }
 
-export function validateNotebookEntry(entry, { manifest, rawText } = {}) {
+export function validateNotebookEntry(entry, options = {}) {
+  const manifest = options["manifest"];
+  const rawText = options["rawText"];
   let check = notebookClosed(entry, NOTEBOOK_ENTRY_FIELDS, "notebook entry");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (entry.contract !== NOTEBOOK_ENTRY_CONTRACT || entry.schema_version !== NOTEBOOK_CONTRACT_VERSION) {
     return { ok: false, error: "notebook entry contract and schema_version must be exactly v1" };
   }
   check = notebookId(entry.entry_id, "entry.entry_id");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   check = notebookId(entry.notebook_id, "entry.notebook_id");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   check = notebookText(entry.protocol_project_id, "entry.protocol_project_id", NOTEBOOK_MAX_PROJECT_ID);
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   for (const field of ["recorded_at", "observed_at"]) {
     check = notebookTimestamp(entry[field], `entry.${field}`);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
   }
   check = notebookClosed(entry.writer, NOTEBOOK_WRITER_FIELDS, "notebook entry writer");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   for (const field of NOTEBOOK_WRITER_FIELDS) {
     check = notebookText(entry.writer[field], `entry.writer.${field}`, 512);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
   }
   check = validateNotebookContext(entry.context);
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   for (const field of ["observation", "impact", "question", "recommendation"]) {
     check = notebookText(entry[field], `entry.${field}`);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
   }
   if (!Array.isArray(entry.evidence) || entry.evidence.length === 0 || entry.evidence.length > NOTEBOOK_MAX_EVIDENCE) {
     return { ok: false, error: `entry.evidence must contain 1-${NOTEBOOK_MAX_EVIDENCE} items` };
   }
   for (const [index, item] of entry.evidence.entries()) {
     check = validateNotebookEvidenceItem(item, index);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
   }
   check = notebookClosed(entry.suspected_mechanism, NOTEBOOK_MECHANISM_FIELDS, "notebook suspected_mechanism");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   for (const field of ["hypothesis", "uncertainty"]) {
     check = notebookText(entry.suspected_mechanism[field], `suspected_mechanism.${field}`);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
   }
   if (!["low", "medium", "high"].includes(entry.suspected_mechanism.confidence)) {
     return { ok: false, error: "suspected_mechanism.confidence must be low|medium|high" };
   }
   check = notebookClosed(entry.escalation, NOTEBOOK_ESCALATION_FIELDS, "notebook escalation");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (typeof entry.escalation.needed !== "boolean") return { ok: false, error: "escalation.needed must be a boolean" };
   if (!["lead", "human", "none"].includes(entry.escalation.owner)) return { ok: false, error: "escalation.owner must be lead|human|none" };
   check = notebookText(entry.escalation.reason, "escalation.reason");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (entry.escalation.relay_target !== null) {
     check = notebookText(entry.escalation.relay_target, "escalation.relay_target", 512);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
   }
   check = notebookClosed(entry.history, NOTEBOOK_HISTORY_FIELDS, "notebook history");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (!["original", "correction", "supersession", "rebind"].includes(entry.history.relation)) {
     return { ok: false, error: "history.relation must be original|correction|supersession|rebind" };
   }
@@ -2373,26 +2383,26 @@ export function validateNotebookEntry(entry, { manifest, rawText } = {}) {
   }
   for (const [index, reference] of entry.history.references.entries()) {
     check = notebookClosed(reference, NOTEBOOK_REFERENCE_FIELDS, `history.references[${index}]`);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
     check = notebookId(reference.entry_id, `history.references[${index}].entry_id`);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
     check = notebookDigestField(reference.entry_digest, `history.references[${index}].entry_digest`);
-    if (!check.ok) return check;
+    if (!check.ok) return { ok: false, error: check.error };
   }
   if (["correction", "supersession"].includes(entry.history.relation) && entry.history.references.length === 0) {
     return { ok: false, error: `history.${entry.history.relation} requires a prior entry reference` };
   }
   check = notebookText(entry.history.reason, "history.reason");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   check = notebookClosed(entry.sensitivity, NOTEBOOK_SENSITIVITY_FIELDS, "notebook sensitivity");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (!Array.isArray(entry.sensitivity.redactions) || entry.sensitivity.redactions.length > NOTEBOOK_MAX_REDACTION_NOTES
       || entry.sensitivity.redactions.some((item) => typeof item !== "string" || item.trim() === "" || item.length > 512)) {
     return { ok: false, error: "sensitivity.redactions must be a bounded array of nonempty strings" };
   }
   if (entry.sensitivity.contains_secret !== false) return { ok: false, error: "sensitivity.contains_secret must be exactly false" };
   check = notebookDigestField(entry.entry_digest, "entry.entry_digest");
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (manifest !== undefined) {
     if (!manifest || entry.notebook_id !== manifest.notebook_id) return { ok: false, error: "entry.notebook_id does not match the manifest" };
     if (entry.protocol_project_id !== manifest.protocol_project_id) return { ok: false, error: "entry.protocol_project_id does not match the manifest" };
@@ -2407,7 +2417,8 @@ export function validateNotebookEntry(entry, { manifest, rawText } = {}) {
   return { ok: true, entry };
 }
 
-export function parseNotebookEntry(text, { manifest } = {}) {
+export function parseNotebookEntry(text, options = {}) {
+  const manifest = options["manifest"];
   if (typeof text !== "string") return { ok: false, error: "notebook entry must be a string" };
   const duplicate = findDuplicateKey(text);
   if (duplicate !== null) return { ok: false, error: `notebook entry contains duplicate field ${JSON.stringify(duplicate)}` };
@@ -2443,7 +2454,7 @@ async function canonicalConfigRoot(raw, create = false) {
 
 async function assertNoSymlinkComponents(root, target, label, { allowMissing = false } = {}) {
   const containment = safeNotebookComponentPath(root, target, label);
-  if (!containment.ok) return containment;
+  if (!containment.ok) return { ok: false, error: containment.error };
   const rel = relative(root, target);
   let current = root;
   for (const part of rel.split(/[\\/]/).filter(Boolean)) {
@@ -2460,7 +2471,7 @@ async function assertNoSymlinkComponents(root, target, label, { allowMissing = f
 
 async function makePrivateDirectory(path, root, label) {
   const safe = await assertNoSymlinkComponents(root, path, label, { allowMissing: true });
-  if (!safe.ok) return safe;
+  if (!safe.ok) return { ok: false, error: safe.error };
   try {
     await mkdir(path, { recursive: true, mode: 0o700 });
   } catch (err) {
@@ -2471,18 +2482,18 @@ async function makePrivateDirectory(path, root, label) {
 
 async function prepareNotebookPaths(env, projectId, create = false) {
   let root = await canonicalConfigRoot(configDir(env), create);
-  if (!root.ok) return root;
+  if (!root.ok) return { ok: false, error: root.error };
   let paths;
   try { paths = notebookPaths(root.path, projectId); } catch (err) { return { ok: false, error: err.message }; }
   if (create) {
     for (const [path, label] of [[paths.storageRoot, "notebook storage root"], [paths.projectsRoot, "notebook projects root"], [paths.projectRoot, "notebook project directory"], [paths.entriesRoot, "notebook entries directory"], [paths.stagingRoot, "notebook staging directory"]]) {
       const made = await makePrivateDirectory(path, root.path, label);
-      if (!made.ok) return made;
+      if (!made.ok) return { ok: false, error: made.error };
     }
   } else {
     for (const [path, label] of [[paths.storageRoot, "notebook storage root"], [paths.projectsRoot, "notebook projects root"], [paths.projectRoot, "notebook project directory"], [paths.entriesRoot, "notebook entries directory"]]) {
       const check = await assertNoSymlinkComponents(root.path, path, label);
-      if (!check.ok) return check;
+      if (!check.ok) return { ok: false, error: check.error };
     }
   }
   return { ok: true, root: root.path, paths };
@@ -2498,7 +2509,7 @@ async function parseNotebookJson(bytes, label) {
 
 async function readManifestForPaths(prepared) {
   const safe = await assertNoSymlinkComponents(prepared.root, prepared.paths.manifestPath, "notebook manifest path");
-  if (!safe.ok) return safe;
+  if (!safe.ok) return { ok: false, error: safe.error };
   let bytes;
   try { bytes = await readFile(prepared.paths.manifestPath); }
   catch (err) {
@@ -2506,9 +2517,9 @@ async function readManifestForPaths(prepared) {
     return { ok: false, error: `notebook manifest read failed: ${err.message}` };
   }
   const parsed = await parseNotebookJson(bytes, "notebook manifest");
-  if (!parsed.ok) return parsed;
+  if (!parsed.ok) return { ok: false, error: parsed.error };
   const check = validateNotebookManifest(parsed.value, { rawText: parsed.text });
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (parsed.value.project_key !== prepared.paths.projectKey) return { ok: false, error: "manifest project_key does not match its derived notebook directory" };
   return { ok: true, manifest: parsed.value, bytes, rawDigest: rawDigest(bytes) };
 }
@@ -2529,7 +2540,7 @@ async function readValidNotebookEntries(prepared, manifest) {
     const digest = rawDigest(bytes);
     files.push({ filename: name, raw_digest: digest });
     const parsed = await parseNotebookJson(bytes, `notebook entry ${name}`);
-    let check = parsed.ok ? validateNotebookEntry(parsed.value, { manifest, rawText: parsed.text }) : parsed;
+    let check = parsed.ok ? validateNotebookEntry(parsed.value, { manifest, rawText: parsed.text }) : { ok: false, error: parsed.error };
     if (check.ok) {
       if (name !== `${check.entry.entry_id}.json`) check = { ok: false, error: "entry filename does not match entry_id" };
     }
@@ -2563,16 +2574,22 @@ async function syncNotebookDirectory(path) {
 export async function publishNotebookCreateOnly({ storageRoot, finalParent, finalName, bytes }) {
   if (!Buffer.isBuffer(bytes)) bytes = Buffer.from(bytes);
   const safeParent = await assertNoSymlinkComponents(storageRoot, finalParent, "notebook final parent");
-  if (!safeParent.ok) return safeParent;
+  if (!safeParent.ok) return { ok: false, error: safeParent.error };
   if (dirname(join(finalParent, finalName)) !== finalParent || finalName.includes("/") || finalName.includes("\\") || finalName === "." || finalName === "..") {
     return { ok: false, error: "notebook final name must be a direct child of the exact final parent" };
   }
   const stagingRoot = join(storageRoot, ".staging");
   const safeStage = await assertNoSymlinkComponents(storageRoot, stagingRoot, "notebook staging root");
-  if (!safeStage.ok) return safeStage;
+  if (!safeStage.ok) return { ok: false, error: safeStage.error };
   const finalPath = join(finalParent, finalName);
-  const before = await lstat(finalPath).catch((err) => (err.code === "ENOENT" ? null : { error: err }));
-  if (before?.error) return { ok: false, error: `notebook final path cannot be inspected: ${before.error.message}` };
+  let before = null;
+  let inspectError = null;
+  try {
+    before = await lstat(finalPath);
+  } catch (err) {
+    if (err.code !== "ENOENT") inspectError = err;
+  }
+  if (inspectError) return { ok: false, error: `notebook final path cannot be inspected: ${inspectError.message}` };
   if (before && before.isSymbolicLink()) return { ok: false, error: "notebook final path must not be a symlink" };
   if (before && !before.isFile()) return { ok: false, error: "notebook final path is not a regular file" };
   if (before) {
@@ -2653,14 +2670,14 @@ async function findNotebookIdElsewhere(prepared, notebookId) {
     if (!NOTEBOOK_ID.test(name)) continue;
     const candidateRoot = join(prepared.paths.projectsRoot, name);
     const candidateSafety = await assertNoSymlinkComponents(prepared.root, candidateRoot, "notebook project scan path");
-    if (!candidateSafety.ok) return candidateSafety;
+    if (!candidateSafety.ok) return { ok: false, error: candidateSafety.error };
     const candidate = { ...prepared, paths: notebookPaths(prepared.root, "x") };
     candidate.paths.projectRoot = candidateRoot;
     candidate.paths.manifestPath = join(candidate.paths.projectRoot, "manifest.json");
     let bytes;
     try { bytes = await readFile(candidate.paths.manifestPath); } catch (err) { if (err.code === "ENOENT") continue; return { ok: false, error: `notebook manifest scan failed: ${err.message}` }; }
     const parsed = await parseNotebookJson(bytes, "notebook manifest");
-    if (!parsed.ok) return parsed;
+    if (!parsed.ok) return { ok: false, error: parsed.error };
     const check = validateNotebookManifest(parsed.value, { rawText: parsed.text });
     if (!check.ok) return { ok: false, error: `another notebook is malformed: ${check.error}` };
     if (parsed.value.notebook_id === notebookId) return { ok: false, error: "notebook_id already exists under another project key" };
@@ -2681,26 +2698,31 @@ async function canonicalLocator(value, label, allowUnknown = true) {
   }
 }
 
-export async function initializeNotebook({
-  env = process.env, projectId, protocolProjectId, paseoProjectId, repositoryRoot = "unknown",
-  supervisorAgentId, piSessionId, createdAt = new Date().toISOString(),
-} = {}) {
+export async function initializeNotebook(options = {}) {
+  const env = options["env"] ?? process.env;
+  const projectId = options["projectId"];
+  const protocolProjectId = options["protocolProjectId"];
+  const paseoProjectId = options["paseoProjectId"];
+  const repositoryRoot = options["repositoryRoot"] ?? "unknown";
+  const supervisorAgentId = options["supervisorAgentId"];
+  const piSessionId = options["piSessionId"];
+  const createdAt = options["createdAt"] ?? new Date().toISOString();
   const humanProjectId = projectId ?? protocolProjectId;
   if (typeof humanProjectId !== "string" || humanProjectId.length === 0) return { ok: false, error: "protocol project_id is required" };
   const paseo = typeof paseoProjectId === "string" && paseoProjectId.trim() !== "" && paseoProjectId !== "unknown" ? paseoProjectId : null;
   if (paseo === null) return { ok: false, error: "paseo_project_id_at_creation is required" };
   const agent = notebookText(supervisorAgentId, "supervisor_agent_id", 512);
-  if (!agent.ok) return agent;
+  if (!agent.ok) return { ok: false, error: agent.error };
   const session = notebookText(piSessionId, "pi_session_id", 512);
-  if (!session.ok) return session;
+  if (!session.ok) return { ok: false, error: session.error };
   const repo = await canonicalLocator(repositoryRoot, "repository_root_at_creation", true);
-  if (!repo.ok) return repo;
+  if (!repo.ok) return { ok: false, error: repo.error };
   const prepared = await prepareNotebookPaths(env, humanProjectId, true);
-  if (!prepared.ok) return prepared;
+  if (!prepared.ok) return { ok: false, error: prepared.error };
   let notebookId;
   try { notebookId = `nb-${randomUUID()}`; } catch (err) { return { ok: false, error: `notebook identity generation failed: ${err.message}` }; }
   const duplicate = await findNotebookIdElsewhere(prepared, notebookId);
-  if (!duplicate.ok) return duplicate;
+  if (!duplicate.ok) return { ok: false, error: duplicate.error };
   let existing;
   try { existing = await lstat(prepared.paths.manifestPath); } catch (err) { if (err.code !== "ENOENT") return { ok: false, error: `notebook manifest cannot be inspected: ${err.message}` }; }
   if (existing) return { ok: false, error: "notebook manifest already exists; initialization is create-once" };
@@ -2720,35 +2742,35 @@ export async function initializeNotebook({
   };
   manifest.manifest_digest = notebookDigest(manifest, "manifest_digest");
   const check = validateNotebookManifest(manifest);
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   const published = await publishNotebookCreateOnly({
     storageRoot: prepared.paths.storageRoot,
     finalParent: prepared.paths.projectRoot,
     finalName: "manifest.json",
     bytes: notebookBytes(manifest),
   });
-  if (!published.ok) return published;
+  if (!published.ok) return { ok: false, error: published.error };
   if (published.status !== "created") return { ok: false, error: "notebook manifest already exists; initialization is create-once" };
   return { ok: true, manifest, paths: prepared.paths, status: "created" };
 }
 
 async function loadNotebook(prepared) {
   const manifest = await readManifestForPaths(prepared);
-  if (!manifest.ok) return manifest;
+  if (!manifest.ok) return { ok: false, error: manifest.error };
   const entries = await readValidNotebookEntries(prepared, manifest.manifest);
-  if (!entries.ok) return entries;
-  return { ok: true, ...manifest, entries };
+  if (!entries.ok) return { ok: false, error: entries.error };
+  return { ok: true, manifest: manifest.manifest, bytes: manifest.bytes, rawDigest: manifest.rawDigest, entries: { files: entries.files, valid: entries.valid, invalid: entries.invalid } };
 }
 
 function contextForNotebook(options = {}) {
-  const context = options.context ?? {};
+  const context = options["context"] ?? {};
   return {
-    paseo_project_id: context.paseo_project_id ?? context.paseoProjectId ?? options.paseoProjectId ?? "unknown",
-    repository_root: context.repository_root ?? context.repositoryRoot ?? options.repositoryRoot ?? "unknown",
-    paseo_workspace_id: context.paseo_workspace_id ?? context.paseoWorkspaceId ?? options.paseoWorkspaceId ?? "unknown",
-    lead_agent_id: context.lead_agent_id ?? context.leadAgentId ?? options.leadAgentId ?? "unknown",
-    binding_source: context.binding_source ?? context.bindingSource ?? options.bindingSource ?? "manifest",
-    protocol_pin: context.protocol_pin ?? context.protocolPin ?? options.protocolPin ?? null,
+    paseo_project_id: context["paseo_project_id"] ?? context["paseoProjectId"] ?? options["paseoProjectId"] ?? "unknown",
+    repository_root: context["repository_root"] ?? context["repositoryRoot"] ?? options["repositoryRoot"] ?? "unknown",
+    paseo_workspace_id: context["paseo_workspace_id"] ?? context["paseoWorkspaceId"] ?? options["paseoWorkspaceId"] ?? "unknown",
+    lead_agent_id: context["lead_agent_id"] ?? context["leadAgentId"] ?? options["leadAgentId"] ?? "unknown",
+    binding_source: context["binding_source"] ?? context["bindingSource"] ?? options["bindingSource"] ?? "manifest",
+    protocol_pin: context["protocol_pin"] ?? context["protocolPin"] ?? options["protocolPin"] ?? null,
   };
 }
 
@@ -2831,18 +2853,23 @@ function redactNotebookEntry(entry) {
   return value;
 }
 
-export async function appendNotebookEntry({
-  env = process.env, projectId, protocolProjectId, entry, context, allowRebind = false,
-  supervisorAgentId, piSessionId,
-} = {}) {
+export async function appendNotebookEntry(options = {}) {
+  const env = options["env"] ?? process.env;
+  const projectId = options["projectId"];
+  const protocolProjectId = options["protocolProjectId"];
+  const entry = options["entry"];
+  const context = options["context"];
+  const allowRebind = options["allowRebind"] ?? false;
+  const supervisorAgentId = options["supervisorAgentId"];
+  const piSessionId = options["piSessionId"];
   const humanProjectId = projectId ?? protocolProjectId ?? entry?.protocol_project_id;
   if (typeof humanProjectId !== "string" || humanProjectId.length === 0) return { ok: false, error: "protocol project_id is required" };
   const prepared = await prepareNotebookPaths(env, humanProjectId, false);
-  if (!prepared.ok) return prepared;
+  if (!prepared.ok) return { ok: false, error: prepared.error };
   const loaded = await loadNotebook(prepared);
-  if (!loaded.ok) return loaded;
+  if (!loaded.ok) return { ok: false, error: loaded.error };
   const binding = classifyNotebookBinding(loaded, context);
-  if (!binding.ok && !allowRebind) return binding;
+  if (!binding.ok && !allowRebind) return { ok: false, error: binding.error, classification: binding.classification, binding: binding.binding, context: binding.context };
   let candidate;
   try { candidate = redactNotebookEntry(structuredClone(entry)); } catch (err) { return { ok: false, error: err.message }; }
   if (!isRecord(candidate)) return { ok: false, error: "notebook append entry must be an object" };
@@ -2865,7 +2892,7 @@ export async function appendNotebookEntry({
   // entry as written is always self-consistent; prior entries are never touched.
   candidate.entry_digest = notebookDigest(candidate, "entry_digest");
   const check = validateNotebookEntry(candidate, { manifest: loaded.manifest });
-  if (!check.ok) return check;
+  if (!check.ok) return { ok: false, error: check.error };
   if (supervisorAgentId !== undefined && candidate.writer.supervisor_agent_id !== supervisorAgentId) {
     return { ok: false, error: "entry.writer.supervisor_agent_id does not match the current Supervisor identity" };
   }
@@ -2886,17 +2913,20 @@ export async function appendNotebookEntry({
     finalName: `${candidate.entry_id}.json`,
     bytes: notebookBytes(candidate),
   });
-  if (!published.ok) return published;
+  if (!published.ok) return { ok: false, error: published.error, status: published.status, path: published.path, existing_digest: published.existing_digest, incoming_digest: published.incoming_digest };
   return { ok: true, status: published.status, entry: candidate, paths: prepared.paths };
 }
 
-export async function snapshotNotebook({ env = process.env, projectId, protocolProjectId } = {}) {
+export async function snapshotNotebook(options = {}) {
+  const env = options["env"] ?? process.env;
+  const projectId = options["projectId"];
+  const protocolProjectId = options["protocolProjectId"];
   const humanProjectId = projectId ?? protocolProjectId;
   if (typeof humanProjectId !== "string" || humanProjectId.length === 0) return { ok: false, error: "protocol project_id is required" };
   const prepared = await prepareNotebookPaths(env, humanProjectId, false);
-  if (!prepared.ok) return prepared;
+  if (!prepared.ok) return { ok: false, error: prepared.error };
   const loaded = await loadNotebook(prepared);
-  if (!loaded.ok) return loaded;
+  if (!loaded.ok) return { ok: false, error: loaded.error };
   const physical = loaded.entries.files.sort((a, b) => a.filename.localeCompare(b.filename));
   const snapshotDigest = `sha256:${createHash("sha256").update(canonicalNotebookJson({ manifest_digest: loaded.rawDigest, entries: physical })).digest("hex")}`;
   const projection = loaded.entries.valid.sort((a, b) => a.entry_id.localeCompare(b.entry_id));
@@ -3020,7 +3050,7 @@ const DOCTOR_STATUSES = ["PASS", "WARN", "BLOCKED"];
 const DOCTOR_STATUS_RANK = { PASS: 0, WARN: 1, BLOCKED: 2 };
 const DOCTOR_CHECK_CODES = [
   "CONTEXT_CWD", "GIT_REPOSITORY", "GIT_WORKTREE", "PI_CAPABILITIES", "PACKAGE_PROVENANCE",
-  "PASEO_IDENTITY", "ADAPTER_OBSERVER", "ROLE_ACTIVATION", "ROLE_SETTINGS", "ROLE_PROFILE",
+  "PASEO_IDENTITY", "ADAPTER_OBSERVER", "OBSERVER_ATTESTATION", "ROLE_ACTIVATION", "ROLE_SETTINGS", "ROLE_PROFILE",
   "WORKSPACE_PROTOCOL", "TOOL_POLICY", "AUTHORITY_STATE",
 ];
 
@@ -3030,9 +3060,9 @@ function doctorRemediation(status, owner, action) {
 }
 
 function doctorCheck(code, subject, status, expected, observed, evidence = [], remediation = {}) {
-  const owner = remediation.owner ?? (status === "BLOCKED" ? "operator" : "human");
+  const owner = remediation["owner"] ?? (status === "BLOCKED" ? "operator" : "human");
   return {
-    code, subject, applicable: remediation.applicable !== false, required: remediation.required !== false,
+    code, subject, applicable: remediation["applicable"] !== false, required: remediation["required"] !== false,
     status, expected: redactDoctorText(expected), observed: redactDoctorText(observed),
     evidence: evidence.map((item) => ({
       kind: item.kind ?? "memory", source: redactDoctorText(item.source ?? "doctor"),
@@ -3040,7 +3070,7 @@ function doctorCheck(code, subject, status, expected, observed, evidence = [], r
       exit_code: item.exit_code ?? null,
       output: item.output === null || item.output === undefined ? null : redactDoctorText(item.output, 500),
     })),
-    remediation: doctorRemediation(status, owner, remediation.action),
+    remediation: doctorRemediation(status, owner, remediation["action"]),
   };
 }
 
@@ -3111,34 +3141,82 @@ async function doctorPaseoObservation(ctx, env, role) {
   const observer = ctx?.observeCurrentAgent
     ?? ctx?.paseoObserver?.observeCurrentAgent
     ?? ctx?.paseo?.observeCurrentAgent;
-  if (typeof observer !== "function") {
-    return {
-      status: role === "lead" || role === "supervisor" ? "BLOCKED" : "WARN",
-      reason: "adapter observer not yet verified",
-      observation: null,
-      agentId,
-    };
+  if (typeof observer === "function") {
+    let observation;
+    try {
+      // One bounded read-only observation. There is intentionally no retry or
+      // alternate target when this capability is unavailable.
+      const result = Promise.resolve(observer({ agent_id: agentId }));
+      observation = await Promise.race([
+        result,
+        new Promise((resolve) => setTimeout(() => resolve({ __timeout: true }), 1500)),
+      ]);
+    } catch (err) {
+      return { status: role === "lead" || role === "supervisor" ? "BLOCKED" : "WARN", reason: `adapter observer unavailable: ${err.message}`, observation: null, agentId };
+    }
+    if (!observation || observation.__timeout) {
+      return { status: role === "lead" || role === "supervisor" ? "BLOCKED" : "WARN", reason: "adapter observer timed out", observation: null, agentId };
+    }
+    const shape = validatePaseoObservation(observation, agentId);
+    if (!shape.ok) {
+      return { status: role === "lead" || role === "supervisor" ? "BLOCKED" : "WARN", reason: shape.error, observation, agentId };
+    }
+    return { status: "PASS", reason: "public current-agent observer returned the complete current-agent tuple", observation, agentId };
   }
-  let observation;
+  // No adapter-provided observer is loaded (pi-mcp-adapter v2.23.0 has no
+  // Paseo integration). Fall back to the independently installed Paseo CLI —
+  // read-only, fixed agent identity, provenance-checkable. This proves
+  // identity/model/thinking/parent/cwd; workspace binding and MCP-config
+  // attestation are not observable through the CLI and are reported
+  // separately by OBSERVER_ATTESTATION (never claimed as proven).
+  if (agentId === "") {
+    return { status: role === "lead" || role === "supervisor" ? "BLOCKED" : "WARN", reason: "no Paseo agent identity to observe", observation: null, agentId };
+  }
+  const observed = await observePaseoCurrentAgent(agentId, { env });
+  if (!observed.ok) {
+    return { status: role === "lead" || role === "supervisor" ? "BLOCKED" : "WARN", reason: observed.error, observation: null, agentId };
+  }
+  const runtime = observed.observation.runtimeInfo;
+  if (typeof runtime.model !== "string" || runtime.model === "" || typeof runtime.thinkingOptionId !== "string" || runtime.thinkingOptionId === "") {
+    return { status: role === "lead" || role === "supervisor" ? "BLOCKED" : "WARN", reason: "paseo CLI observer cannot prove model/thinking for the current agent", observation: observed.observation, agentId };
+  }
+  return { status: "PASS", reason: "paseo CLI current-agent observation proved identity, model, thinking, parent, and cwd", observation: observed.observation, agentId };
+}
+
+// Reads the exact current-agent tuple through the installed Paseo CLI
+// (`paseo inspect <id> --json`). One bounded read-only call, fixed identity,
+// no retry, no alternate target, no mutation.
+export async function observePaseoCurrentAgent(agentId, { env = process.env, timeoutMs = 15000 } = {}) {
+  const id = (agentId ?? "").trim();
+  if (id === "") return { ok: false, error: "no Paseo agent identity to observe" };
+  const output = await execFileAsync("paseo", ["inspect", id, "--json"], { env, timeout: timeoutMs })
+    .then(({ stdout }) => ({ stdout: stdout.trim(), error: null }))
+    .catch((err) => ({ stdout: "", error: `paseo inspect failed: ${err.message}` }));
+  if (output.error) return { ok: false, error: output.error };
+  if (output.stdout === "") return { ok: false, error: "paseo inspect returned no output" };
+  let raw;
   try {
-    // One bounded read-only observation. There is intentionally no retry or
-    // alternate target when this capability is unavailable.
-    const result = Promise.resolve(observer({ agent_id: agentId }));
-    observation = await Promise.race([
-      result,
-      new Promise((resolve) => setTimeout(() => resolve({ __timeout: true }), 1500)),
-    ]);
-  } catch (err) {
-    return { status: role === "lead" || role === "supervisor" ? "BLOCKED" : "WARN", reason: `adapter observer unavailable: ${err.message}`, observation: null, agentId };
+    raw = JSON.parse(output.stdout);
+  } catch {
+    return { ok: false, error: "paseo inspect returned non-JSON output" };
   }
-  if (!observation || observation.__timeout) {
-    return { status: role === "lead" || role === "supervisor" ? "BLOCKED" : "WARN", reason: "adapter observer timed out", observation: null, agentId };
-  }
-  const shape = validatePaseoObservation(observation, agentId);
-  if (!shape.ok) {
-    return { status: role === "lead" || role === "supervisor" ? "BLOCKED" : "WARN", reason: shape.error, observation, agentId };
-  }
-  return { status: "PASS", reason: "public current-agent observer returned the complete current-agent tuple", observation, agentId };
+  if (!isRecord(raw)) return { ok: false, error: "paseo inspect returned a non-object payload" };
+  if (raw.Id !== id) return { ok: false, error: `paseo inspect returned identity ${JSON.stringify(raw.Id)} instead of the requested agent ${JSON.stringify(id)}` };
+  const observation = {
+    agent_id: raw.Id,
+    provider: typeof raw.Provider === "string" ? raw.Provider : null,
+    status: typeof raw.Status === "string" ? raw.Status : null,
+    cwd: typeof raw.Cwd === "string" ? raw.Cwd : null,
+    parent_agent_id: typeof raw.ParentAgentId === "string" && raw.ParentAgentId !== "" ? raw.ParentAgentId : null,
+    runtimeInfo: {
+      model: typeof raw.Model === "string" ? raw.Model : null,
+      thinkingOptionId: typeof raw.Thinking === "string" ? raw.Thinking : null,
+    },
+    workspace_id: null,
+    mcp_configuration_attested: false,
+    source: "paseo-cli",
+  };
+  return { ok: true, observation };
 }
 
 function doctorActivation(roleCheck) {
@@ -3180,7 +3258,11 @@ function doctorEffectiveToolReport(pi, role) {
   return { actual, base, expected, requested, effective };
 }
 
-export async function buildDoctorReport({ ctx = {}, pi = {}, now, reportId } = {}) {
+export async function buildDoctorReport(options = {}) {
+  const ctx = options["ctx"] ?? {};
+  const pi = options["pi"] ?? {};
+  const now = options["now"];
+  const reportId = options["reportId"];
   const startedAt = doctorNow(now);
   const env = envOf(ctx);
   const roleCheck = parseRole(env);
@@ -3222,7 +3304,16 @@ export async function buildDoctorReport({ ctx = {}, pi = {}, now, reportId } = {
     : role ? (paseo.status === "PASS" && paseo.observation?.agent_id === (env[AGENT_ENV] ?? "").trim() ? "PASS" : "BLOCKED") : "WARN";
   checks.push(doctorCheck("PASEO_IDENTITY", "Paseo current-agent identity", paseoIdentityStatus, role ? "PASEO_AGENT_ID is nonempty" : "identity is not required for passive mode", (env[AGENT_ENV] ?? "").trim() || "absent", [{ kind: "env", source: AGENT_ENV, output: (env[AGENT_ENV] ?? "").trim() ? "present" : "absent" }], { owner: "operator", action: "Set the exact Paseo agent identity before governed work." }));
   const observerOwner = role === "supervisor" ? "supervisor" : role === "lead" ? "lead" : "operator";
-  checks.push(doctorCheck("ADAPTER_OBSERVER", "public current-agent observation capability", paseo.status, "the already-loaded adapter proves exact current-agent observation", paseo.reason, [{ kind: "api", source: "public current-agent observer", output: paseo.observation ? "verified" : "unavailable" }], { owner: observerOwner, action: paseo.status === "BLOCKED" ? "Install/configure the public adapter current-agent observer, then rerun doctor." : "Use a configured adapter observer when governed live facts are needed." }));
+  checks.push(doctorCheck("ADAPTER_OBSERVER", "public current-agent observation capability", paseo.status, "the already-loaded adapter or Paseo CLI proves exact current-agent observation", paseo.reason, [{ kind: "api", source: paseo.observation?.source ?? "public current-agent observer", output: paseo.observation ? "verified" : "unavailable" }], { owner: observerOwner, action: paseo.status === "BLOCKED" ? "Start the Paseo daemon and verify the exact agent identity, then rerun doctor." : "Use a configured observer when governed live facts are needed." }));
+  // Workspace binding and MCP-configuration attestation are required
+  // observations that neither the installed pi-mcp-adapter (no Paseo
+  // integration) nor the Paseo CLI currently proves. Capability-first: never
+  // claimed as proven, surfaced as an explicit WARN with the exact pieces.
+  const unverified = [];
+  if (!paseo.observation?.workspace_id) unverified.push("workspace_binding");
+  if (paseo.observation?.mcp_configuration_attested !== true) unverified.push("mcp_configuration_attestation");
+  const attestationStatus = unverified.length === 0 ? "PASS" : "WARN";
+  checks.push(doctorCheck("OBSERVER_ATTESTATION", "workspace binding and MCP-configuration attestation", attestationStatus, "the observation proves the typed workspace binding and MCP-configuration attestation", unverified.length === 0 ? "all attested" : `unverified: ${unverified.join(", ")}`, [{ kind: "api", source: "current observation tuple", output: unverified.length === 0 ? "attested" : unverified.join(", ") }], { owner: "operator", action: "Provide an observer that proves the typed workspace binding and MCP-configuration attestation, or accept the WARN as the environment ceiling.", applicable: role !== null, required: role !== null }));
 
   if (!roleCheck.ok) {
     checks.push(doctorCheck("ROLE_ACTIVATION", "role activation", "BLOCKED", "PI_PASEO_ORCHESTRATION_ROLE is supervisor|lead|peer or empty", roleCheck.error, [{ kind: "env", source: ROLE_ENV, output: redactDoctorText(env[ROLE_ENV] ?? "absent") }], { owner: "human", action: "Correct the role environment and start a fresh process." }));
@@ -3385,7 +3476,7 @@ function validateDoctorEvidence(item) {
   if (!isRecord(item)) return { ok: false, error: "doctor evidence must be an object" };
   const fields = ["kind", "source", "digest", "exit_code", "output"];
   const closed = notebookClosed(item, fields, "doctor evidence");
-  if (!closed.ok) return closed;
+  if (!closed.ok) return { ok: false, error: closed.error };
   if (typeof item.kind !== "string" || item.kind.trim() === "") return { ok: false, error: "doctor evidence.kind must be nonempty" };
   if (typeof item.source !== "string" || item.source.trim() === "") return { ok: false, error: "doctor evidence.source must be nonempty" };
   if (item.digest !== null && !NOTEBOOK_DIGEST.test(item.digest)) return { ok: false, error: "doctor evidence.digest must be null or sha256 digest" };
@@ -3405,61 +3496,61 @@ export function parseDoctorReport(text) {
   try { report = JSON.parse(body); } catch { return { ok: false, error: "doctor report body is not valid JSON" }; }
   const fields = ["report_id", "started_at", "finished_at", "doctor", "overall_status", "activation", "target", "compatibility", "checks", "policy", "mutations", "limitations"];
   let check = notebookClosed(report, fields, "doctor report");
-  if (!check.ok) return check;
-  check = notebookId(report.report_id, "doctor report.report_id"); if (!check.ok) return check;
-  for (const field of ["started_at", "finished_at"]) { check = notebookTimestamp(report[field], `doctor report.${field}`); if (!check.ok) return check; }
+  if (!check.ok) return { ok: false, error: check.error };
+  check = notebookId(report.report_id, "doctor report.report_id"); if (!check.ok) return { ok: false, error: check.error };
+  for (const field of ["started_at", "finished_at"]) { check = notebookTimestamp(report[field], `doctor report.${field}`); if (!check.ok) return { ok: false, error: check.error }; }
   if (!DOCTOR_STATUSES.includes(report.overall_status)) return { ok: false, error: "doctor report.overall_status is invalid" };
   if (!["governed", "ungoverned", "blocked"].includes(report.activation)) return { ok: false, error: "doctor report.activation is invalid" };
-  check = notebookClosed(report.doctor, ["contract_version", "package_version", "source"], "doctor report.doctor"); if (!check.ok) return check;
+  check = notebookClosed(report.doctor, ["contract_version", "package_version", "source"], "doctor report.doctor"); if (!check.ok) return { ok: false, error: check.error };
   if (report.doctor.contract_version !== "v1" || typeof report.doctor.package_version !== "string") return { ok: false, error: "doctor report doctor metadata is malformed" };
-  check = notebookClosed(report.doctor.source, ["scope", "origin", "source", "digest"], "doctor report source"); if (!check.ok) return check;
-  for (const field of ["scope", "origin", "source"]) { check = notebookText(report.doctor.source[field], `doctor report source.${field}`, 2000); if (!check.ok) return check; }
-  check = notebookDigestField(report.doctor.source.digest, "doctor report source.digest"); if (!check.ok) return check;
-  check = notebookClosed(report.target, ["cwd", "repository_root", "pi_session_id", "paseo_agent_id", "workspace_id", "paseo_project_id", "protocol_project_id", "role"], "doctor report target"); if (!check.ok) return check;
-  for (const field of ["cwd", "repository_root", "pi_session_id", "paseo_agent_id", "workspace_id", "paseo_project_id", "protocol_project_id"]) { check = validateDoctorNullableString(report.target[field], `doctor report target.${field}`); if (!check.ok) return check; }
+  check = notebookClosed(report.doctor.source, ["scope", "origin", "source", "digest"], "doctor report source"); if (!check.ok) return { ok: false, error: check.error };
+  for (const field of ["scope", "origin", "source"]) { check = notebookText(report.doctor.source[field], `doctor report source.${field}`, 2000); if (!check.ok) return { ok: false, error: check.error }; }
+  check = notebookDigestField(report.doctor.source.digest, "doctor report source.digest"); if (!check.ok) return { ok: false, error: check.error };
+  check = notebookClosed(report.target, ["cwd", "repository_root", "pi_session_id", "paseo_agent_id", "workspace_id", "paseo_project_id", "protocol_project_id", "role"], "doctor report target"); if (!check.ok) return { ok: false, error: check.error };
+  for (const field of ["cwd", "repository_root", "pi_session_id", "paseo_agent_id", "workspace_id", "paseo_project_id", "protocol_project_id"]) { check = validateDoctorNullableString(report.target[field], `doctor report target.${field}`); if (!check.ok) return { ok: false, error: check.error }; }
   if (report.target.role !== null && !ROLES.includes(report.target.role)) return { ok: false, error: "doctor report target.role is invalid" };
   if (!Array.isArray(report.compatibility) || !Array.isArray(report.checks) || !Array.isArray(report.limitations)) return { ok: false, error: "doctor report arrays are malformed" };
   let previous = "";
   for (const component of report.compatibility) {
-    check = notebookClosed(component, ["component", "version", "strategy", "required_capabilities", "missing_capabilities", "floor", "status"], "doctor compatibility"); if (!check.ok) return check;
+    check = notebookClosed(component, ["component", "version", "strategy", "required_capabilities", "missing_capabilities", "floor", "status"], "doctor compatibility"); if (!check.ok) return { ok: false, error: check.error };
     if (typeof component.component !== "string" || component.component <= previous) return { ok: false, error: "doctor compatibility must be deterministically ordered" };
     previous = component.component;
     if (!DOCTOR_STATUSES.includes(component.status) || !["capability", "floor"].includes(component.strategy)
         || !Array.isArray(component.required_capabilities) || !Array.isArray(component.missing_capabilities)
         || !component.required_capabilities.every((item) => typeof item === "string")
         || !component.missing_capabilities.every((item) => typeof item === "string")) return { ok: false, error: "doctor compatibility item is malformed" };
-    check = validateDoctorNullableString(component.version, "doctor compatibility.version"); if (!check.ok) return check;
-    check = validateDoctorNullableString(component.floor, "doctor compatibility.floor"); if (!check.ok) return check;
+    check = validateDoctorNullableString(component.version, "doctor compatibility.version"); if (!check.ok) return { ok: false, error: check.error };
+    check = validateDoctorNullableString(component.floor, "doctor compatibility.floor"); if (!check.ok) return { ok: false, error: check.error };
   }
   const codes = new Set();
   let previousCode = "";
   for (const item of report.checks) {
-    check = notebookClosed(item, ["code", "subject", "applicable", "required", "status", "expected", "observed", "evidence", "remediation"], "doctor check"); if (!check.ok) return check;
+    check = notebookClosed(item, ["code", "subject", "applicable", "required", "status", "expected", "observed", "evidence", "remediation"], "doctor check"); if (!check.ok) return { ok: false, error: check.error };
     if (codes.has(item.code)) return { ok: false, error: "doctor check codes must be unique" };
     codes.add(item.code);
     if (typeof item.code !== "string" || item.code.trim() === "" || item.code <= previousCode) return { ok: false, error: "doctor checks must be deterministically ordered" };
     previousCode = item.code;
     if (DOCTOR_STATUSES.includes(item.status) === false || typeof item.applicable !== "boolean" || typeof item.required !== "boolean" || !Array.isArray(item.evidence)) return { ok: false, error: "doctor check is malformed" };
-    for (const field of ["subject", "expected", "observed"]) { check = notebookText(item[field], `doctor check.${field}`, 4000); if (!check.ok) return check; }
-    for (const evidence of item.evidence) { check = validateDoctorEvidence(evidence); if (!check.ok) return check; }
-    check = notebookClosed(item.remediation, ["owner", "action", "commands", "rerun_required"], "doctor remediation"); if (!check.ok) return check;
+    for (const field of ["subject", "expected", "observed"]) { check = notebookText(item[field], `doctor check.${field}`, 4000); if (!check.ok) return { ok: false, error: check.error }; }
+    for (const evidence of item.evidence) { check = validateDoctorEvidence(evidence); if (!check.ok) return { ok: false, error: check.error }; }
+    check = notebookClosed(item.remediation, ["owner", "action", "commands", "rerun_required"], "doctor remediation"); if (!check.ok) return { ok: false, error: check.error };
     if (item.remediation.owner !== null && !["human", "operator", "lead", "supervisor"].includes(item.remediation.owner)) return { ok: false, error: "doctor remediation.owner is invalid" };
-    check = validateDoctorNullableString(item.remediation.action, "doctor remediation.action"); if (!check.ok) return check;
+    check = validateDoctorNullableString(item.remediation.action, "doctor remediation.action"); if (!check.ok) return { ok: false, error: check.error };
     if (!Array.isArray(item.remediation.commands) || typeof item.remediation.rerun_required !== "boolean") return { ok: false, error: "doctor remediation is malformed" };
     for (const command of item.remediation.commands) {
-      check = notebookClosed(command, ["command", "mutates"], "doctor remediation command"); if (!check.ok) return check;
+      check = notebookClosed(command, ["command", "mutates"], "doctor remediation command"); if (!check.ok) return { ok: false, error: check.error };
       if (typeof command.command !== "string" || typeof command.mutates !== "boolean") return { ok: false, error: "doctor remediation command is malformed" };
     }
   }
-  check = notebookClosed(report.policy, ["session_baseline", "role_ceiling", "authority_state", "requested_capabilities", "effective_tools"], "doctor policy"); if (!check.ok) return check;
-  for (const field of ["session_baseline", "role_ceiling", "requested_capabilities"]) { check = validateDoctorStringArray(report.policy[field], `doctor policy.${field}`); if (!check.ok) return check; }
+  check = notebookClosed(report.policy, ["session_baseline", "role_ceiling", "authority_state", "requested_capabilities", "effective_tools"], "doctor policy"); if (!check.ok) return { ok: false, error: check.error };
+  for (const field of ["session_baseline", "role_ceiling", "requested_capabilities"]) { check = validateDoctorStringArray(report.policy[field], `doctor policy.${field}`); if (!check.ok) return { ok: false, error: check.error }; }
   if (!["none", "valid", "rejected", "stale_inactive"].includes(report.policy.authority_state)) return { ok: false, error: "doctor policy authority_state is invalid" };
   if (!Array.isArray(report.policy.effective_tools)) return { ok: false, error: "doctor policy.effective_tools must be an array" };
   for (const tool of report.policy.effective_tools) {
-    check = notebookClosed(tool, ["name", "source", "state", "reason"], "doctor policy tool"); if (!check.ok) return check;
+    check = notebookClosed(tool, ["name", "source", "state", "reason"], "doctor policy tool"); if (!check.ok) return { ok: false, error: check.error };
     if (typeof tool.name !== "string" || typeof tool.source !== "string" || !["active", "inactive", "unavailable"].includes(tool.state) || typeof tool.reason !== "string") return { ok: false, error: "doctor policy tool is malformed" };
   }
-  check = notebookClosed(report.mutations, ["attempted", "performed"], "doctor mutations"); if (!check.ok) return check;
+  check = notebookClosed(report.mutations, ["attempted", "performed"], "doctor mutations"); if (!check.ok) return { ok: false, error: check.error };
   if (report.mutations.attempted !== false || report.mutations.performed !== false) return { ok: false, error: "doctor report must assert no mutation" };
   if (report.limitations.some((item) => typeof item !== "string" || item.trim() === "")) return { ok: false, error: "doctor limitations must be nonempty strings" };
   return { ok: true, report };
@@ -3753,7 +3844,7 @@ export function getProtocolPin() {
   return protocolPin === null ? null : { ...protocolPin };
 }
 
-// ─── Lát 8: package verification and release gate ────────────────────────────
+// ─── Slice 8: package verification and release gate ────────────────────────────
 
 // Canonical package resources: the manifest-declared extension and skill plus
 // the three private profile resources. Everything resolves from loaded-module/
@@ -3824,7 +3915,7 @@ export async function resolvePackageResources(moduleUrl = import.meta.url) {
     ["skill", manifest.pi.skills[0]],
     ...BUNDLED_PROFILE_FILES.map((file) => [`profile ${file}`, join("profiles", file)]),
   ];
-  const resources = { package_root: realRoot, profiles: {} };
+  const resources = { package_root: realRoot, profiles: {}, extension: null, skill: null };
   for (const [label, rel] of declared) {
     if (isAbsolute(rel)) return { ok: false, error: `${label} must be a direct descendant of the package root (absolute path)` };
     const full = join(realRoot, rel);
@@ -3877,7 +3968,7 @@ const RELEASE_FACTS = [
 const RELEASE_CAPABILITIES = [
   { capability: "pi_api", condition: "required Pi extension APIs (getActiveTools, setActiveTools, setModel, setThinkingLevel) are present", owner: "operator", action: "Use a Pi process exposing the required extension APIs." },
   { capability: "paseo_live", condition: "live Paseo daemon/client identity, cwd, and typed workspace binding are observable", owner: "operator", action: "Start the Paseo daemon and client and rerun doctor until live facts are PASS." },
-  { capability: "adapter_current_agent_observer", condition: "the public current-agent observer proves exact current-agent observation through the independently installed pi-mcp-adapter", owner: "operator", action: "Install and verify the public pi-mcp-adapter current-agent observer; the release gate accepts no fallback." },
+  { capability: "adapter_current_agent_observer", condition: "the public current-agent observer (adapter-provided or the independently installed Paseo CLI) proves exact current-agent identity, model, thinking, parent, and cwd", owner: "operator", action: "Start the Paseo daemon, verify the exact agent identity through the installed observer, and rerun the release smoke on the exact commit." },
 ];
 
 function releaseFactState(value) {

@@ -7,6 +7,7 @@
   ],
   "scripts": {
     "test": "node --test test/package.test.mjs",
+    "typecheck": "tsc --noEmit",
     "release:smoke": "node test/release-smoke.mjs"
   },
   "pi": {
@@ -16,5 +17,9 @@
     "skills": [
       "./skills/workspace-protocol/SKILL.md"
     ]
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "5.9"
   }
 }
