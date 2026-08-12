@@ -245,7 +245,8 @@ async function main() {
     setActiveTools: (tools) => { holder.activeTools = [...tools]; },
     getActiveTools: () => [...holder.activeTools],
     setModel: (model) => { holder.modelCalls.push(["setModel", model.provider, model.id]); return true; },
-    setThinkingLevel: (level) => { holder.modelCalls.push(["setThinkingLevel", level]); return level; },
+    setThinkingLevel: (level) => { holder.modelCalls.push(["setThinkingLevel", level]); holder.thinking = level; },
+      getThinkingLevel: () => holder.thinking,
   };
   extension.default(pi);
   const ctx = {

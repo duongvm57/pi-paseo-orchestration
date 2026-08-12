@@ -50,7 +50,7 @@ const fakePi = (ctxOverrides = {}) => {
   const commands = new Map();
   const tools = new Map();
   const notifications = [];
-  const holder = { activeTools: [...(ctxOverrides.activeTools ?? [])], modelCalls: [] };
+  const holder = { activeTools: [...(ctxOverrides.activeTools ?? [])], modelCalls: [], thinking: runtimeThinking };
   const ui = {
     select: async () => null,
     confirm: async () => false,
@@ -80,7 +80,8 @@ const fakePi = (ctxOverrides = {}) => {
       setActiveTools: (tools) => { holder.activeTools = [...tools]; },
       getActiveTools: () => [...holder.activeTools],
       setModel: (model) => { holder.modelCalls.push(["setModel", model.provider, model.id]); return true; },
-      setThinkingLevel: (level) => { holder.modelCalls.push(["setThinkingLevel", level]); return level; },
+      setThinkingLevel: (level) => { holder.modelCalls.push(["setThinkingLevel", level]); holder.thinking = level; },
+      getThinkingLevel: () => holder.thinking,
     },
     ctx: {
       ui,
@@ -400,17 +401,25 @@ test("activate: governed role requires agent id, settings snapshot, profile, and
   try {
     const baseEnv = { PI_PASEO_ORCHESTRATION_ROLE: "lead", PASEO_AGENT_ID: "agent-7" };
 
-    const noAgent = await ext.activate({ env: { ...baseEnv, PASEO_AGENT_ID: "" }, dir, profileDir: profiles, models: baseModels(), setModel: async () => true, setThinkingLevel: async (l) => l });
+    const noAgent = await ext.activate({ env: { ...baseEnv, PASEO_AGENT_ID: "" }, dir, profileDir: profiles, models: baseModels(), setModel: async () => true, setThinkingLevel: (l) => {}, getThinkingLevel: () => "medium" });
     assert.equal(noAgent.ok, false);
 
-    const noSettings = await ext.activate({ env: baseEnv, dir, profileDir: profiles, models: baseModels(), setModel: async () => true, setThinkingLevel: async (l) => l });
+    const noSettings = await ext.activate({ env: baseEnv, dir, profileDir: profiles, models: baseModels(), setModel: async () => true, setThinkingLevel: (l) => {}, getThinkingLevel: () => "medium" });
     assert.equal(noSettings.ok, false);
 
     await writeSettings(dir, validDoc);
-    const unknownModel = await ext.activate({ env: { ...baseEnv, PI_PASEO_ORCHESTRATION_ROLE: "peer" }, dir, profileDir: profiles, models: [{ provider: "nope", id: "nope" }], setModel: async () => true, setThinkingLevel: async (l) => l });
+    const unknownModel = await ext.activate({ env: { ...baseEnv, PI_PASEO_ORCHESTRATION_ROLE: "peer" }, dir, profileDir: profiles, models: [{ provider: "nope", id: "nope" }], setModel: async () => true, setThinkingLevel: (l) => {}, getThinkingLevel: () => "off" });
     assert.equal(unknownModel.ok, false);
 
-    const ok = await ext.activate({ env: baseEnv, dir, profileDir: profiles, models: baseModels(), setModel: async () => true, setThinkingLevel: async (l) => l });
+    // setThinkingLevel returns void in the real Pi API; the effective level
+    // must be read back. A clamped level (read-back mismatch) blocks.
+    const clamped = await ext.activate({ env: baseEnv, dir, profileDir: profiles, models: baseModels(), setModel: async () => true, setThinkingLevel: (l) => {}, getThinkingLevel: () => "off" });
+    assert.equal(clamped.ok, false);
+    assert.match(clamped.error, /unavailable or clamped/);
+    const noObservation = await ext.activate({ env: baseEnv, dir, profileDir: profiles, models: baseModels(), setModel: async () => true, setThinkingLevel: (l) => {} });
+    assert.equal(noObservation.ok, false);
+
+    const ok = await ext.activate({ env: baseEnv, dir, profileDir: profiles, models: baseModels(), setModel: async () => true, setThinkingLevel: (l) => {}, getThinkingLevel: () => "medium" });
     assert.equal(ok.ok, true);
     assert.equal(ok.latch.role, "lead");
     assert.equal(ok.latch.agentId, "agent-7");
@@ -419,7 +428,7 @@ test("activate: governed role requires agent id, settings snapshot, profile, and
     assert.equal(ok.latch.profileDigest, digestOf(ok.latch.profileText));
 
     // Passive role latches nothing.
-    const passive = await ext.activate({ env: { PASEO_AGENT_ID: "agent-7" }, dir, profileDir: profiles, models: baseModels(), setModel: async () => true, setThinkingLevel: async (l) => l });
+    const passive = await ext.activate({ env: { PASEO_AGENT_ID: "agent-7" }, dir, profileDir: profiles, models: baseModels(), setModel: async () => true, setThinkingLevel: (l) => {}, getThinkingLevel: () => "medium" });
     assert.equal(passive.ok, true);
     assert.equal(passive.latch, null);
   } finally {
@@ -436,7 +445,7 @@ test("verifyLatch: settings, profile, role, or agent drift blocks; unchanged pas
     await writeSettings(dir, validDoc);
     const baseEnv = { PI_PASEO_ORCHESTRATION_ROLE: "lead", PASEO_AGENT_ID: "agent-7" };
     const runtime = { model: baseModels()[0], thinkingLevel: "medium" };
-    const { latch } = await ext.activate({ env: baseEnv, dir, profileDir: profiles, models: baseModels(), setModel: async () => true, setThinkingLevel: async (l) => l });
+    const { latch } = await ext.activate({ env: baseEnv, dir, profileDir: profiles, models: baseModels(), setModel: async () => true, setThinkingLevel: (l) => {}, getThinkingLevel: () => "medium" });
 
     assert.equal((await ext.verifyLatch(latch, baseEnv, dir, runtime)).ok, true);
 

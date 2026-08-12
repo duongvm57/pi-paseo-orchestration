@@ -207,7 +207,7 @@ async function findModel(models, provider, id) {
 // First successful activation latches role, agent identity, settings snapshot,
 // profile source, and profile digest. Everything later is drift-checked against
 // this latch; a fresh Paseo process is required to change the role.
-export async function activate({ env, dir, profileDir, models, setModel, setThinkingLevel }) {
+export async function activate({ env, dir, profileDir, models, setModel, setThinkingLevel, getThinkingLevel }) {
   const roleCheck = parseRole(env);
   if (!roleCheck.ok) return { ok: false, error: roleCheck.error };
   if (roleCheck.role === null) return { ok: true, latch: null };
@@ -252,9 +252,19 @@ export async function activate({ env, dir, profileDir, models, setModel, setThin
   if (!applied) return { ok: false, error: `model ${sel.provider}/${sel.model} is unavailable or unauthenticated` };
 
   if (typeof setThinkingLevel !== "function") return { ok: false, error: "thinking level API is unavailable" };
+  try {
+    setThinkingLevel(sel.thinking);
+  } catch {
+    return { ok: false, error: `thinking level ${sel.thinking} is unavailable or clamped to ${String(null)}` };
+  }
+  // setThinkingLevel returns void in the Pi API; the effective level must be
+  // read back. Unobservable or clamped states block (fail closed).
+  if (typeof getThinkingLevel !== "function") {
+    return { ok: false, error: "thinking level observation API is unavailable" };
+  }
   let effective;
   try {
-    effective = await setThinkingLevel(sel.thinking);
+    effective = getThinkingLevel();
   } catch {
     effective = null;
   }
@@ -3236,7 +3246,7 @@ function doctorActivation(roleCheck) {
 }
 
 function doctorPiCapabilities(pi) {
-  const required = ["getActiveTools", "setActiveTools", "setModel", "setThinkingLevel"];
+  const required = ["getActiveTools", "setActiveTools", "setModel", "setThinkingLevel", "getThinkingLevel"];
   const missing = required.filter((name) => typeof pi?.[name] !== "function");
   return { missing, observed: required.filter((name) => typeof pi?.[name] === "function") };
 }
@@ -4057,7 +4067,7 @@ const RELEASE_FACTS = [
 ];
 
 const RELEASE_CAPABILITIES = [
-  { capability: "pi_api", condition: "required Pi extension APIs (getActiveTools, setActiveTools, setModel, setThinkingLevel) are present", owner: "operator", action: "Use a Pi process exposing the required extension APIs." },
+  { capability: "pi_api", condition: "required Pi extension APIs (getActiveTools, setActiveTools, setModel, setThinkingLevel, getThinkingLevel) are present", owner: "operator", action: "Use a Pi process exposing the required extension APIs." },
   { capability: "paseo_live", condition: "live Paseo daemon/client identity, cwd, and typed workspace binding are observable", owner: "operator", action: "Start the Paseo daemon and client and rerun doctor until live facts are PASS." },
   { capability: "adapter_current_agent_observer", condition: "the public current-agent observer (adapter-provided or the independently installed Paseo CLI) proves exact current-agent identity, model, thinking, parent, and cwd", owner: "operator", action: "Start the Paseo daemon, verify the exact agent identity through the installed observer, and rerun the release smoke on the exact commit." },
 ];
@@ -4301,6 +4311,7 @@ export default function (pi) {
       models: ctx.modelRegistry,
       setModel: pi.setModel,
       setThinkingLevel: pi.setThinkingLevel,
+      getThinkingLevel: pi.getThinkingLevel,
     });
     if (!result.ok) {
       blockWith(ctx, result.error);
