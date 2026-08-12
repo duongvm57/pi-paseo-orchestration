@@ -244,8 +244,16 @@ test("extension registers the settings command and a handler that never calls a 
     "ppo:settings",
     "ppo:supervisor-recovery",
   ]);
-  assert.equal(fake.tools.has("pi-paseo-orchestration:supervisor_notebook_append"), true);
+  assert.equal(fake.tools.has("supervisor_notebook_append"), true);
   assert.equal(fake.commands.has("pi-paseo-orchestration:notebook-append"), false);
+  // Provider contract: tool names must match ^[a-zA-Z0-9_-]+$ — a colon or
+  // other punctuation breaks every chat request ("Invalid 'tools[n].function.name'")
+  // even when the name field itself is present.
+  for (const name of fake.tools.keys()) {
+    assert.match(name, /^[a-zA-Z0-9_-]+$/, `tool name ${name} must match the provider pattern`);
+  }
+  assert.equal(fake.tools.get("supervisor_notebook_append")?.label, "Supervisor Notebook Append");
+  assert.equal(typeof fake.tools.get("supervisor_notebook_append")?.execute, "function");
 });
 
 test("settings command: cancel anywhere preserves prior bytes and writes nothing", async () => {
@@ -3322,7 +3330,7 @@ test("mutation boundary: settings command, notebook init+append, and doctor touc
     assert.equal(initResult.ok, true, initResult.error);
     const manifest = JSON.parse(await readFile(initResult.paths.manifestPath, "utf8"));
     const entry = notebookEntryFixture(manifest, "ppo-fixture", repo.dir);
-    const appendResult = await fake.tools.get("pi-paseo-orchestration:supervisor_notebook_append").execute(
+    const appendResult = await fake.tools.get("supervisor_notebook_append").execute(
       "call-ppo-fixture", { project_id: "ppo-fixture", entry }, undefined, undefined, fake.ctx,
     );
     assert.equal(appendResult.content?.[0]?.text.includes("Notebook entry"), true, appendResult.content?.[0]?.text);

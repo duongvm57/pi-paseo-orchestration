@@ -288,7 +288,7 @@ async function main() {
   if (initOk) {
     const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
     try {
-      const appendResult = await tools.get("pi-paseo-orchestration:supervisor_notebook_append").execute(
+      const appendResult = await tools.get("supervisor_notebook_append").execute(
         "smoke-append", { project_id: "smoke-project", entry: smokeEntry(extension, manifest, "smoke-project", project) },
         undefined, undefined, ctx,
       );

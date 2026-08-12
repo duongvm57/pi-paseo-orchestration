@@ -2072,7 +2072,7 @@ export const NOTEBOOK_ENTRY_CONTRACT = "pi-paseo-supervisor-notebook-entry";
 export const NOTEBOOK_CONTRACT_VERSION = "v1";
 export const NOTEBOOK_STORAGE_VERSION = "v1";
 export const NOTEBOOK_INIT_COMMAND = "pi-paseo-orchestration:notebook-init";
-export const NOTEBOOK_APPEND_TOOL = "pi-paseo-orchestration:supervisor_notebook_append";
+export const NOTEBOOK_APPEND_TOOL = "supervisor_notebook_append";
 
 const NOTEBOOK_MANIFEST_FIELDS = [
   "contract", "contract_version", "manifest_schema", "notebook_id",
