@@ -17,11 +17,11 @@ The manifest exposes exactly one extension and one Workspace Protocol skill. `AU
 
 The extension registers these package surfaces:
 
-- `/pi-paseo-orchestration:settings`
-- `/pi-paseo-orchestration:lead-tiny`
-- `/pi-paseo-orchestration:supervisor-recovery`
-- `/pi-paseo-orchestration:notebook-init`
-- `/pi-paseo-orchestration:doctor`
+- `/ppo:settings`
+- `/ppo:lead-tiny`
+- `/ppo:supervisor-recovery`
+- `/ppo:notebook-init`
+- `/ppo:doctor`
 - the Supervisor-only typed Notebook append tool
 
 ## Governance boundary

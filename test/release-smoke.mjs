@@ -261,7 +261,7 @@ async function main() {
   };
 
   // ── settings command write, then exact application at activation ──
-  await commands.get("pi-paseo-orchestration:settings").handler("", ctx);
+  await commands.get("ppo:settings").handler("", ctx);
   let settingsOk = false;
   try {
     const written = JSON.parse(await readFile(join(config, "pi-paseo-orchestration", "settings.json"), "utf8"));
@@ -280,7 +280,7 @@ async function main() {
   // ── notebook init + append through the real registered handlers ──
   const projectKey = extension.deriveNotebookProjectKey("smoke-project");
   const manifestPath = join(config, "pi-paseo-orchestration", "supervisor-notebooks", "v1", "projects", projectKey, "manifest.json");
-  const initResult = await commands.get("pi-paseo-orchestration:notebook-init").handler("", ctx);
+  const initResult = await commands.get("ppo:notebook-init").handler("", ctx);
   const initOk = initResult.ok === true && await fileExists(manifestPath);
   report("notebook-init writes the create-once manifest", initOk, initOk ? manifestPath : initResult.error ?? initResult.ok);
 
@@ -309,7 +309,7 @@ async function main() {
   // The doctor run stays hermetic: PATH is stripped so the observation probe
   // cannot depend on the live daemon; the release observer probe below uses
   // the real environment.
-  const doctorCmd = commands.get("pi-paseo-orchestration:doctor");
+  const doctorCmd = commands.get("ppo:doctor");
   const doctorCtx = { ...ctx, env: { ...env, PATH: "/nonexistent-ppo-path" } };
   const configBefore = await tree(config);
   const projectBefore = await tree(project);

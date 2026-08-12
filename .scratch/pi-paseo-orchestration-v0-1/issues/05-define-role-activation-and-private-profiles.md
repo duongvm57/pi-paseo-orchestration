@@ -16,7 +16,7 @@ The package activates one durable Role Profile from one closed environment contr
 
 `PI_PASEO_ORCHESTRATION_ROLE` is the only role source. Its accepted values are exactly `supervisor`, `lead`, or `peer`. Missing or empty means passive/explicitly ungoverned; whitespace, case variants, and every other non-empty value are invalid rather than normalized. Provider names, titles, labels, parentage, task prose, and model output never infer or change role.
 
-A governed activation additionally requires a nonblank effective `PASEO_AGENT_ID` (daemon-owned in the supported Paseo launch), a valid profile source, `read`, and—only for Supervisor and Lead—the active outer `mcp` tool from the independently installed `pi-mcp-adapter`. This is a consistency prerequisite, not authentication: an outside process can spoof environment values. Missing prerequisites block ordinary prompts without invoking the model; `/pi-paseo-orchestration:doctor` remains available. Missing optional tools produce a degraded surface and are never re-enabled. A direct Pi process with no role remains fully passive, so normal Pi lifecycle commands and tool settings keep working.
+A governed activation additionally requires a nonblank effective `PASEO_AGENT_ID` (daemon-owned in the supported Paseo launch), a valid profile source, `read`, and—only for Supervisor and Lead—the active outer `mcp` tool from the independently installed `pi-mcp-adapter`. This is a consistency prerequisite, not authentication: an outside process can spoof environment values. Missing prerequisites block ordinary prompts without invoking the model; `/ppo:doctor` remains available. Missing optional tools produce a degraded surface and are never re-enabled. A direct Pi process with no role remains fully passive, so normal Pi lifecycle commands and tool settings keep working.
 
 Paseo configuration should define three user-renamable provider aliases; the sample names are `pi-paseo-orchestration-supervisor`, `pi-paseo-orchestration-lead`, and `pi-paseo-orchestration-peer`. Each alias persistently sets the one corresponding role env value. The alias is convenience, not identity truth. Per-create transient env is not the supported role path because Paseo does not persist it across resume.
 
@@ -71,7 +71,7 @@ Role ceiling:
 - Read-only Paseo discovery: `list_providers`, `list_models`, `inspect_provider`.
 - Observation: `list_agents`, `get_agent_status`, `get_agent_activity`, `list_workspaces`.
 - Relay: `send_agent_prompt`, constrained by the Role Profile to evidence/owner-decision relay rather than correction-by-fiat.
-- Recovery exception: `create_agent` only during one current Human recovery grant created by `/pi-paseo-orchestration:recover-lead`, with exact provider/workspace/handoff arguments checked against that grant.
+- Recovery exception: `create_agent` only during one current Human recovery grant created by `/ppo:recover-lead`, with exact provider/workspace/handoff arguments checked against that grant.
 
 Supervisor owns workflow/reasoning observation, evidence, causal notebook entries, and Human decision relay, not project implementation, architecture ownership, difficult-change acceptance, or generic code edits. The exact notebook location/lifecycle/path guard is delegated to a new notebook-contract ticket; `.orchestration/workspace-protocol.md` authoring remains a Human-confirmed governance workflow owned by ticket 07. Until those paths/workflows are specified, they grant no additional write path.
 
@@ -88,7 +88,7 @@ Base effective surface without an exceptional grant:
 - Orchestration: `create_agent`, `send_agent_prompt`, `update_agent`, `cancel_agent`, `archive_agent`.
 - Permission observation: `list_pending_permissions`; only the Human uses `respond_to_permission`.
 
-Lead owns framing, topology, routing, one-writer ownership, dependency handling, stable-candidate review, integration, and the binding project verdict. It does not pre-solve delegated work. The Lead role ceiling conditionally admits `write`/`edit` and local commit, but those capabilities are absent from the base surface. A Lead may implement, optionally make a local commit, and proportionately self-accept one genuinely tiny task only when all of these hold: the Workspace Protocol permits tiny self-work, an idle Human invokes `/pi-paseo-orchestration:lead-tiny`, the editor/confirmation attests protocol compatibility, and the current-run envelope grants the exact writable scope. Edit and local-commit grants are separate and default denied. Local acceptance still requires the exact Stable Candidate defined by ticket 09; without commit authority the Lead cannot turn its edits into v0.1's commit candidate. If the task stops being tiny, Lead preserves evidence and delegates instead of expanding its grant. Push/merge/amend/deploy remain blocked.
+Lead owns framing, topology, routing, one-writer ownership, dependency handling, stable-candidate review, integration, and the binding project verdict. It does not pre-solve delegated work. The Lead role ceiling conditionally admits `write`/`edit` and local commit, but those capabilities are absent from the base surface. A Lead may implement, optionally make a local commit, and proportionately self-accept one genuinely tiny task only when all of these hold: the Workspace Protocol permits tiny self-work, an idle Human invokes `/ppo:lead-tiny`, the editor/confirmation attests protocol compatibility, and the current-run envelope grants the exact writable scope. Edit and local-commit grants are separate and default denied. Local acceptance still requires the exact Stable Candidate defined by ticket 09; without commit authority the Lead cannot turn its edits into v0.1's commit candidate. If the task stops being tiny, Lead preserves evidence and delegates instead of expanding its grant. Push/merge/amend/deploy remain blocked.
 
 #### Peer
 
@@ -98,11 +98,11 @@ The base effective surface is `read` and `bash`. The Peer role ceiling condition
 
 Ticket 06 will define one strict, versioned Task Authority Envelope format with role-specific grant kinds for Peer edit/local-commit, Lead tiny-task edit/local-commit, and Supervisor Lead recovery. Only one complete canonical block at the beginning of the injected prompt is recognized; unknown fields, duplicates, malformed markers, text scans, quoted examples, and role/grant mismatches confer no authority. The exact issuer/field rules remain ticket 06's responsibility.
 
-`/pi-paseo-orchestration:lead-tiny` and `/pi-paseo-orchestration:recover-lead` use one multiline `ctx.ui.editor()` followed by `ctx.ui.confirm()`, then inject a user message whose authority block is the first nonempty content. `lead-tiny` refuses outside an idle governed Lead; `recover-lead` refuses outside an idle governed Supervisor. They do not directly mutate role or tools, cannot grant outside the role ceiling/session baseline, refuse automatic/background approval, and leave an auditable Human message. These are slash commands, not LLM tools. No custom LLM tool is added by ticket 05.
+`/ppo:lead-tiny` and `/ppo:recover-lead` use one multiline `ctx.ui.editor()` followed by `ctx.ui.confirm()`, then inject a user message whose authority block is the first nonempty content. `lead-tiny` refuses outside an idle governed Lead; `recover-lead` refuses outside an idle governed Supervisor. They do not directly mutate role or tools, cannot grant outside the role ceiling/session baseline, refuse automatic/background approval, and leave an auditable Human message. These are slash commands, not LLM tools. No custom LLM tool is added by ticket 05.
 
 ### Doctor observations
 
-`/pi-paseo-orchestration:doctor` is always registered, including passive and blocked states, and remains observation-only. It must expose facts for ticket 10 to classify and format:
+`/ppo:doctor` is always registered, including passive and blocked states, and remains observation-only. It must expose facts for ticket 10 to classify and format:
 
 - governed, ungoverned, or blocked activation;
 - role missing/empty/invalid and `PASEO_AGENT_ID` presence;

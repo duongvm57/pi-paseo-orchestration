@@ -227,7 +227,7 @@ export async function activate({ env, dir, profileDir, models, setModel, setThin
   } catch (err) {
     return { ok: false, error: err.message };
   }
-  if (settings === null) return { ok: false, error: `settings document is missing; run /pi-paseo-orchestration:settings first` };
+  if (settings === null) return { ok: false, error: `settings document is missing; run /ppo:settings first` };
 
   const source = await validateProfileDir(profileDir);
   if (!source.ok) return { ok: false, error: source.error };
@@ -442,7 +442,7 @@ function validateCreateAgentArgs(args, policy) {
     }
     if (!args.initialPrompt.includes(recovery.objective)
         || !args.initialPrompt.includes(recovery.handoff_id)
-        || !/(?:\/ppo:doctor|\/pi-paseo-orchestration:doctor)/.test(args.initialPrompt)) {
+        || !args.initialPrompt.includes("/ppo:doctor")) {
       return block("recovery create_agent prompt must bind the objective and handoff and require doctor");
     }
   }
@@ -2198,7 +2198,7 @@ export const NOTEBOOK_CONTRACT = "pi-paseo-supervisor-notebook";
 export const NOTEBOOK_ENTRY_CONTRACT = "pi-paseo-supervisor-notebook-entry";
 export const NOTEBOOK_CONTRACT_VERSION = "v1";
 export const NOTEBOOK_STORAGE_VERSION = "v1";
-export const NOTEBOOK_INIT_COMMAND = "pi-paseo-orchestration:notebook-init";
+export const NOTEBOOK_INIT_COMMAND = "ppo:notebook-init";
 export const NOTEBOOK_APPEND_TOOL = "supervisor_notebook_append";
 
 const NOTEBOOK_MANIFEST_FIELDS = [
@@ -4331,11 +4331,7 @@ function blockWith(ctx, reason) {
   ctx.ui?.notify?.(`pi-paseo-orchestration blocked: ${reason}`, "error");
 }
 
-// Short aliases: the canonical `pi-paseo-orchestration:*` names stay registered
-// (spec contract), and `ppo:*` is offered because the long prefix truncates in
-// the slash-command menu. Both names share one handler and one description.
 function registerCommand(pi, name, definition) {
-  pi.registerCommand(`pi-paseo-orchestration:${name}`, definition);
   pi.registerCommand(`ppo:${name}`, definition);
 }
 
@@ -4352,7 +4348,7 @@ export default function (pi) {
     description: "Store a Human-confirmed Supervisor recovery grant binding provider, workspace, and handoff (idle supervisor process only)",
     handler: runSupervisorRecovery,
   });
-  registerCommand(pi, NOTEBOOK_INIT_COMMAND.replace("pi-paseo-orchestration:", ""), {
+  registerCommand(pi, NOTEBOOK_INIT_COMMAND.replace("ppo:", ""), {
     description: "Create a Human-confirmed immutable Supervisor Notebook manifest (Supervisor only)",
     handler: runNotebookInit,
   });

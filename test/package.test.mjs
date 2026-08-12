@@ -244,14 +244,14 @@ test("configDir resolves from PI_CODING_AGENT_DIR or the documented per-user def
 async function runSettingsWith(fake, env) {
   const ext = await freshExtension();
   ext.default(fake.pi);
-  const settings = fake.commands.get("pi-paseo-orchestration:settings");
+  const settings = fake.commands.get("ppo:settings");
   await settings.handler("", { ...fake.ctx, env: env ?? process.env });
   return fake;
 }
 
 test("extension registers the settings command and a handler that never calls a model", async () => {
   const fake = fakePi();
-  fake.pi.registerCommand("pi-paseo-orchestration:settings", {
+  fake.pi.registerCommand("ppo:settings", {
     description: "…",
     handler: async () => { throw new Error("no model call"); },
   });
@@ -259,11 +259,6 @@ test("extension registers the settings command and a handler that never calls a 
   const ext = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
   ext.default(fake.pi);
   assert.deepEqual([...fake.commands.keys()].sort(), [
-    "pi-paseo-orchestration:doctor",
-    "pi-paseo-orchestration:lead-tiny",
-    "pi-paseo-orchestration:notebook-init",
-    "pi-paseo-orchestration:settings",
-    "pi-paseo-orchestration:supervisor-recovery",
     "ppo:doctor",
     "ppo:lead-tiny",
     "ppo:notebook-init",
@@ -271,7 +266,8 @@ test("extension registers the settings command and a handler that never calls a 
     "ppo:supervisor-recovery",
   ]);
   assert.equal(fake.tools.has("supervisor_notebook_append"), true);
-  assert.equal(fake.commands.has("pi-paseo-orchestration:notebook-append"), false);
+  assert.equal(fake.commands.has("ppo:notebook-append"), false);
+  assert.equal([...fake.commands.keys()].some((name) => name.startsWith("pi-paseo-orchestration:")), false);
   // Provider contract: tool names must match ^[a-zA-Z0-9_-]+$ — a colon or
   // other punctuation breaks every chat request ("Invalid 'tools[n].function.name'")
   // even when the name field itself is present.
@@ -2057,7 +2053,7 @@ test("command: lead-tiny requires an idle lead, stores a pending authority, acti
   const ext = await freshExtension();
   const env = await governedCommandFixture(ext, { role: "lead", activeTools: ["read", "bash", "mcp", "write", "edit"] });
   try {
-    const handler = env.fake.commands.get("pi-paseo-orchestration:lead-tiny").handler;
+    const handler = env.fake.commands.get("ppo:lead-tiny").handler;
     assert.notEqual(handler, undefined);
     assert.equal(ext.getPendingAuthority(), null);
 
@@ -2132,7 +2128,7 @@ test("command: supervisor-recovery binds provider/workspace/handoff, never grant
   const ext = await freshExtension();
   const env = await governedCommandFixture(ext, { role: "supervisor", activeTools: ["read", "bash", "mcp"] });
   try {
-    const handler = env.fake.commands.get("pi-paseo-orchestration:supervisor-recovery").handler;
+    const handler = env.fake.commands.get("ppo:supervisor-recovery").handler;
     assert.notEqual(handler, undefined);
 
     const inputs = ["t-2", "Recover the lead after a crash", "ws-1", "h-9"];
@@ -2187,8 +2183,8 @@ test("command: wrong role and mid-run processes are rejected without storing any
   const ext = await freshExtension();
   const env = await governedCommandFixture(ext, { role: "peer", activeTools: ["read", "bash"] });
   try {
-    const tiny = env.fake.commands.get("pi-paseo-orchestration:lead-tiny").handler;
-    const recovery = env.fake.commands.get("pi-paseo-orchestration:supervisor-recovery").handler;
+    const tiny = env.fake.commands.get("ppo:lead-tiny").handler;
+    const recovery = env.fake.commands.get("ppo:supervisor-recovery").handler;
     await tiny("", env.fake.ctx);
     await recovery("", env.fake.ctx);
     assert.equal(ext.getPendingAuthority(), null);
@@ -2208,7 +2204,7 @@ test("command: wrong role and mid-run processes are rejected without storing any
   const env2 = await governedCommandFixture(ext2, { role: "lead", activeTools: ["read", "bash", "mcp", "write", "edit"] });
   try {
     env2.fake.ctx.isIdle = () => false;
-    const tiny = env2.fake.commands.get("pi-paseo-orchestration:lead-tiny").handler;
+    const tiny = env2.fake.commands.get("ppo:lead-tiny").handler;
     await tiny("", env2.fake.ctx);
     assert.equal(ext2.getPendingAuthority(), null);
     assert.equal(env2.fake.notifications.some(([msg]) => /requires an idle process/.test(msg)), true);
@@ -2227,7 +2223,7 @@ test("command: declined confirmation and a new session clear the pending authori
   const ext = await freshExtension();
   const env = await governedCommandFixture(ext, { role: "lead", activeTools: ["read", "bash", "mcp", "write", "edit"] });
   try {
-    const handler = env.fake.commands.get("pi-paseo-orchestration:lead-tiny").handler;
+    const handler = env.fake.commands.get("ppo:lead-tiny").handler;
 
     // Declined confirmation stores nothing.
     const inputs = ["t-1", "tiny fix", "src", ""];
@@ -3131,7 +3127,7 @@ test("Doctor: a full run mutates nothing — config and repository trees are byt
     fake.ctx.cwd = repo.dir;
     const ext = await freshExtension();
     ext.default(fake.pi);
-    const command = fake.commands.get("pi-paseo-orchestration:doctor");
+    const command = fake.commands.get("ppo:doctor");
     const before = async (dir) => {
       const map = new Map();
       const walk = async (base, rel) => {
@@ -3463,8 +3459,8 @@ test("mutation boundary: settings command, notebook init+append, and doctor touc
     const repoGit = await gitSnapshot(repo.dir);
 
     // Full exercise through the real registered handlers.
-    await fake.commands.get("pi-paseo-orchestration:settings").handler("", fake.ctx);
-    const initResult = await fake.commands.get("pi-paseo-orchestration:notebook-init").handler("", fake.ctx);
+    await fake.commands.get("ppo:settings").handler("", fake.ctx);
+    const initResult = await fake.commands.get("ppo:notebook-init").handler("", fake.ctx);
     assert.equal(initResult.ok, true, initResult.error);
     const manifest = JSON.parse(await readFile(initResult.paths.manifestPath, "utf8"));
     const entry = notebookEntryFixture(manifest, "ppo-fixture", repo.dir);
@@ -3472,7 +3468,7 @@ test("mutation boundary: settings command, notebook init+append, and doctor touc
       "call-ppo-fixture", { project_id: "ppo-fixture", entry }, undefined, undefined, fake.ctx,
     );
     assert.equal(appendResult.content?.[0]?.text.includes("Notebook entry"), true, appendResult.content?.[0]?.text);
-    const doctorResult = await fake.commands.get("pi-paseo-orchestration:doctor").handler("", { ...fake.ctx, rpc: true });
+    const doctorResult = await fake.commands.get("ppo:doctor").handler("", { ...fake.ctx, rpc: true });
     assert.equal(doctorResult.ok, true, doctorResult.error);
 
     // No project, package, Git, or Paseo mutation.

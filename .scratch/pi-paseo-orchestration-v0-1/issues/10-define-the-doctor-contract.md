@@ -12,7 +12,7 @@ Which facts must the observation-only doctor verify for the current cwd/session,
 
 ## Contract boundary
 
-`/pi-paseo-orchestration:doctor` is a deterministic, observation-only Pi extension command. It inspects only the command's current `ctx.cwd`, the Git repository containing that cwd, the current Pi process/session, and the exact current Paseo agent/workspace reachable from that session. It accepts no alternate path, repository, workspace, agent, or session target.
+`/ppo:doctor` is a deterministic, observation-only Pi extension command. It inspects only the command's current `ctx.cwd`, the Git repository containing that cwd, the current Pi process/session, and the exact current Paseo agent/workspace reachable from that session. It accepts no alternate path, repository, workspace, agent, or session target.
 
 Doctor never invokes the model; changes active tools; reparses a prompt as a new grant; writes config, profile, protocol, transcript, Git, or workspace state; starts/stops/reloads an agent or daemon; connects an unrelated lazy adapter server merely to discover it; installs/updates a package; or performs repair. A bounded read-only connection to the exact current Paseo daemon is allowed because reachability must be observed. Paseo remains the only lifecycle/workspace control plane. Doctor adds no service, daemon, queue, ledger, mailbox, registry, retry loop, or repair plane.
 

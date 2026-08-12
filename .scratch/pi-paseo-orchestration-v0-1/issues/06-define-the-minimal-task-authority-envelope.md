@@ -44,8 +44,8 @@ The objective and task prose follow the established hierarchy. Prose may explain
 `issuer` is route-bound, not self-authorizing prose:
 
 - `peer` is accepted only from the direct Human task message;
-- `lead_tiny` is accepted only from `/pi-paseo-orchestration:lead-tiny` after Human editor and confirmation;
-- `supervisor_recovery` is accepted only from `/pi-paseo-orchestration:recover-lead` after Human editor and confirmation.
+- `lead_tiny` is accepted only from `/ppo:lead-tiny` after Human editor and confirmation;
+- `supervisor_recovery` is accepted only from `/ppo:recover-lead` after Human editor and confirmation.
 
 No role or task prompt may issue a grant for another role.
 

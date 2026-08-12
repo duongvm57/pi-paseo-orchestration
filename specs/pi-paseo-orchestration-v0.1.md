@@ -104,7 +104,7 @@ Supervisor observations persist in a Human-owned, append-only, project-scoped No
 
 ### Human-owned role model settings
 
-- `/pi-paseo-orchestration:settings` is always registered, invokes no model, and is the only package surface that changes role model settings. It uses Pi's current model registry to collect an exact provider ID, model ID, and one thinking level from `off|minimal|low|medium|high|xhigh|max` for each of Supervisor, Lead, and Peer, shows the complete replacement, and writes only after Human confirmation.
+- `/ppo:settings` is always registered, invokes no model, and is the only package surface that changes role model settings. It uses Pi's current model registry to collect an exact provider ID, model ID, and one thinking level from `off|minimal|low|medium|high|xhigh|max` for each of Supervisor, Lead, and Peer, shows the complete replacement, and writes only after Human confirmation.
 - The complete closed document lives at `<effective Pi config directory>/pi-paseo-orchestration/settings.json` and contains exactly `version: 1` plus a `roles` object with required `supervisor`, `lead`, and `peer` entries; each entry contains exactly string fields `provider`, `model`, and `thinking`. `thinking` is one exact Pi ID from the listed closed set and is passed unchanged as Paseo `settings.thinkingOptionId`; there is no conversion. The document is Human-owned runtime state, not package data, project policy, Paseo lifecycle state, or authority. The package supplies no model/thinking defaults or alternate source.
 - Cancel, incomplete selection, unknown model, or invalid thinking syntax preserves the previous document. A write failure is explicit and is never reported as success. A valid replacement affects fresh governed processes only; it does not hot-switch an active process.
 - A fresh governed process snapshots the complete document, resolves and applies its role selection through Pi's public model APIs before ordinary model work, and compares the effective model and thinking with the snapshot. Missing, malformed, unavailable, unauthenticated, clamped, file-drifted, or runtime-drifted settings block ordinary prompts while settings and doctor remain available.
@@ -214,7 +214,7 @@ Supervisor observations persist in a Human-owned, append-only, project-scoped No
 
 ### Doctor
 
-- `/pi-paseo-orchestration:doctor` is always registered when the package is loaded, including passive and blocked states. It is deterministic, observation-only, never invokes the model, and accepts no alternate target.
+- `/ppo:doctor` is always registered when the package is loaded, including passive and blocked states. It is deterministic, observation-only, never invokes the model, and accepts no alternate target.
 - Doctor inspects only current canonical cwd, containing Git repository, Pi process/session, process activation, exact Paseo agent and typed workspace binding, current package/adapter provenance, Role Profile, Workspace Protocol, effective tools, and internal current-run authority result.
 - It records a bounded observation interval and rechecks critical identity/digests before output. Drift yields `BLOCKED / OBSERVATION_DRIFT`; timeout/unavailability is reported without polling or retry.
 - Checks use `PASS`, `WARN`, and `BLOCKED`; overall status is the worst applicable result. Ungoverned is WARN. Invalid role or any missing/malformed/ambiguous/stale/mismatched mandatory governed fact is BLOCKED.
