@@ -7,6 +7,8 @@ description: Author or revise a repository's Pi Paseo Workspace Protocol through
 
 Create or revise only the repository-wide `.orchestration/workspace-protocol.md`. Paseo remains the sole lifecycle, workspace, parentage, follow-up, and timeline truth.
 
+Before interviewing, read the packaged [Workspace Protocol authoring guide](./AUTHORING-GUIDE.md). Apply its protocol boundary, routing patterns, evidence rules, anti-pattern catalog, and evolution rules.
+
 ## Establish the authoring route
 
 1. Confirm the repository root and the Human-defined `project_id`.
@@ -20,28 +22,28 @@ Stop if identity or authoring authority is absent or conflicting.
 
 Interview the Human one group at a time, restating each decision, consequence, hidden assumption, and contradiction before continuing:
 
-1. repository identity, applicability, criticality, dominant risks, and expensive-to-reverse effects;
+1. repository identity and applicability, then criticality, dominant risks, and expensive-to-reverse effects only when they change routing or proof;
 2. Human, Supervisor, Lead, and Peer decision boundaries;
 3. routing for `tiny/bounded`, `cross-module/lifecycle`, and `architecture-sensitive` work;
 4. ownership, one-writer scope, isolated checkouts, dependencies, and handback;
-5. per-class Stable Candidate, verification, review, verdict, and Local Acceptance rules;
+5. per-class Git Stable Candidate, verification, review, Lead verdict, and direct Human Local Acceptance prerequisites;
 6. `REOPEN_REQUEST`, `DEPENDENCY_REQUEST`, `BLOCKED`, and Human `must_ask` boundaries;
-7. anti-patterns, review triggers, and protocol evolution.
+7. evidence-backed project-specific anti-patterns when relevant (candidate signals from the guide's catalog, plus evidence required, open question, and allowed response for each), review triggers, and protocol evolution.
 
 The Human must decide product and priority, irreversible trade-offs, external effects, authority or protocol changes, subjective acceptance, and material cost or risk.
 
 ## Draft the closed core
 
-The draft must include:
+Use exactly the guide's closed frontmatter and H2 schema. The required H2 sections are:
 
-- `status`, monotonically increasing `version`, `last_reviewed`, `project_id`, `repository_root: .`, and repository-wide applicability;
-- a repository-specific four-role decision matrix within the Role Profile ceilings;
-- the three task classes and proportionate routing;
-- ownership, isolation, one-writer, dependency, and handback rules;
-- each class's candidate identity, verification evidence, reviewer trigger, verdict, and accepter;
-- escalation handling and evolution rules.
+- `Decision matrix` with repository-specific four-role boundaries and Human `must_ask` decisions;
+- `Task classes and routing` with all three classes and proportionate routing;
+- `Ownership and isolation` with one-writer, checkout, dependency, integration, and handback rules;
+- `Candidate, verification, review, and acceptance` with each class's exact `git:v1:<task-base-full-oid>:<candidate-full-oid>` contract, verification evidence, review trigger, Lead verdict, and direct Human Local Acceptance prerequisites;
+- `Reopen, dependency, and blocked handling` with evidence, decision owner, and bounded next action;
+- `Evolution` with revision authority, Human confirmation, versioning, and effects on running work.
 
-Optional material is limited to project characteristics, review or council rules, anti-patterns, and Supervisor observation or authoring hints. Keep model and thinking selection outside the v0.1 protocol; Human-owned role settings are the operative source. Record only repository-specific allocations and constraints; do not restate the Role Profiles or this authoring workflow.
+Optional H2 sections are limited to `Project criticality`, `Review and council rules` (or `Review and council`), `Anti-patterns`, and `Supervisor hints`. Include project characteristics only when they change routing or proof. Include anti-patterns only when causal evidence makes them repository-specific; record each as bold text plus signal, evidence required, open question, and allowed response, never as a nested heading. Keep model and thinking selection outside the v0.1 protocol; Human-owned role settings are the operative source. Record only repository-specific allocations and constraints; do not restate the Role Profiles or this authoring workflow.
 
 The Workspace Protocol may narrow workflow and permit tiny Lead self-work, but it cannot grant `edit`, `local_commit`, recovery, or any other Capability. Preserve **Role Profile > Workspace Protocol > current-run Task Authority Envelope > ordinary task prose**. Omission grants nothing.
 

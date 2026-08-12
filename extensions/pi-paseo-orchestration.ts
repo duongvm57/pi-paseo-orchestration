@@ -3952,14 +3952,16 @@ export function getProtocolPin() {
 
 // ─── Slice 8: package verification and release gate ────────────────────────────
 
-// Canonical package resources: the manifest-declared extension and skill plus
-// the three private profile resources. Everything resolves from loaded-module/
-// package provenance (the module URL argument, defaulting to import.meta.url)
+// Canonical package resources: the manifest-declared extension and skill,
+// the skill's required companion guide, and the three private profiles.
+// Everything resolves from loaded-module/package provenance (the module URL
+// argument, defaulting to import.meta.url)
 // — never from cwd, repository root, Pi config root, Paseo workspace, or
 // parent-directory search. Expected resources must be regular, readable,
 // nonempty, direct descendants without symlink escape (the realpath-
 // containment pattern from validateProfileDir).
 const BUNDLED_PROFILE_FILES = ["supervisor.md", "lead.md", "peer.md"];
+const BUNDLED_SKILL_GUIDE_FILE = "AUTHORING-GUIDE.md";
 const MANIFEST_DEPENDENCY_FIELDS = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"];
 const MANIFEST_INSTALL_SCRIPTS = ["preinstall", "install", "postinstall"];
 
@@ -4019,9 +4021,10 @@ export async function resolvePackageResources(moduleUrl = import.meta.url) {
   const declared = [
     ["extension", manifest.pi.extensions[0]],
     ["skill", manifest.pi.skills[0]],
+    ["guide", join(dirname(manifest.pi.skills[0]), BUNDLED_SKILL_GUIDE_FILE)],
     ...BUNDLED_PROFILE_FILES.map((file) => [`profile ${file}`, join("profiles", file)]),
   ];
-  const resources = { package_root: realRoot, profiles: {}, extension: null, skill: null };
+  const resources = { package_root: realRoot, profiles: {}, extension: null, skill: null, guide: null };
   for (const [label, rel] of declared) {
     if (isAbsolute(rel)) return { ok: false, error: `${label} must be a direct descendant of the package root (absolute path)` };
     const full = join(realRoot, rel);
@@ -4040,7 +4043,7 @@ export async function resolvePackageResources(moduleUrl = import.meta.url) {
     }
     if (!(await stat(real)).isFile()) return { ok: false, error: `${label} must be a regular file (${rel})` };
     if ((await readFile(real, "utf8")).trim() === "") return { ok: false, error: `${label} must be nonempty (${rel})` };
-    if (label === "extension" || label === "skill") resources[label] = real;
+    if (label === "extension" || label === "skill" || label === "guide") resources[label] = real;
     else resources.profiles[label.slice("profile ".length).replace(/\.md$/, "")] = real;
   }
   // The loaded module must be the manifest-declared extension.

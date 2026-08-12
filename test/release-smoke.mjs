@@ -5,8 +5,8 @@
 // Against a fresh temporary copy of the package it proves:
 //   - the manifest declares exactly one extension and one skill, no adapter
 //     dependency, and no install lifecycle scripts
-//   - every declared resource (extension, skill, three private profiles)
-//     resolves from canonical loaded-module provenance and is regular,
+//   - every required resource (extension, skill, companion guide, three private
+//     profiles) resolves from canonical loaded-module provenance and is regular,
 //     readable, nonempty, and a direct descendant without symlink escape
 //   - relocation: the same resources resolve identically from the fresh copy
 //   - fail-closed provenance: a module loaded without file provenance does not
@@ -115,7 +115,7 @@ async function tree(base) {
 }
 
 const resourceDigests = async (resources) => {
-  const files = [resources.extension, resources.skill, ...Object.values(resources.profiles)];
+  const files = [resources.extension, resources.skill, resources.guide, ...Object.values(resources.profiles)];
   const digests = {};
   for (const file of files) digests[file] = createHash("sha256").update(await readFile(file)).digest("hex");
   return digests;

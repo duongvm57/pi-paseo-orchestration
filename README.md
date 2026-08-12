@@ -8,12 +8,12 @@ A native Pi package for cooperative role governance. Paseo remains the source of
 package.json
 extensions/pi-paseo-orchestration.ts
 profiles/{supervisor,lead,peer}.md
-skills/workspace-protocol/SKILL.md
+skills/workspace-protocol/{SKILL.md,AUTHORING-GUIDE.md}
 test/package.test.mjs
 test/release-smoke.mjs
 ```
 
-The manifest exposes exactly one extension and one Workspace Protocol skill. The three Role Profiles are private package data: they are not Pi prompts or independently discoverable skills, and contain no secrets.
+The manifest exposes exactly one extension and one Workspace Protocol skill. `AUTHORING-GUIDE.md` is the skill's packaged reference, not a second discoverable skill. The three Role Profiles are private package data: they are not Pi prompts or independently discoverable skills, and contain no secrets.
 
 The extension registers these package surfaces:
 

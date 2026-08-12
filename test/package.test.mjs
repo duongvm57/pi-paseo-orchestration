@@ -123,6 +123,7 @@ test("declared resources and private profiles are nonempty files", async () => {
   const paths = [
     manifest.pi.extensions[0],
     manifest.pi.skills[0],
+    "skills/workspace-protocol/AUTHORING-GUIDE.md",
     "profiles/supervisor.md",
     "profiles/lead.md",
     "profiles/peer.md",
@@ -135,7 +136,31 @@ test("declared resources and private profiles are nonempty files", async () => {
   }
 
   assert.equal(JSON.stringify(manifest.pi).includes("profiles"), false);
-  assert.match(await readFile(join(root, manifest.pi.skills[0]), "utf8"), /^---\nname: workspace-protocol\ndescription: .+\n---/);
+  const skill = await readFile(join(root, manifest.pi.skills[0]), "utf8");
+  const guide = await readFile(join(root, "skills/workspace-protocol/AUTHORING-GUIDE.md"), "utf8");
+  assert.match(skill, /^---\nname: workspace-protocol\ndescription: .+\n---/);
+  assert.match(skill, /\.\/AUTHORING-GUIDE\.md/);
+  assert.match(guide, /^# Workspace Protocol Authoring Guide\n/);
+  assert.deepEqual(guide.match(/^## \d+\..+$/gm), [
+    "## 1. Protocol boundary",
+    "## 2. Readers and decision authority",
+    "## 3. Required protocol content",
+    "## 4. Content to leave out",
+    "## 5. Routing patterns",
+    "## 6. Evidence and independent judgment",
+    "## 7. Anti-pattern catalog",
+    "## 8. Protocol evolution",
+    "## 9. Authoring quality check",
+  ]);
+  const skeletonMatch = /<!-- canonical-protocol-skeleton:start -->\n```md\n([\s\S]+?)\n```\n<!-- canonical-protocol-skeleton:end -->/.exec(guide);
+  assert.notEqual(skeletonMatch, null, "guide must contain one canonical protocol skeleton");
+  const skeleton = skeletonMatch[1].replace("YYYY-MM-DD", "2026-01-01").replace("HUMAN_DEFINED_ID", "guide-fixture");
+  assert.equal(extension.validateProtocol(skeleton).ok, true, extension.validateProtocol(skeleton).error);
+  assert.match(guide, /git:v1:<task-base-full-oid>:<candidate-full-oid>/);
+  assert.match(guide, /Human is the sole Local Accepter|Sole accepter through a direct canonical Human acceptance block/);
+  assert.match(guide, /optional `Anti-patterns` section/);
+  assert.doesNotMatch(guide, /[^\x00-\x7F]/);
+  assert.doesNotMatch(`${skill}\n${guide}`, /reference orchestration model/i);
 });
 
 test("settings document is closed: valid doc passes, every drift fails", () => {
@@ -3114,6 +3139,7 @@ test("package resources resolve from canonical loaded-module provenance: real ro
   assert.equal(resolved.resources.package_root, realRoot);
   assert.equal(resolved.resources.extension, join(realRoot, manifest.pi.extensions[0]));
   assert.equal(resolved.resources.skill, join(realRoot, manifest.pi.skills[0]));
+  assert.equal(resolved.resources.guide, join(realRoot, "skills/workspace-protocol/AUTHORING-GUIDE.md"));
   assert.deepEqual(Object.keys(resolved.resources.profiles).sort(), ["lead", "peer", "supervisor"]);
   for (const [role, rel] of [["supervisor", "profiles/supervisor.md"], ["lead", "profiles/lead.md"], ["peer", "profiles/peer.md"]]) {
     assert.equal(resolved.resources.profiles[role], join(realRoot, rel));
@@ -3127,6 +3153,7 @@ test("package resources resolve from canonical loaded-module provenance: real ro
     const copied = await resolvePackageResources(pathToFileURL(join(copy, manifest.pi.extensions[0])));
     assert.equal(copied.ok, true, copied.error);
     assert.notEqual(copied.resources.package_root, realRoot);
+    assert.equal(copied.resources.guide, join(copied.resources.package_root, "skills/workspace-protocol/AUTHORING-GUIDE.md"));
     assert.deepEqual(copied.resources.profiles, {
       supervisor: join(copied.resources.package_root, "profiles/supervisor.md"),
       lead: join(copied.resources.package_root, "profiles/lead.md"),
@@ -3161,6 +3188,20 @@ test("package resources fail closed on missing, empty, non-regular, symlink-esca
   const cases = [];
   const missing = await makeCopy();
   cases.push([missing, async () => rm(join(missing, "profiles", "peer.md")), /peer\.md must exist/]);
+
+  const missingGuide = await makeCopy();
+  cases.push([missingGuide, async () => rm(join(missingGuide, "skills/workspace-protocol/AUTHORING-GUIDE.md")), /guide must exist/]);
+
+  const emptyGuide = await makeCopy();
+  cases.push([emptyGuide, async () => writeFile(join(emptyGuide, "skills/workspace-protocol/AUTHORING-GUIDE.md"), "", "utf8"), /guide must be nonempty/]);
+
+  const nonRegularGuide = await makeCopy();
+  cases.push([nonRegularGuide, async () => { const file = join(nonRegularGuide, "skills/workspace-protocol/AUTHORING-GUIDE.md"); await rm(file); await mkdir(file); }, /guide must be a regular file/]);
+
+  const symlinkGuide = await makeCopy();
+  const outsideGuide = join(tmpdir(), `ppo-guide-outside-${Math.random().toString(36).slice(2)}.md`);
+  await writeFile(outsideGuide, "outside guide\n", "utf8");
+  cases.push([symlinkGuide, async () => { await rm(join(symlinkGuide, "skills/workspace-protocol/AUTHORING-GUIDE.md")); await symlink(outsideGuide, join(symlinkGuide, "skills/workspace-protocol/AUTHORING-GUIDE.md")); }, /guide must be a direct descendant without symlink escape/]);
 
   const empty = await makeCopy();
   cases.push([empty, async () => writeFile(join(empty, manifest.pi.skills[0]), "", "utf8"), /skill must be nonempty/]);
@@ -3217,6 +3258,7 @@ test("package resources fail closed on missing, empty, non-regular, symlink-esca
   } finally {
     for (const [copy] of cases) await rm(copy, { recursive: true, force: true });
     await rm(outside, { force: true });
+    await rm(outsideGuide, { force: true });
   }
 });
 
