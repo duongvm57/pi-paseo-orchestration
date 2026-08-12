@@ -3,8 +3,12 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
+import { execFile as execFileCallback } from "node:child_process";
+import { promisify } from "node:util";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+
+const execFile = promisify(execFileCallback);
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const manifest = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
@@ -582,5 +586,531 @@ test("wiring: missing read or outer mcp baseline blocks a governed lead", async 
   } finally {
     await rm(profiles, { recursive: true, force: true });
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ─── Lát 3: Task Authority Envelope ──────────────────────────────────────────
+
+const {
+  ENVELOPE_BEGIN,
+  ENVELOPE_END,
+  parseEnvelope,
+  validateScope,
+  effectiveTools,
+  checkCommitGate,
+  getAuthority,
+  getAuthorityReason,
+} = extension;
+
+const gitEnv = {
+  ...process.env,
+  GIT_AUTHOR_NAME: "ppo-test",
+  GIT_AUTHOR_EMAIL: "ppo-test@example.com",
+  GIT_COMMITTER_NAME: "ppo-test",
+  GIT_COMMITTER_EMAIL: "ppo-test@example.com",
+};
+const git = (args, cwd) => execFile("git", ["-c", "commit.gpgsign=false", ...args], { cwd, env: gitEnv });
+
+// Real hermetic git repository with a committed base.
+async function gitRepoFixture() {
+  const dir = await mkdtemp(join(tmpdir(), "ppo-repo-"));
+  await git(["init"], dir);
+  await mkdir(join(dir, "src"), { recursive: true });
+  await writeFile(join(dir, "src", "main.go"), "package main\n");
+  await writeFile(join(dir, "README.md"), "readme\n");
+  await git(["add", "-A"], dir);
+  await git(["commit", "-m", "base"], dir);
+  const { stdout } = await git(["rev-parse", "HEAD"], dir);
+  return { dir, base: stdout.trim() };
+}
+
+const envelopeText = (obj) => `${ENVELOPE_BEGIN}\n${JSON.stringify(obj, null, 2)}\n${ENVELOPE_END}`;
+
+const peerEnvelope = (over = {}) => ({
+  version: 1,
+  grant_kind: "peer",
+  role: "peer",
+  issuer: "human",
+  agent_id: "agent-7",
+  task_id: "task-42",
+  objective: "Implement the feature under src/",
+  capabilities: ["edit", "local_commit"],
+  scope: "src",
+  base: "0".repeat(40),
+  ...over,
+});
+
+// Governed (supervisor|lead|peer) process wired on a fresh extension instance.
+async function governedFixture(ext, { role = "peer", activeTools = ["read", "bash"] } = {}) {
+  const dir = await mkdtemp(join(tmpdir(), "ppo-env-"));
+  await mkdir(join(dir, "pi-paseo-orchestration"), { recursive: true });
+  await writeSettings(dir, validDoc);
+  const profiles = await profileDirFixture();
+  const fake = fakePi({
+    activeTools,
+    env: {
+      PI_PASEO_ORCHESTRATION_ROLE: role,
+      PASEO_AGENT_ID: "agent-7",
+      PI_CODING_AGENT_DIR: dir,
+      PI_PASEO_ORCHESTRATION_PROFILES_DIR: profiles,
+    },
+  });
+  ext.default(fake.pi);
+  await fake.handlers.get("session_start")({ reason: "startup" }, fake.ctx);
+  return { dir, profiles, fake };
+}
+
+const inputText = (fake, text, source = "interactive") =>
+  fake.handlers.get("input")({ text, source }, fake.ctx);
+
+test("parseEnvelope: valid Peer, tiny Lead, and Supervisor recovery envelopes parse", () => {
+  const editOnly = parseEnvelope(envelopeText(peerEnvelope({ capabilities: ["edit"], base: undefined })));
+  assert.equal(editOnly.ok, true);
+  assert.equal(editOnly.envelope.grant_kind, "peer");
+  assert.deepEqual(editOnly.envelope.capabilities, ["edit"]);
+  assert.equal(editOnly.envelope.scope, "src");
+  assert.deepEqual(editOnly.envelope.exclusions, []);
+  assert.equal(editOnly.envelope.base, undefined);
+
+  const full = parseEnvelope(envelopeText(peerEnvelope({ exclusions: ["src/generated"] })));
+  assert.equal(full.ok, true);
+  assert.deepEqual(full.envelope.capabilities, ["edit", "local_commit"]);
+  assert.deepEqual(full.envelope.exclusions, ["src/generated"]);
+  assert.equal(full.envelope.base, "0".repeat(40));
+
+  const tiny = parseEnvelope(envelopeText({
+    version: 1, grant_kind: "lead_tiny", role: "lead", issuer: "human",
+    agent_id: "agent-7", task_id: "t-1", objective: "tiny fix",
+    capabilities: ["edit"], scope: "src", protocol_digest: "a".repeat(64),
+  }));
+  assert.equal(tiny.ok, true);
+  assert.equal(tiny.envelope.protocol_digest, "a".repeat(64));
+
+  const recovery = parseEnvelope(envelopeText({
+    version: 1, grant_kind: "supervisor_recovery", role: "lead", issuer: "human",
+    agent_id: "agent-7", task_id: "t-2", objective: "recover the lead",
+    provider: "anthropic", workspace_id: "ws-1", handoff_id: "h-9",
+  }));
+  assert.equal(recovery.ok, true);
+  assert.deepEqual(recovery.envelope.capabilities, []);
+  assert.equal(recovery.envelope.provider, "anthropic");
+
+  assert.deepEqual(parseEnvelope("Just do the work, please."), { ok: true, envelope: null });
+  assert.deepEqual(parseEnvelope(""), { ok: true, envelope: null });
+  assert.deepEqual(parseEnvelope("   \n  "), { ok: true, envelope: null });
+});
+
+test("parseEnvelope: misplaced, duplicate, malformed, quoted, and unknown-marker envelopes fail closed", () => {
+  const valid = envelopeText(peerEnvelope({ base: "a".repeat(40) }));
+  const cases = [
+    ["misplaced", `First, some prose.\n${valid}`],
+    ["duplicate", `${valid}\n${valid}`],
+    ["malformed", `${ENVELOPE_BEGIN}\n{"version": 1, broken\n${ENVELOPE_END}`],
+    ["quoted", `${ENVELOPE_BEGIN}\n"${JSON.stringify(peerEnvelope({ base: "a".repeat(40) }))}"\n${ENVELOPE_END}`],
+    ["unclosed", `${ENVELOPE_BEGIN}\n{"version": 1}`],
+    ["unknown marker version", '<pi-paseo-orchestration authority="v2">\n{"version": 1}\n</pi-paseo-orchestration>'],
+    ["empty body", `${ENVELOPE_BEGIN}${ENVELOPE_END}`],
+    ["array body", `${ENVELOPE_BEGIN}\n[1, 2]\n${ENVELOPE_END}`],
+    ["trailing garbage", `${ENVELOPE_BEGIN}\n{"version": 1} trailing\n${ENVELOPE_END}`],
+  ];
+  for (const [label, text] of cases) {
+    const parsed = parseEnvelope(text);
+    assert.equal(parsed.ok, false, `${label} must fail`);
+    assert.equal(typeof parsed.error, "string", `${label} must carry an explicit reason`);
+  }
+});
+
+test("parseEnvelope: unknown version/kind/field, duplicate field, mistyped, conflicting, role-mismatched fail", () => {
+  const dupFieldText = `${ENVELOPE_BEGIN}
+{
+  "version": 1,
+  "grant_kind": "peer",
+  "role": "peer",
+  "issuer": "human",
+  "agent_id": "agent-7",
+  "task_id": "task-42",
+  "task_id": "task-43",
+  "objective": "x",
+  "capabilities": ["edit"],
+  "scope": "src"
+}
+${ENVELOPE_END}`;
+  const base = "a".repeat(40);
+  const cases = [
+    ["unknown version", envelopeText(peerEnvelope({ base, version: 2 }))],
+    ["string version", envelopeText(peerEnvelope({ base, version: "1" }))],
+    ["unknown grant kind", envelopeText(peerEnvelope({ base, grant_kind: "intern" }))],
+    ["role mismatch", envelopeText(peerEnvelope({ base, role: "lead" }))],
+    ["wrong issuer", envelopeText(peerEnvelope({ base, issuer: "Human" }))],
+    ["empty agent id", envelopeText(peerEnvelope({ base, agent_id: " " }))],
+    ["missing task id", envelopeText(peerEnvelope({ base, task_id: "" }))],
+    ["numeric objective", envelopeText(peerEnvelope({ base, objective: 5 }))],
+    ["unbounded objective", envelopeText(peerEnvelope({ base, objective: "x".repeat(2001) }))],
+    ["unknown field", envelopeText(peerEnvelope({ base, magic: true }))],
+    ["duplicate field", dupFieldText],
+    ["string capabilities", envelopeText(peerEnvelope({ base, capabilities: "edit" }))],
+    ["empty capabilities", envelopeText(peerEnvelope({ base, capabilities: [] }))],
+    ["repeated capability", envelopeText(peerEnvelope({ base, capabilities: ["edit", "edit"] }))],
+    ["unknown capability", envelopeText(peerEnvelope({ base, capabilities: ["push"] }))],
+    ["missing scope", envelopeText(peerEnvelope({ base, scope: "" }))],
+    ["base without local_commit", envelopeText(peerEnvelope({ base, capabilities: ["edit"] }))],
+    ["local_commit without base", envelopeText(peerEnvelope({ base: undefined }))],
+    ["short base", envelopeText(peerEnvelope({ base: "abc123" }))],
+    ["non-sha base", envelopeText(peerEnvelope({ base: "z".repeat(40) }))],
+    ["exclusions not array", envelopeText(peerEnvelope({ base, exclusions: "src/x" }))],
+    ["peer with protocol_digest", envelopeText(peerEnvelope({ base, protocol_digest: "a".repeat(64) }))],
+    ["lead_tiny without protocol_digest", envelopeText({ version: 1, grant_kind: "lead_tiny", role: "lead", issuer: "human", agent_id: "agent-7", task_id: "t", objective: "x", capabilities: ["edit"], scope: "src" })],
+    ["recovery with capabilities", envelopeText({ version: 1, grant_kind: "supervisor_recovery", role: "lead", issuer: "human", agent_id: "agent-7", task_id: "t", objective: "x", provider: "p", workspace_id: "w", handoff_id: "h", capabilities: ["edit"] })],
+    ["recovery missing provider", envelopeText({ version: 1, grant_kind: "supervisor_recovery", role: "lead", issuer: "human", agent_id: "agent-7", task_id: "t", objective: "x", workspace_id: "w", handoff_id: "h" })],
+  ];
+  for (const [label, text] of cases) {
+    assert.equal(parseEnvelope(text).ok, false, `${label} must fail`);
+  }
+});
+
+test("validateScope: canonical scopes pass; absolute/traversal/glob/ambiguous/symlink/new-outside-existing reject; exclusions must lie inside", async () => {
+  const repo = await gitRepoFixture();
+  const outside = await mkdtemp(join(tmpdir(), "ppo-outside-"));
+  try {
+    await symlink(outside, join(repo.dir, "linkdir"));
+    await symlink(join(repo.dir, "README.md"), join(repo.dir, "linkfile"));
+    await mkdir(join(repo.dir, "src", "sub"), { recursive: true });
+    await writeFile(join(repo.dir, "src", "sub", "deep.go"), "x\n");
+
+    for (const scope of ["src", "src/main.go", "newdir", "src/newfile.go", "src/sub/deep.go"]) {
+      const check = await validateScope(repo.dir, scope, []);
+      assert.equal(check.ok, true, `${scope} must pass`);
+      assert.equal(check.scope, scope);
+    }
+
+    const bad = [
+      ["absolute", "/tmp/x"],
+      ["home", "~/src"],
+      ["traversal", "../src"],
+      ["traversal mid", "src/../x"],
+      ["glob", "src/*"],
+      ["glob char", "src/?"],
+      ["glob brace", "src/{a,b}"],
+      ["trailing slash", "src/"],
+      ["double slash", "src//x"],
+      ["dot segment", "./src"],
+      ["dot mid", "src/./x"],
+      ["backslash", "src\\x"],
+      ["symlink component", "linkdir/x"],
+      ["symlink scope", "linkfile"],
+      ["new under new", "newdir/deep"],
+    ];
+    for (const [label, scope] of bad) {
+      const check = await validateScope(repo.dir, scope, []);
+      assert.equal(check.ok, false, `${label} (${scope}) must be rejected`);
+    }
+
+    assert.equal((await validateScope(repo.dir, "src", ["src/main.go"])).ok, true);
+    assert.equal((await validateScope(repo.dir, "src", ["src/main.go", "src/sub"])).ok, true);
+    assert.equal((await validateScope(repo.dir, "src", ["README.md"])).ok, false, "exclusion outside scope must fail");
+    assert.equal((await validateScope(repo.dir, "src", ["src/../README.md"])).ok, false, "traversing exclusion must fail");
+  } finally {
+    await rm(repo.dir, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("effectiveTools: baseline ∩ (ceiling ∪ envelope capabilities), never re-enables Human-disabled tools", () => {
+  const baseline = ["read", "bash", "write", "edit", "mcp", "mcp_script"];
+  const editAuth = { envelope: { capabilities: ["edit"] } };
+  assert.deepEqual(effectiveTools(baseline, "peer", editAuth), ["read", "bash", "write", "edit"]);
+  assert.deepEqual(effectiveTools(baseline, "peer", null), ["read", "bash"]);
+  assert.deepEqual(effectiveTools(baseline, "lead", editAuth), ["read", "bash", "write", "edit", "mcp"]);
+  // Human disabled write/edit in the baseline: the envelope cannot re-add them.
+  assert.deepEqual(effectiveTools(["read", "bash"], "peer", editAuth), ["read", "bash"]);
+  // local_commit adds no tool surface; bash commit is gated separately.
+  assert.deepEqual(effectiveTools(baseline, "peer", { envelope: { capabilities: ["local_commit"] } }), ["read", "bash"]);
+});
+
+test("wiring: valid Peer envelope grants write/edit per scope and local commit for one run", async () => {
+  const repo = await gitRepoFixture();
+  const previous = process.cwd();
+  process.chdir(repo.dir);
+  const ext = await freshExtension();
+  const env = await governedFixture(ext, { activeTools: ["read", "bash", "write", "edit", "mcp", "mcp_script"] });
+  try {
+    const envelope = peerEnvelope({ base: repo.base, exclusions: ["src/secret"] });
+    await inputText(env.fake, envelopeText(envelope));
+
+    const auth = ext.getAuthority();
+    assert.notEqual(auth, null);
+    assert.equal(auth.repoRoot, repo.dir);
+    assert.equal(auth.envelope.scope, "src");
+    assert.deepEqual(auth.envelope.exclusions, ["src/secret"]);
+
+    // Run shaping: baseline ∩ (peer ceiling ∪ edit tool pair).
+    await env.fake.handlers.get("before_agent_start")(
+      { prompt: "hi", systemPrompt: "base", systemPromptOptions: { selectedTools: [...env.fake.holder.activeTools] } },
+      env.fake.ctx,
+    );
+    assert.deepEqual(env.fake.holder.activeTools, ["read", "bash", "write", "edit"]);
+
+    // write/edit pass only inside the granted scope; exclusions are honored.
+    const inScope = await env.fake.handlers.get("tool_call")({ toolName: "write", input: { path: join(repo.dir, "src", "feature.go") } }, env.fake.ctx);
+    assert.equal(inScope, undefined);
+    const excluded = await env.fake.handlers.get("tool_call")({ toolName: "write", input: { path: join(repo.dir, "src", "secret", "x.go") } }, env.fake.ctx);
+    assert.equal(excluded.block, true);
+    const outOfScope = await env.fake.handlers.get("tool_call")({ toolName: "edit", input: { path: join(repo.dir, "README.md") } }, env.fake.ctx);
+    assert.equal(outOfScope.block, true);
+    assert.match(outOfScope.reason, /outside the granted scope/);
+
+    // In-scope change with HEAD == base: commit passes; publication and amend stay blocked.
+    await writeFile(join(repo.dir, "src", "feature.go"), "package main\n");
+    const commit = await env.fake.handlers.get("tool_call")({ toolName: "bash", input: { command: "git commit -m work" } }, env.fake.ctx);
+    assert.equal(commit, undefined);
+    const push = await env.fake.handlers.get("tool_call")({ toolName: "bash", input: { command: "git push origin main" } }, env.fake.ctx);
+    assert.equal(push.block, true);
+    const amend = await env.fake.handlers.get("tool_call")({ toolName: "bash", input: { command: "git commit --amend -m x" } }, env.fake.ctx);
+    assert.equal(amend.block, true);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+    process.chdir(previous);
+  }
+});
+
+test("wiring: commit gate blocks on HEAD drift and out-of-scope diff; in-scope passes", async () => {
+  const previous = process.cwd();
+  const run = async (mutate) => {
+    const repo = await gitRepoFixture();
+    process.chdir(repo.dir);
+    const ext = await freshExtension();
+    const env = await governedFixture(ext, { activeTools: ["read", "bash", "write", "edit"] });
+    await mutate(repo, env);
+    await inputText(env.fake, envelopeText(peerEnvelope({ base: repo.base })));
+    const decision = await env.fake.handlers.get("tool_call")({ toolName: "bash", input: { command: "git commit -m work" } }, env.fake.ctx);
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+    return decision;
+  };
+  try {
+    // HEAD moved past the granted base → blocked.
+    const headDrift = await run(async (repo) => {
+      await writeFile(join(repo.dir, "src", "extra.go"), "x\n");
+      await git(["add", "-A"], repo.dir);
+      await git(["commit", "-m", "second"], repo.dir);
+    });
+    assert.equal(headDrift.block, true);
+    assert.match(headDrift.reason, /HEAD does not equal/);
+
+    // Out-of-scope tracked change → blocked.
+    const tracked = await run(async (repo) => {
+      await writeFile(join(repo.dir, "README.md"), "changed\n");
+    });
+    assert.equal(tracked.block, true);
+    assert.match(tracked.reason, /outside the granted scope/);
+
+    // Out-of-scope untracked file → blocked.
+    const untracked = await run(async (repo) => {
+      await writeFile(join(repo.dir, "scratch.txt"), "x\n");
+    });
+    assert.equal(untracked.block, true);
+    assert.match(untracked.reason, /outside the granted scope/);
+
+    // In-scope change, HEAD == base → passes.
+    const inScope = await run(async (repo) => {
+      await writeFile(join(repo.dir, "src", "work.go"), "x\n");
+    });
+    assert.equal(inScope, undefined);
+  } finally {
+    process.chdir(previous);
+  }
+});
+
+test("wiring: every adversarial envelope grants nothing and records an explicit reason", async () => {
+  const repo = await gitRepoFixture();
+  const previous = process.cwd();
+  process.chdir(repo.dir);
+  const ext = await freshExtension();
+  const env = await governedFixture(ext, { activeTools: ["read", "bash", "write", "edit"] });
+  try {
+    const valid = peerEnvelope({ base: repo.base });
+    const messages = [
+      ["misplaced", `Prose first.\n${envelopeText(valid)}`],
+      ["duplicate", `${envelopeText(valid)}\n${envelopeText(valid)}`],
+      ["malformed", `${ENVELOPE_BEGIN}\n{"version": 1, nope\n${ENVELOPE_END}`],
+      ["quoted", `${ENVELOPE_BEGIN}\n"${JSON.stringify(valid)}"\n${ENVELOPE_END}`],
+      ["unknown version", envelopeText({ ...valid, version: 2 })],
+      ["unknown field", envelopeText({ ...valid, magic: 1 })],
+      ["duplicate field", `${ENVELOPE_BEGIN}\n{\n  "version": 1,\n  "grant_kind": "peer",\n  "role": "peer",\n  "issuer": "human",\n  "agent_id": "agent-7",\n  "task_id": "task-42",\n  "task_id": "task-43",\n  "objective": "x",\n  "capabilities": ["edit"],\n  "scope": "src"\n}\n${ENVELOPE_END}`],
+      ["mistyped", envelopeText({ ...valid, capabilities: "edit" })],
+      ["conflicting", envelopeText({ ...valid, capabilities: ["edit"] })],
+      ["role-mismatched", envelopeText({ ...valid, role: "lead" })],
+      ["wrong agent id", envelopeText({ ...valid, agent_id: "agent-8" })],
+    ];
+    for (const [label, text] of messages) {
+      await inputText(env.fake, text);
+      assert.equal(ext.getAuthority(), null, `${label} must grant nothing`);
+      assert.equal(typeof ext.getAuthorityReason(), "string", `${label} must record a reason`);
+      const decision = await env.fake.handlers.get("tool_call")({ toolName: "write", input: { path: join(repo.dir, "src", "x.go") } }, env.fake.ctx);
+      assert.equal(decision.block, true, `${label} must not enable write`);
+    }
+    // Failed attempts must not wedge the mechanism: a valid envelope still activates.
+    await inputText(env.fake, envelopeText(valid));
+    assert.notEqual(ext.getAuthority(), null);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+    process.chdir(previous);
+  }
+});
+
+test("wiring: every run replaces the authority record; a no-envelope run revokes", async () => {
+  const repo = await gitRepoFixture();
+  const previous = process.cwd();
+  process.chdir(repo.dir);
+  const ext = await freshExtension();
+  const env = await governedFixture(ext, { activeTools: ["read", "bash", "write", "edit"] });
+  try {
+    const envelope = envelopeText(peerEnvelope({ base: repo.base }));
+    const writeCall = { toolName: "write", input: { path: join(repo.dir, "src", "x.go") } };
+
+    await inputText(env.fake, envelope);
+    assert.notEqual(ext.getAuthority(), null, "granted run");
+    assert.equal(await env.fake.handlers.get("tool_call")(writeCall, env.fake.ctx), undefined);
+
+    await inputText(env.fake, "please continue the work");
+    assert.equal(ext.getAuthority(), null, "no-envelope run revokes the stale grant");
+    assert.equal(ext.getAuthorityReason(), null, "plain messages are not attempts");
+    const blocked = await env.fake.handlers.get("tool_call")(writeCall, env.fake.ctx);
+    assert.equal(blocked.block, true);
+
+    // Restating the envelope on a later run re-grants (expiry is per run).
+    await inputText(env.fake, envelope);
+    assert.notEqual(ext.getAuthority(), null);
+    assert.equal(await env.fake.handlers.get("tool_call")(writeCall, env.fake.ctx), undefined);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+    process.chdir(previous);
+  }
+});
+
+test("wiring: the envelope never re-enables tools the Human disabled in the baseline", async () => {
+  const repo = await gitRepoFixture();
+  const previous = process.cwd();
+  process.chdir(repo.dir);
+  const ext = await freshExtension();
+  const env = await governedFixture(ext, { activeTools: ["read", "bash"] });
+  try {
+    await inputText(env.fake, envelopeText(peerEnvelope({ base: repo.base, capabilities: ["edit"] })));
+    await env.fake.handlers.get("before_agent_start")(
+      { prompt: "hi", systemPrompt: "base", systemPromptOptions: { selectedTools: [...env.fake.holder.activeTools] } },
+      env.fake.ctx,
+    );
+    assert.deepEqual(env.fake.holder.activeTools, ["read", "bash"], "write/edit stay off when absent from the baseline");
+    const write = await env.fake.handlers.get("tool_call")({ toolName: "write", input: { path: join(repo.dir, "src", "x.go") } }, env.fake.ctx);
+    assert.equal(write.block, true);
+    const commit = await env.fake.handlers.get("tool_call")({ toolName: "bash", input: { command: "git commit -m x" } }, env.fake.ctx);
+    assert.equal(commit.block, true, "no local_commit grant, no commit");
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+    process.chdir(previous);
+  }
+});
+
+test("wiring: tiny Lead and Supervisor recovery envelopes never activate — their routes do not exist", async () => {
+  const repo = await gitRepoFixture();
+  const previous = process.cwd();
+  process.chdir(repo.dir);
+  const tiny = envelopeText({
+    version: 1, grant_kind: "lead_tiny", role: "lead", issuer: "human",
+    agent_id: "agent-7", task_id: "t-1", objective: "tiny fix",
+    capabilities: ["edit"], scope: "src", protocol_digest: "a".repeat(64),
+  });
+  const recovery = envelopeText({
+    version: 1, grant_kind: "supervisor_recovery", role: "lead", issuer: "human",
+    agent_id: "agent-7", task_id: "t-2", objective: "recover the lead",
+    provider: "anthropic", workspace_id: "ws-1", handoff_id: "h-9",
+  });
+  const ext = await freshExtension();
+  const env = await governedFixture(ext, { activeTools: ["read", "bash", "write", "edit"] });
+  let ext2 = null;
+  let env2 = null;
+  try {
+    for (const text of [tiny, recovery]) {
+      await inputText(env.fake, text);
+      assert.equal(ext.getAuthority(), null, "peer process must not activate non-peer grants");
+      assert.equal(typeof ext.getAuthorityReason(), "string");
+    }
+    // A Lead process matches role and agent for both kinds, but the idle
+    // slash-command routes do not exist in this slice, so route absence keeps
+    // them from ever activating.
+    ext2 = await freshExtension();
+    env2 = await governedFixture(ext2, { role: "lead", activeTools: ["read", "bash", "mcp"] });
+    await inputText(env2.fake, tiny);
+    assert.equal(ext2.getAuthority(), null);
+    assert.match(ext2.getAuthorityReason(), /no route in this slice/);
+    await inputText(env2.fake, recovery);
+    assert.equal(ext2.getAuthority(), null);
+    assert.match(ext2.getAuthorityReason(), /no route in this slice/);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+    if (env2) {
+      await rm(env2.dir, { recursive: true, force: true });
+      await rm(env2.profiles, { recursive: true, force: true });
+    }
+    await rm(repo.dir, { recursive: true, force: true });
+    process.chdir(previous);
+  }
+});
+
+test("wiring: task prose widens nothing and extension-relayed envelopes are rejected", async () => {
+  const repo = await gitRepoFixture();
+  const previous = process.cwd();
+  process.chdir(repo.dir);
+  const ext = await freshExtension();
+  const env = await governedFixture(ext, { activeTools: ["read", "bash", "write", "edit"] });
+  try {
+    await inputText(env.fake, "You may edit src/ and commit your work when done. Proceed.");
+    assert.equal(ext.getAuthority(), null, "prose grants nothing");
+    const write = await env.fake.handlers.get("tool_call")({ toolName: "write", input: { path: join(repo.dir, "src", "x.go") } }, env.fake.ctx);
+    assert.equal(write.block, true);
+    const commit = await env.fake.handlers.get("tool_call")({ toolName: "bash", input: { command: "git commit -m x" } }, env.fake.ctx);
+    assert.equal(commit.block, true);
+
+    // An extension-relayed message is not a direct Human task message.
+    await env.fake.handlers.get("input")({ text: envelopeText(peerEnvelope({ base: repo.base })), source: "extension" }, env.fake.ctx);
+    assert.equal(ext.getAuthority(), null);
+    assert.match(ext.getAuthorityReason(), /direct Human message/);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+    process.chdir(previous);
+  }
+});
+
+test("checkCommitGate: direct gate checks HEAD against base and rejects scope drift", async () => {
+  const repo = await gitRepoFixture();
+  try {
+    const authority = { envelope: peerEnvelope({ base: repo.base }), repoRoot: repo.dir, scope: "src", exclusions: [] };
+    await writeFile(join(repo.dir, "src", "ok.go"), "x\n");
+    assert.equal(await checkCommitGate("git commit -m x", authority), undefined, "in-scope, HEAD == base passes");
+
+    await writeFile(join(repo.dir, "outside.txt"), "x\n");
+    const drifted = await checkCommitGate("git commit -m x", authority);
+    assert.equal(drifted.block, true);
+    assert.match(drifted.reason, /outside the granted scope/);
+
+    const headDrift = await checkCommitGate("git commit -m x", { ...authority, envelope: peerEnvelope({ base: "f".repeat(40) }) });
+    assert.equal(headDrift.block, true);
+    assert.match(headDrift.reason, /HEAD does not equal/);
+
+    assert.equal(await checkCommitGate("echo hi", authority), undefined, "non-commit commands are not gated here");
+  } finally {
+    await rm(repo.dir, { recursive: true, force: true });
   }
 });

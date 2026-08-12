@@ -1,7 +1,8 @@
-import { mkdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, posix, relative } from "node:path";
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 export const ROLES = ["supervisor", "lead", "peer"];
@@ -93,8 +94,8 @@ export const AGENT_ENV = "PASEO_AGENT_ID";
 
 // Closed role ceilings: Peer is read+Bash; Supervisor and Lead add the outer
 // mcp tool (whose inner targets are validated separately). write/edit are never
-// in a ceiling — they come only from a current-run authority grant (later slice).
-// mcp_script is in no ceiling.
+// in a ceiling — they come only from a current-run Task Authority Envelope
+// grant. mcp_script is in no ceiling.
 export const CEILINGS = {
   supervisor: ["read", "bash", "mcp"],
   lead: ["read", "bash", "mcp"],
@@ -105,15 +106,27 @@ export const CEILINGS = {
 // the adapter's public observer contract is verified; empty means deny all.
 export const MCP_TARGETS = {};
 
-// Cooperative, recognizable-only publication detection. Not a sandbox: aliases,
-// scripts, and child programs can bypass it. The git pattern also catches global
+// Cooperative, recognizable-only command detection. Not a sandbox: aliases,
+// scripts, and child programs can bypass it. The git patterns also catch global
 // flag forms (`git --no-pager commit`) by scanning the command line for the
-// blocked subcommand after any `git` invocation.
-const GIT_BLOCKED = [
-  /\bgit\b[^\n;&|]*\b(?:commit|push|merge)\b/, // local commits need a current-run grant; push/merge never allowed
+// subcommand after any `git` invocation.
+const GIT_COMMIT = /\bgit\b[^\n;&|]*\bcommit\b/; // commits need a current-run local_commit grant
+const GIT_AMEND = /\bgit\b[^\n;&|]*\bcommit\b[^\n;&|]*--amend\b/; // amend is forbidden even with a grant
+const PUBLICATION = [
+  /\bgit\b[^\n;&|]*\b(?:push|merge)\b/, // push/merge never allowed
   /\bgh\s+pr\b/,
   /\b(?:vercel|netlify|flyctl?|railway|supabase|render|amplify)\s+deploy\b/,
 ];
+
+// Task Authority Envelope: one canonical v1 JSON object between exact markers,
+// accepted only as the first nonempty content of a submitted Human message.
+export const ENVELOPE_BEGIN = '<pi-paseo-orchestration authority="v1">';
+export const ENVELOPE_END = "</pi-paseo-orchestration>";
+const OBJECTIVE_MAX = 2000;
+const CAPABILITY_NAMES = ["edit", "local_commit"];
+const GRANT_KIND_ROLE = { peer: "peer", lead_tiny: "lead", supervisor_recovery: "lead" };
+const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const SHA256_HEX = /^[0-9a-f]{64}$/;
 
 const PROFILE_MARKER = (role, digest) =>
   `<pi-paseo-orchestration role="${role}" profile="sha256:${digest.slice(0, 12)}">`;
@@ -299,12 +312,367 @@ export function checkToolCall(toolName, input, policy) {
   }
   if (toolName === "bash") {
     if (typeof input?.command !== "string") return block("bash call without a command string");
-    for (const pattern of GIT_BLOCKED) {
-      if (pattern.test(input.command)) return block("publication/commit route is always blocked without an explicit grant");
+    for (const pattern of PUBLICATION) {
+      if (pattern.test(input.command)) return block("publication route is always blocked");
+    }
+    if (GIT_AMEND.test(input.command)) return block("git commit --amend is forbidden");
+    if (GIT_COMMIT.test(input.command) && !policy.envelope?.capabilities?.includes("local_commit")) {
+      return block("git commit requires a current-run local_commit grant");
+    }
+    return undefined;
+  }
+  if (toolName === "write" || toolName === "edit") {
+    if (!policy.envelope) return block(`${toolName} requires a current-run edit grant`);
+    if (policy.repoRoot == null) return block(`${toolName} target cannot be checked without a repository root`);
+    const target = input?.path ?? input?.file_path;
+    const rel = targetToRepoRelative(policy.repoRoot, target);
+    if (rel === null || !isPathInScope(rel, policy.envelope.scope, policy.envelope.exclusions)) {
+      return block(`${toolName} target ${JSON.stringify(target)} is outside the granted scope`);
     }
     return undefined;
   }
   return undefined;
+}
+
+// ─── Task Authority Envelope ─────────────────────────────────────────────────
+
+// Raw duplicate-key scan: JSON.parse silently keeps the last duplicate, but the
+// closed schema must reject duplicate fields. Keys are compared decoded (via
+// JSON.parse of the raw key token) so escape variants (`"\u0061"` vs `"a"`)
+// cannot slip through.
+function findDuplicateKey(jsonText) {
+  const stack = [];
+  let i = 0;
+  const n = jsonText.length;
+  while (i < n) {
+    const c = jsonText[i];
+    if (c === '"') {
+      const start = i;
+      i++;
+      while (i < n) {
+        if (jsonText[i] === "\\") {
+          i += 2;
+          continue;
+        }
+        if (jsonText[i] === '"') break;
+        i++;
+      }
+      let j = i + 1;
+      while (j < n && /\s/.test(jsonText[j])) j++;
+      if (jsonText[j] === ":") {
+        const top = stack[stack.length - 1];
+        if (top !== undefined && top !== null) {
+          let key;
+          try {
+            key = JSON.parse(jsonText.slice(start, i + 1));
+          } catch {
+            key = jsonText.slice(start + 1, i);
+          }
+          if (top.has(key)) return key;
+          top.set(key, true);
+        }
+      }
+      i = j; // resume just past the string (and any whitespace)
+      continue;
+    }
+    if (c === "{") stack.push(new Map());
+    else if (c === "}") stack.pop();
+    else if (c === "[") stack.push(null);
+    else if (c === "]") stack.pop();
+    i++;
+  }
+  return null;
+}
+
+// Closed v1 schema per grant kind. Unknown version/kind/field, duplicate field,
+// mistyped, conflicting (e.g. base without local_commit), and role-mismatched
+// data all fail closed with an explicit reason.
+function validateEnvelopeShape(obj) {
+  const err = (error) => ({ ok: false, error });
+  if (obj === null || typeof obj !== "object" || Array.isArray(obj)) {
+    return err("authority envelope body must be a single JSON object");
+  }
+  if (obj.version !== 1) {
+    return err(`authority envelope version must be exactly 1 (got ${JSON.stringify(obj.version)})`);
+  }
+  const kind = obj.grant_kind;
+  if (!Object.prototype.hasOwnProperty.call(GRANT_KIND_ROLE, kind)) {
+    return err(`grant_kind must be one of peer|lead_tiny|supervisor_recovery (got ${JSON.stringify(kind)})`);
+  }
+  if (obj.role !== GRANT_KIND_ROLE[kind]) {
+    return err(`grant_kind ${kind} requires role ${GRANT_KIND_ROLE[kind]} (got ${JSON.stringify(obj.role)})`);
+  }
+  if (obj.issuer !== "human") {
+    return err(`issuer must be exactly "human" (got ${JSON.stringify(obj.issuer)})`);
+  }
+  for (const field of ["agent_id", "task_id"]) {
+    if (typeof obj[field] !== "string" || obj[field].trim() === "") {
+      return err(`${field} must be a nonempty string`);
+    }
+  }
+  if (typeof obj.objective !== "string" || obj.objective.trim() === "") {
+    return err("objective must be a nonempty string");
+  }
+  if (obj.objective.length > OBJECTIVE_MAX) {
+    return err(`objective exceeds the ${OBJECTIVE_MAX}-character bound`);
+  }
+
+  if (kind === "supervisor_recovery") {
+    const fields = ["version", "grant_kind", "role", "issuer", "agent_id", "task_id", "objective", "provider", "workspace_id", "handoff_id"];
+    const extra = Object.keys(obj).find((k) => !fields.includes(k));
+    if (extra !== undefined) return err(`unknown field ${JSON.stringify(extra)} in supervisor_recovery envelope`);
+    for (const field of ["provider", "workspace_id", "handoff_id"]) {
+      if (typeof obj[field] !== "string" || obj[field].trim() === "") {
+        return err(`${field} must be a nonempty string`);
+      }
+    }
+    return { ok: true, envelope: { ...obj, capabilities: [] } };
+  }
+
+  const fields = ["version", "grant_kind", "role", "issuer", "agent_id", "task_id", "objective", "capabilities", "scope", "exclusions", "base"];
+  if (kind === "lead_tiny") fields.push("protocol_digest");
+  const extra = Object.keys(obj).find((k) => !fields.includes(k));
+  if (extra !== undefined) return err(`unknown field ${JSON.stringify(extra)} in ${kind} envelope`);
+
+  if (!Array.isArray(obj.capabilities) || obj.capabilities.length === 0) {
+    return err("capabilities must be a nonempty array");
+  }
+  if (new Set(obj.capabilities).size !== obj.capabilities.length) {
+    return err("capabilities must not repeat");
+  }
+  for (const cap of obj.capabilities) {
+    if (typeof cap !== "string" || !CAPABILITY_NAMES.includes(cap)) {
+      return err(`unknown capability ${JSON.stringify(cap)}`);
+    }
+  }
+  if (typeof obj.scope !== "string" || obj.scope === "") {
+    return err("scope must be a nonempty repository-relative string");
+  }
+  let exclusions = [];
+  if (obj.exclusions !== undefined) {
+    if (!Array.isArray(obj.exclusions)) return err("exclusions must be an array");
+    for (const e of obj.exclusions) {
+      if (typeof e !== "string" || e === "") return err("each exclusion must be a nonempty string");
+    }
+    exclusions = obj.exclusions;
+  }
+  const commitGranted = obj.capabilities.includes("local_commit");
+  if (commitGranted) {
+    if (typeof obj.base !== "string" || !FULL_SHA.test(obj.base)) {
+      return err("base must be a full git commit SHA when local_commit is granted");
+    }
+  } else if (obj.base !== undefined) {
+    return err("base is only valid when local_commit is granted");
+  }
+  if (kind === "lead_tiny" && (typeof obj.protocol_digest !== "string" || !SHA256_HEX.test(obj.protocol_digest))) {
+    return err("protocol_digest must be a full sha256 hex digest");
+  }
+  return { ok: true, envelope: { ...obj, exclusions } };
+}
+
+// Parses the authority envelope from a submitted message. Returns
+// { ok: true, envelope: null } when no envelope is present, { ok: true,
+// envelope } for a schema-valid envelope, or { ok: false, error } when an
+// envelope attempt exists but is misplaced, duplicated, malformed, quoted, or
+// otherwise invalid — nothing is granted in that case.
+export function parseEnvelope(text) {
+  if (typeof text !== "string") return { ok: true, envelope: null };
+  const stripped = text.trimStart();
+  if (!stripped.includes(ENVELOPE_BEGIN)) {
+    if (stripped.includes("<pi-paseo-orchestration")) {
+      return { ok: false, error: "unrecognized authority envelope marker (unknown marker version or malformed)" };
+    }
+    return { ok: true, envelope: null };
+  }
+  if (!stripped.startsWith(ENVELOPE_BEGIN)) {
+    return { ok: false, error: "authority envelope must be the first nonempty content of the message" };
+  }
+  // A second begin marker anywhere (even in trailing prose) is a duplicate.
+  if (stripped.indexOf(ENVELOPE_BEGIN, 1) !== -1) {
+    return { ok: false, error: "duplicate authority envelope in one message" };
+  }
+  const endAt = stripped.indexOf(ENVELOPE_END, ENVELOPE_BEGIN.length);
+  if (endAt === -1) {
+    return { ok: false, error: "authority envelope has no closing marker" };
+  }
+  const body = stripped.slice(ENVELOPE_BEGIN.length, endAt);
+  const dup = findDuplicateKey(body);
+  if (dup !== null) {
+    return { ok: false, error: `duplicate field ${JSON.stringify(dup)} in authority envelope` };
+  }
+  let obj;
+  try {
+    obj = JSON.parse(body);
+  } catch {
+    return { ok: false, error: "authority envelope body is not valid JSON" };
+  }
+  return validateEnvelopeShape(obj);
+}
+
+function isPathInScope(rel, scope, exclusions) {
+  const within = rel === scope || rel.startsWith(scope + "/");
+  if (!within) return false;
+  return !(exclusions ?? []).some((e) => rel === e || rel.startsWith(e + "/"));
+}
+
+// Converts a write/edit target (absolute or repo-relative) to a canonical
+// repo-relative path, or null when it is outside the repository or ambiguous.
+function targetToRepoRelative(repoRoot, target) {
+  if (typeof target !== "string" || target.trim() === "") return null;
+  let rel = target;
+  if (isAbsolute(target) || /^[A-Za-z]:[\\/]/.test(target)) {
+    rel = relative(repoRoot, target);
+    if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) return null;
+  }
+  rel = posix.normalize(rel);
+  if (rel === "." || rel === ".." || rel.startsWith("../")) return null;
+  return rel;
+}
+
+// One granted scope path: nonempty, repository-relative, no absolute/home
+// path, no backslashes, no empty/dot/traversal segments, no glob characters,
+// no symlink components, and at most a new final component inside an existing
+// real directory ("new files outside an existing real directory" are rejected).
+async function checkScopePath(repoRoot, p, label) {
+  if (typeof p !== "string" || p === "") return { ok: false, error: `${label} must be a nonempty string` };
+  if (p !== p.trim()) return { ok: false, error: `${label} must not have leading or trailing whitespace` };
+  if (isAbsolute(p) || /^[A-Za-z]:[\\/]/.test(p) || p.startsWith("~")) {
+    return { ok: false, error: `${label} must be repository-relative, not an absolute or home path` };
+  }
+  if (p.includes("\\")) return { ok: false, error: `${label} must use forward-slash repository-relative paths` };
+  const segments = p.split("/");
+  for (const segment of segments) {
+    if (segment === "" || segment === ".") {
+      return { ok: false, error: `${label} has an empty or ambiguous segment (no ".", trailing "/", or "//")` };
+    }
+    if (segment === "..") return { ok: false, error: `${label} must not traverse outside the repository` };
+    if (/[*?[\]{}]/.test(segment)) return { ok: false, error: `${label} must not contain glob characters` };
+  }
+  for (let i = 1; i <= segments.length; i++) {
+    const current = join(repoRoot, ...segments.slice(0, i));
+    let st;
+    try {
+      st = await lstat(current);
+    } catch {
+      if (i < segments.length) {
+        return { ok: false, error: `${label} names a new file outside an existing real directory` };
+      }
+      return { ok: true, canonical: p }; // new final component inside an existing real directory
+    }
+    if (st.isSymbolicLink()) return { ok: false, error: `${label} contains a symlink component` };
+    if (!st.isDirectory()) {
+      if (i < segments.length) return { ok: false, error: `${label} descends through a non-directory` };
+      if (!st.isFile()) return { ok: false, error: `${label} must be a directory or a regular file` };
+    }
+  }
+  return { ok: true, canonical: p };
+}
+
+// Normalized repository-relative writable scope plus in-scope exclusions,
+// checked at envelope activation against the real repository filesystem.
+export async function validateScope(repoRoot, scope, exclusions = []) {
+  const scopeCheck = await checkScopePath(repoRoot, scope, "scope");
+  if (!scopeCheck.ok) return scopeCheck;
+  const canonical = [];
+  for (const exclusion of exclusions) {
+    const check = await checkScopePath(repoRoot, exclusion, `exclusion ${JSON.stringify(exclusion)}`);
+    if (!check.ok) return check;
+    if (!isPathInScope(exclusion, scope, [])) {
+      return { ok: false, error: `exclusion ${JSON.stringify(exclusion)} must lie within scope ${JSON.stringify(scope)}` };
+    }
+    canonical.push(exclusion);
+  }
+  return { ok: true, scope, exclusions: canonical };
+}
+
+// One shared effective-policy computation: baseline ∩ (role ceiling ∪
+// current-run envelope capabilities). The envelope's `edit` capability maps to
+// the write and edit tools; `local_commit` gates git commit through bash
+// instead of adding a tool. Tools outside the baseline are never re-enabled.
+export function effectiveTools(baseline, role, authority = null) {
+  const ceiling = CEILINGS[role] ?? [];
+  const extra = [];
+  if (authority?.envelope?.capabilities?.includes("edit")) extra.push("write", "edit");
+  return baseline.filter((tool) => ceiling.includes(tool) || extra.includes(tool));
+}
+
+function gitOut(repoRoot, args) {
+  return new Promise((resolve) => {
+    execFile("git", args, { cwd: repoRoot, timeout: 15000 }, (err, stdout) => {
+      resolve(err ? null : stdout.trim());
+    });
+  });
+}
+
+function findRepoRoot(cwd = process.cwd()) {
+  return gitOut(cwd, ["rev-parse", "--show-toplevel"]).then((root) => (root === "" ? null : root));
+}
+
+async function gitChangedPaths(repoRoot) {
+  const [unstaged, staged, untracked] = await Promise.all([
+    gitOut(repoRoot, ["diff", "--name-only", "HEAD"]),
+    gitOut(repoRoot, ["diff", "--cached", "--name-only", "HEAD"]),
+    gitOut(repoRoot, ["ls-files", "--others", "--exclude-standard"]),
+  ]);
+  if (unstaged === null || staged === null || untracked === null) return null;
+  const paths = new Set();
+  for (const list of [unstaged, staged, untracked]) {
+    for (const line of list.split("\n")) {
+      const p = line.trim();
+      if (p !== "") paths.add(p);
+    }
+  }
+  return [...paths];
+}
+
+// Call-time gate for recognizable `git commit` under a local_commit grant:
+// HEAD must still equal the granted candidate base and the current/cumulative
+// diff (staged, unstaged, and untracked paths) must stay within the granted
+// scope. Cooperative like the rest of the guardrail — aliases, scripts, and
+// child programs can bypass it.
+export async function checkCommitGate(command, authority) {
+  const { envelope, repoRoot, scope, exclusions } = authority;
+  if (!envelope.capabilities.includes("local_commit")) {
+    return { block: true, reason: "git commit requires a current-run local_commit grant" };
+  }
+  if (!GIT_COMMIT.test(command ?? "")) return undefined;
+  const head = await gitOut(repoRoot, ["rev-parse", "HEAD"]);
+  if (head !== envelope.base) {
+    return { block: true, reason: "git commit blocked: current HEAD does not equal the granted candidate base" };
+  }
+  const changed = await gitChangedPaths(repoRoot);
+  if (changed === null) {
+    return { block: true, reason: "git commit blocked: cannot inspect the current diff" };
+  }
+  for (const p of changed) {
+    if (!isPathInScope(p, scope, exclusions)) {
+      return { block: true, reason: `git commit blocked: ${p} is outside the granted scope` };
+    }
+  }
+  return undefined;
+}
+
+// Route binding: the direct Human task message is the only authority route in
+// this slice. tiny Lead and Supervisor recovery grant kinds are parsed and
+// schema-validated above, but their idle governed slash-command flows do not
+// exist yet (later slice) — route absent means grant nothing.
+async function activateEnvelope(envelope) {
+  if (envelope.role !== latch.role) {
+    return { ok: false, error: `envelope role ${JSON.stringify(envelope.role)} does not match the ${latch.role} process` };
+  }
+  if (envelope.agent_id !== latch.agentId) {
+    return { ok: false, error: `envelope agent_id ${JSON.stringify(envelope.agent_id)} does not match the latched Paseo agent ${JSON.stringify(latch.agentId)}` };
+  }
+  if (envelope.grant_kind !== "peer") {
+    return { ok: false, error: `grant_kind ${envelope.grant_kind} has no route in this slice: its idle slash-command flow does not exist yet, so it grants nothing` };
+  }
+  const repoRoot = await findRepoRoot();
+  if (repoRoot === null) {
+    return { ok: false, error: "no git repository root is observable for scope validation" };
+  }
+  const check = await validateScope(repoRoot, envelope.scope, envelope.exclusions);
+  if (!check.ok) return check;
+  return { ok: true, authority: { envelope, repoRoot, scope: check.scope, exclusions: check.exclusions } };
 }
 
 async function runSettings(_args, ctx) {
@@ -368,6 +736,20 @@ async function runSettings(_args, ctx) {
 let latch = null;
 let blockedReason = null;
 let baseline = null;
+// Current-run authority record: { envelope, repoRoot, scope, exclusions } or
+// null when the run carries no valid grant. Replaced on every input event.
+let currentAuthority = null;
+// Last explicit no-authority reason (diagnostics; doctor reads it later).
+let authorityReason = null;
+
+export function getAuthority() {
+  if (currentAuthority === null) return null;
+  return { envelope: { ...currentAuthority.envelope }, repoRoot: currentAuthority.repoRoot };
+}
+
+export function getAuthorityReason() {
+  return authorityReason;
+}
 
 const bundledDir = (() => {
   try {
@@ -415,6 +797,8 @@ export default function (pi) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    currentAuthority = null; // new/resumed/forked sessions inherit no authority
+    authorityReason = null;
     const env = envOf(ctx);
     const dir = configDir(env);
     if (latch !== null) {
@@ -463,6 +847,33 @@ export default function (pi) {
       return { action: "handled" };
     }
     if (!(await verifyOrBlock(ctx, configDir(envOf(ctx))))) return { action: "handled" };
+    // Authority lifetime: every run (input) replaces the internal current-run
+    // authority record — including replacement with NO authority when the
+    // message carries no valid envelope. Only the direct Human task-message
+    // route (Peer grants) exists in this slice; tiny Lead and Supervisor
+    // recovery grant kinds parse and validate, but their idle slash-command
+    // routes do not exist yet, so route absence keeps them from ever
+    // activating here. New/resumed/forked sessions inherit nothing.
+    currentAuthority = null;
+    authorityReason = null;
+    if (event.source === "extension") {
+      authorityReason = "authority envelope route must be a direct Human message, not an extension relay";
+      ctx.ui?.notify?.(`pi-paseo-orchestration: no authority granted (${authorityReason})`, "error");
+    } else {
+      const parsed = parseEnvelope(event.text ?? "");
+      if (!parsed.ok) {
+        authorityReason = parsed.error;
+        ctx.ui?.notify?.(`pi-paseo-orchestration: no authority granted (${parsed.error})`, "error");
+      } else if (parsed.envelope !== null) {
+        const activated = await activateEnvelope(parsed.envelope);
+        if (!activated.ok) {
+          authorityReason = activated.error;
+          ctx.ui?.notify?.(`pi-paseo-orchestration: no authority granted (${activated.error})`, "error");
+        } else {
+          currentAuthority = activated.authority;
+        }
+      }
+    }
     return { action: "continue" };
   });
 
@@ -479,7 +890,7 @@ export default function (pi) {
       blockWith(ctx, tools.error);
       return undefined;
     }
-    const allowed = intersectTools(baseline, latch.role);
+    const allowed = effectiveTools(baseline, latch.role, currentAuthority);
     if (typeof pi.setActiveTools === "function") pi.setActiveTools(allowed);
     return {
       systemPrompt: `${event.systemPrompt}\n\n${PROFILE_MARKER(latch.role, latch.profileDigest)}\n${latch.profileText}\n</pi-paseo-orchestration>`,
@@ -494,15 +905,27 @@ export default function (pi) {
     if (!(await verifyOrBlock(ctx, configDir(envOf(ctx))))) {
       return { block: true, reason: `pi-paseo-orchestration blocked: ${blockedReason}` };
     }
-    const allowed = new Set(intersectTools(baseline ?? [], latch.role));
+    const allowed = new Set(effectiveTools(baseline ?? [], latch.role, currentAuthority));
     const decision = checkToolCall(event.toolName, event.input, {
       role: latch.role,
       allowed,
       mcpTargets: MCP_TARGETS,
+      envelope: currentAuthority?.envelope ?? null,
+      repoRoot: currentAuthority?.repoRoot ?? null,
     });
     if (decision?.block) {
       ctx.ui?.notify?.(`Blocked ${event.toolName}: ${decision.reason}`, "error");
       return decision;
+    }
+    // The commit gate is the async continuation of the same bash check: the
+    // static layer admits `git commit` only under a local_commit grant, and
+    // this layer re-checks HEAD and diff scope against the granted base.
+    if (event.toolName === "bash" && currentAuthority !== null && GIT_COMMIT.test(event.input?.command ?? "")) {
+      const gate = await checkCommitGate(event.input?.command ?? "", currentAuthority);
+      if (gate?.block) {
+        ctx.ui?.notify?.(`Blocked ${event.toolName}: ${gate.reason}`, "error");
+        return gate;
+      }
     }
     return undefined;
   });
