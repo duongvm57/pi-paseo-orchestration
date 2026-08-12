@@ -107,10 +107,10 @@ const validDoc = {
   },
 };
 
-test("manifest declares only one Pi extension and one Pi skill", () => {
+test("manifest declares one Pi extension and the two packaged skills", () => {
   assert.deepEqual(manifest.pi, {
     extensions: ["./extensions/pi-paseo-orchestration.ts"],
-    skills: ["./skills/workspace-protocol/SKILL.md"],
+    skills: ["./skills/workspace-protocol/SKILL.md", "./skills/full-topology-test/SKILL.md"],
   });
   assert.deepEqual(manifest.scripts, { test: "node --test test/package.test.mjs", typecheck: "tsc --noEmit", "release:smoke": "node test/release-smoke.mjs" });
 
@@ -122,7 +122,7 @@ test("manifest declares only one Pi extension and one Pi skill", () => {
 test("declared resources and private profiles are nonempty files", async () => {
   const paths = [
     manifest.pi.extensions[0],
-    manifest.pi.skills[0],
+    ...manifest.pi.skills,
     "skills/workspace-protocol/AUTHORING-GUIDE.md",
     "profiles/supervisor.md",
     "profiles/lead.md",
@@ -137,9 +137,12 @@ test("declared resources and private profiles are nonempty files", async () => {
 
   assert.equal(JSON.stringify(manifest.pi).includes("profiles"), false);
   const skill = await readFile(join(root, manifest.pi.skills[0]), "utf8");
+  const topologySkill = await readFile(join(root, manifest.pi.skills[1]), "utf8");
   const guide = await readFile(join(root, "skills/workspace-protocol/AUTHORING-GUIDE.md"), "utf8");
   assert.match(skill, /^---\nname: workspace-protocol\ndescription: .+\n---/);
   assert.match(skill, /\.\/AUTHORING-GUIDE\.md/);
+  assert.match(topologySkill, /^---\nname: full-topology-test\ndescription: .+\ndisable-model-invocation: true\n/);
+  assert.match(topologySkill, /scripts\/run\.mjs/);
   assert.match(guide, /^# Workspace Protocol Authoring Guide\n/);
   assert.deepEqual(guide.match(/^## \d+\..+$/gm), [
     "## 1. Protocol boundary",
@@ -896,6 +899,21 @@ test("wiring: an attempted tool re-enablement is healed and still gated per call
     assert.deepEqual(env.fake.holder.activeTools, ["read", "bash"]);
     const passed = await env.fake.handlers.get("tool_call")({ toolName: "read", input: {} }, env.fake.ctx);
     assert.equal(passed, undefined);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+  }
+});
+
+test("command: doctor heals tool drift introduced after governed activation", async () => {
+  const ext = await freshExtension();
+  const env = await governedCommandFixture(ext, { role: "peer", activeTools: ["read", "bash"] });
+  try {
+    env.fake.holder.activeTools.push("complete_goal", "list_add");
+    const result = await env.fake.commands.get("ppo:doctor").handler("", env.fake.ctx);
+    assert.equal(result.ok, true);
+    assert.deepEqual(env.fake.holder.activeTools, ["read", "bash"]);
+    assert.equal(result.report.checks.find((check) => check.code === "TOOL_POLICY").status, "PASS");
   } finally {
     await rm(env.dir, { recursive: true, force: true });
     await rm(env.profiles, { recursive: true, force: true });
@@ -2131,11 +2149,12 @@ test("command: supervisor-recovery binds provider/workspace/handoff, never grant
     const handler = env.fake.commands.get("ppo:supervisor-recovery").handler;
     assert.notEqual(handler, undefined);
 
-    const inputs = ["t-2", "Recover the lead after a crash", "ws-1", "h-9"];
+    const inputs = ["t-2", "Recover the lead after a crash", "ppo-lead", "ws-1", "h-9"];
+    env.fake.ctx.modelRegistry = undefined;
     env.fake.ctx.ui = {
       ...env.fake.ctx.ui,
       input: async () => inputs.shift(),
-      select: async () => "anthropic",
+      select: async () => { throw new Error("recovery provider is a Paseo alias, not a Pi model provider"); },
       confirm: async () => true,
     };
     await handler("", env.fake.ctx);
@@ -2145,7 +2164,7 @@ test("command: supervisor-recovery binds provider/workspace/handoff, never grant
     assert.equal(pending.role, "lead");
     assert.equal(pending.agent_id, "agent-7");
     assert.deepEqual(pending.capabilities, []);
-    assert.equal(pending.provider, "anthropic");
+    assert.equal(pending.provider, "ppo-lead");
     assert.equal(pending.workspace_id, "ws-1");
     assert.equal(pending.handoff_id, "h-9");
 
@@ -2154,7 +2173,7 @@ test("command: supervisor-recovery binds provider/workspace/handoff, never grant
     const auth = ext.getAuthority();
     assert.notEqual(auth, null);
     assert.equal(auth.envelope.grant_kind, "supervisor_recovery");
-    assert.equal(auth.envelope.provider, "anthropic");
+    assert.equal(auth.envelope.provider, "ppo-lead");
     assert.equal(auth.envelope.workspace_id, "ws-1");
     assert.equal(auth.envelope.handoff_id, "h-9");
     assert.equal(ext.getPendingAuthority(), null);
@@ -3218,6 +3237,8 @@ test("package resources resolve from canonical loaded-module provenance: real ro
   assert.equal(resolved.resources.extension, join(realRoot, manifest.pi.extensions[0]));
   assert.equal(resolved.resources.skill, join(realRoot, manifest.pi.skills[0]));
   assert.equal(resolved.resources.guide, join(realRoot, "skills/workspace-protocol/AUTHORING-GUIDE.md"));
+  assert.equal(resolved.resources.topology_skill, join(realRoot, manifest.pi.skills[1]));
+  assert.equal(resolved.resources.topology_runner, join(realRoot, "skills/full-topology-test/scripts/run.mjs"));
   assert.deepEqual(Object.keys(resolved.resources.profiles).sort(), ["lead", "peer", "supervisor"]);
   for (const [role, rel] of [["supervisor", "profiles/supervisor.md"], ["lead", "profiles/lead.md"], ["peer", "profiles/peer.md"]]) {
     assert.equal(resolved.resources.profiles[role], join(realRoot, rel));
@@ -3232,6 +3253,8 @@ test("package resources resolve from canonical loaded-module provenance: real ro
     assert.equal(copied.ok, true, copied.error);
     assert.notEqual(copied.resources.package_root, realRoot);
     assert.equal(copied.resources.guide, join(copied.resources.package_root, "skills/workspace-protocol/AUTHORING-GUIDE.md"));
+    assert.equal(copied.resources.topology_skill, join(copied.resources.package_root, manifest.pi.skills[1]));
+    assert.equal(copied.resources.topology_runner, join(copied.resources.package_root, "skills/full-topology-test/scripts/run.mjs"));
     assert.deepEqual(copied.resources.profiles, {
       supervisor: join(copied.resources.package_root, "profiles/supervisor.md"),
       lead: join(copied.resources.package_root, "profiles/lead.md"),
@@ -3296,7 +3319,7 @@ test("package resources fail closed on missing, empty, non-regular, symlink-esca
   cases.push([twoExtensions, async () => writeManifest(twoExtensions, { pi: { ...JSON.parse(await readFile(join(twoExtensions, "package.json"), "utf8")).pi, extensions: ["./extensions/a.ts", "./extensions/b.ts"] } }), /exactly one extension/]);
 
   const noSkill = await makeCopy();
-  cases.push([noSkill, async () => writeManifest(noSkill, { pi: { ...JSON.parse(await readFile(join(noSkill, "package.json"), "utf8")).pi, skills: [] } }), /exactly one skill/]);
+  cases.push([noSkill, async () => writeManifest(noSkill, { pi: { ...JSON.parse(await readFile(join(noSkill, "package.json"), "utf8")).pi, skills: [] } }), /exactly two skills/]);
 
   const adapterDep = await makeCopy();
   cases.push([adapterDep, () => writeManifest(adapterDep, { dependencies: { "pi-mcp-adapter": "2.22.0" } }), /adapter dependency/]);

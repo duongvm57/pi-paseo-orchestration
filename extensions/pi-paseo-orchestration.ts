@@ -3707,6 +3707,10 @@ export async function runDoctor(args, ctx, pi) {
     if (typeof notify === "function" && ctx.outputMode !== "print" && ctx.outputMode !== "json") notify(error, "error");
     return { ok: false, error };
   }
+  if (latch !== null) {
+    const tools = await ensureToolPolicy(pi);
+    if (!tools.ok) return { ok: false, error: "error" in tools ? tools.error : "active-tool policy cannot be re-applied" };
+  }
   const report = await buildDoctorReport({ ctx, pi });
   const block = formatDoctorReport(report);
   const table = formatDoctorTable(report);
@@ -3842,13 +3846,7 @@ async function runSupervisorRecovery(_args, ctx) {
   if (!taskId) return cancelled();
   const objective = await ui.input("Bounded objective for the replacement Lead:", "");
   if (!objective) return cancelled();
-  const models = ctx.modelRegistry?.getAvailable?.() ?? [];
-  const providers = [...new Set(models.map((m) => m.provider))].sort();
-  if (providers.length === 0) {
-    notify("No providers available in the current model registry; no pending authority stored.", "error");
-    return;
-  }
-  const provider = await ui.select("Provider for the replacement Lead:", providers);
+  const provider = await ui.input("Human-attested Paseo provider alias for the replacement Lead:", "");
   if (!provider) return cancelled();
   const workspaceId = await ui.input("Paseo workspace ID for the replacement Lead:", "");
   if (!workspaceId) return cancelled();
@@ -4074,6 +4072,7 @@ export function getProtocolPin() {
 // containment pattern from validateProfileDir).
 const BUNDLED_PROFILE_FILES = ["supervisor.md", "lead.md", "peer.md"];
 const BUNDLED_SKILL_GUIDE_FILE = "AUTHORING-GUIDE.md";
+const BUNDLED_TOPOLOGY_RUNNER_FILE = "scripts/run.mjs";
 const MANIFEST_DEPENDENCY_FIELDS = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"];
 const MANIFEST_INSTALL_SCRIPTS = ["preinstall", "install", "postinstall"];
 
@@ -4111,9 +4110,9 @@ export async function resolvePackageResources(moduleUrl = import.meta.url) {
       || typeof manifest.pi.extensions[0] !== "string" || manifest.pi.extensions[0] === "") {
     return { ok: false, error: "package manifest must declare exactly one extension" };
   }
-  if (!Array.isArray(manifest.pi.skills) || manifest.pi.skills.length !== 1
-      || typeof manifest.pi.skills[0] !== "string" || manifest.pi.skills[0] === "") {
-    return { ok: false, error: "package manifest must declare exactly one skill" };
+  if (!Array.isArray(manifest.pi.skills) || manifest.pi.skills.length !== 2
+      || manifest.pi.skills.some((skill) => typeof skill !== "string" || skill === "")) {
+    return { ok: false, error: "package manifest must declare exactly two skills" };
   }
   for (const field of MANIFEST_DEPENDENCY_FIELDS) {
     const deps = manifest[field];
@@ -4134,9 +4133,11 @@ export async function resolvePackageResources(moduleUrl = import.meta.url) {
     ["extension", manifest.pi.extensions[0]],
     ["skill", manifest.pi.skills[0]],
     ["guide", join(dirname(manifest.pi.skills[0]), BUNDLED_SKILL_GUIDE_FILE)],
+    ["topology skill", manifest.pi.skills[1]],
+    ["topology runner", join(dirname(manifest.pi.skills[1]), BUNDLED_TOPOLOGY_RUNNER_FILE)],
     ...BUNDLED_PROFILE_FILES.map((file) => [`profile ${file}`, join("profiles", file)]),
   ];
-  const resources = { package_root: realRoot, profiles: {}, extension: null, skill: null, guide: null };
+  const resources = { package_root: realRoot, profiles: {}, extension: null, skill: null, guide: null, topology_skill: null, topology_runner: null };
   for (const [label, rel] of declared) {
     if (isAbsolute(rel)) return { ok: false, error: `${label} must be a direct descendant of the package root (absolute path)` };
     const full = join(realRoot, rel);
@@ -4156,6 +4157,8 @@ export async function resolvePackageResources(moduleUrl = import.meta.url) {
     if (!(await stat(real)).isFile()) return { ok: false, error: `${label} must be a regular file (${rel})` };
     if ((await readFile(real, "utf8")).trim() === "") return { ok: false, error: `${label} must be nonempty (${rel})` };
     if (label === "extension" || label === "skill" || label === "guide") resources[label] = real;
+    else if (label === "topology skill") resources.topology_skill = real;
+    else if (label === "topology runner") resources.topology_runner = real;
     else resources.profiles[label.slice("profile ".length).replace(/\.md$/, "")] = real;
   }
   // The loaded module must be the manifest-declared extension.

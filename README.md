@@ -9,11 +9,12 @@ package.json
 extensions/pi-paseo-orchestration.ts
 profiles/{supervisor,lead,peer}.md
 skills/workspace-protocol/{SKILL.md,AUTHORING-GUIDE.md}
+skills/full-topology-test/{SKILL.md,scripts/run.mjs}
 test/package.test.mjs
 test/release-smoke.mjs
 ```
 
-The manifest exposes exactly one extension and one Workspace Protocol skill. `AUTHORING-GUIDE.md` is the skill's packaged reference, not a second discoverable skill. The three Role Profiles are private package data: they are not Pi prompts or independently discoverable skills, and contain no secrets.
+The manifest exposes exactly one extension and two skills: Workspace Protocol authoring and the user-invoked live full-topology proof. Their guides/scripts are packaged references, not additional discoverable skills. The three Role Profiles are private package data: they are not Pi prompts or independently discoverable skills, and contain no secrets.
 
 The extension registers these package surfaces:
 
@@ -123,9 +124,10 @@ role proof.
 npm test
 npm run release:smoke
 git diff --check
+node skills/full-topology-test/scripts/run.mjs --workspace <paseo-workspace-id>
 ```
 
-The standard-library test suite covers package resources, settings, activation, policy, strict contracts, Git candidate checks, Notebook behavior, doctor observation, release gating, and mutation boundaries. The release smoke proves relocation and local package seams, and exits non-zero while required live adapter/Paseo/install facts remain unproven.
+The standard-library test suite covers package resources, settings, activation, policy, strict contracts, Git candidate checks, Notebook behavior, doctor observation, release gating, and mutation boundaries. The live runner proves Supervisor → Lead → Peer identities, doctor policy, and Peer Report correlation, then archives its agents. `notifyOnFinish` is only an attention signal for the created child run; it is not a mailbox or delivery guarantee for a report emitted by a later follow-up. The release smoke proves relocation and local package seams, and exits non-zero while required live adapter/Paseo/install facts remain unproven.
 
 ## Public Pi seam
 

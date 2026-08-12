@@ -15,7 +15,8 @@
       "./extensions/pi-paseo-orchestration.ts"
     ],
     "skills": [
-      "./skills/workspace-protocol/SKILL.md"
+      "./skills/workspace-protocol/SKILL.md",
+      "./skills/full-topology-test/SKILL.md"
     ]
   },
   "devDependencies": {
