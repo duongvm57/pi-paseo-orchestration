@@ -242,25 +242,24 @@ export async function activate({ env, dir, profileDir, models, setModel, setThin
   const sel = settings.roles[roleCheck.role];
   const model = await findModel(models, sel.provider, sel.model);
   if (!model) return { ok: false, error: `model ${sel.provider}/${sel.model} is not in the current model registry` };
-  if (typeof setModel === "function") {
-    let applied = false;
-    try {
-      applied = await setModel(model);
-    } catch {
-      applied = false;
-    }
-    if (!applied) return { ok: false, error: `model ${sel.provider}/${sel.model} is unavailable or unauthenticated` };
+  if (typeof setModel !== "function") return { ok: false, error: "model selection API is unavailable" };
+  let applied = false;
+  try {
+    applied = await setModel(model);
+  } catch {
+    applied = false;
   }
-  if (typeof setThinkingLevel === "function") {
-    let effective;
-    try {
-      effective = await setThinkingLevel(sel.thinking);
-    } catch {
-      effective = null;
-    }
-    if (effective !== sel.thinking) {
-      return { ok: false, error: `thinking level ${sel.thinking} is unavailable or clamped to ${String(effective)}` };
-    }
+  if (!applied) return { ok: false, error: `model ${sel.provider}/${sel.model} is unavailable or unauthenticated` };
+
+  if (typeof setThinkingLevel !== "function") return { ok: false, error: "thinking level API is unavailable" };
+  let effective;
+  try {
+    effective = await setThinkingLevel(sel.thinking);
+  } catch {
+    effective = null;
+  }
+  if (effective !== sel.thinking) {
+    return { ok: false, error: `thinking level ${sel.thinking} is unavailable or clamped to ${String(effective)}` };
   }
 
   const latch = {
@@ -279,18 +278,24 @@ export async function activate({ env, dir, profileDir, models, setModel, setThin
 }
 
 function verifyRuntimeSelection(latch, ctx) {
-  if (ctx?.model !== undefined) {
-    if (!isRecord(ctx.model) || ctx.model.provider !== latch.selectedModel?.provider || ctx.model.id !== latch.selectedModel?.id) {
-      return { ok: false, error: "runtime model drifted from the latched role setting" };
-    }
+  if (!isRecord(ctx) || !isRecord(ctx.model)
+      || typeof ctx.model.provider !== "string" || ctx.model.provider.trim() === ""
+      || typeof ctx.model.id !== "string" || ctx.model.id.trim() === "") {
+    return { ok: false, error: "runtime model selection is missing or unobservable" };
   }
-  if (ctx?.thinkingLevel !== undefined && ctx.thinkingLevel !== latch.selectedThinking) {
+  if (ctx.model.provider !== latch.selectedModel?.provider || ctx.model.id !== latch.selectedModel?.id) {
+    return { ok: false, error: "runtime model drifted from the latched role setting" };
+  }
+  if (typeof ctx.thinkingLevel !== "string" || ctx.thinkingLevel.trim() === "") {
+    return { ok: false, error: "runtime thinking level is missing or unobservable" };
+  }
+  if (ctx.thinkingLevel !== latch.selectedThinking) {
     return { ok: false, error: "runtime thinking level drifted from the latched role setting" };
   }
   return { ok: true };
 }
 
-export async function verifyLatch(latch, env, dir, ctx = {}) {
+export async function verifyLatch(latch, env, dir, ctx = {}, { runtime = true } = {}) {
   if (parseRole(env).role !== latch.role) return { ok: false, error: "role environment drifted" };
   if ((env[AGENT_ENV] ?? "").trim() !== latch.agentId) return { ok: false, error: "Paseo agent identity drifted" };
   if ((env[PROFILES_ENV] ?? null) !== latch.profileOverride) return { ok: false, error: "profile source drifted" };
@@ -310,6 +315,10 @@ export async function verifyLatch(latch, env, dir, ctx = {}) {
     }
   } catch (err) {
     return { ok: false, error: err.message };
+  }
+  if (runtime) {
+    const runtimeCheck = verifyRuntimeSelection(latch, ctx);
+    if (!runtimeCheck.ok) return runtimeCheck;
   }
   return { ok: true };
 }
@@ -640,9 +649,9 @@ export async function validateScope(repoRoot, scope, exclusions = []) {
 // the write and edit tools; `local_commit` gates git commit through bash
 // instead of adding a tool. Tools outside the baseline are never re-enabled.
 export function effectiveTools(baseline, role, authority = null) {
+  if (!Array.isArray(baseline)) return [];
   const ceiling = CEILINGS[role] ?? [];
-  const extra = [];
-  if (authority?.envelope?.capabilities?.includes("edit")) extra.push("write", "edit");
+  const extra = authority?.envelope?.capabilities?.includes("edit") ? ["write", "edit"] : [];
   return baseline.filter((tool) => ceiling.includes(tool) || extra.includes(tool));
 }
 
@@ -2964,7 +2973,7 @@ async function runNotebookInit(_args, ctx) {
   const notify = (message, level) => ctx.ui?.notify?.(message, level);
   if (latch === null || latch.role !== "supervisor") { notify("pi-paseo-orchestration: notebook-init is available only to an active supervisor process", "error"); return { ok: false, error: "supervisor role required" }; }
   if (blockedReason !== null) { notify(`pi-paseo-orchestration blocked: ${blockedReason}`, "error"); return { ok: false, error: blockedReason }; }
-  if (!(await verifyOrBlock(ctx, configDir(envOf(ctx))))) return { ok: false, error: blockedReason };
+  if (!(await verifyOrBlock(ctx, configDir(envOf(ctx)), null, { runtime: false }))) return { ok: false, error: blockedReason };
   const ui = ctx.ui ?? {};
   if (typeof ui.input !== "function" || typeof ui.confirm !== "function") {
     const error = "interactive input is unavailable; notebook initialization did not write";
@@ -2998,7 +3007,7 @@ async function runNotebookAppend(args, ctx) {
   const notify = (message, level) => ctx.ui?.notify?.(message, level);
   if (latch === null || latch.role !== "supervisor") { const error = "supervisor role required"; notify(error, "error"); return { ok: false, error }; }
   if (blockedReason !== null) { notify(`pi-paseo-orchestration blocked: ${blockedReason}`, "error"); return { ok: false, error: blockedReason }; }
-  if (!(await verifyOrBlock(ctx, configDir(envOf(ctx))))) return { ok: false, error: blockedReason };
+  if (!(await verifyOrBlock(ctx, configDir(envOf(ctx)), null, { runtime: false }))) return { ok: false, error: blockedReason };
   let input = args;
   if (typeof input === "string") {
     try { input = JSON.parse(input); } catch { const error = "notebook-append arguments must be a JSON object"; notify(error, "error"); return { ok: false, error }; }
@@ -3239,8 +3248,9 @@ function doctorAuthorityState() {
 }
 
 function doctorEffectiveToolReport(pi, role) {
-  const actual = typeof pi?.getActiveTools === "function" ? pi.getActiveTools() : [];
-  const base = baseline ?? actual;
+  const observed = readActiveTools(pi);
+  const actual = observed.ok ? observed.tools : [];
+  const base = baseline ?? [];
   const authority = currentAuthority;
   const expected = role ? effectiveTools(base, role, authority) : [];
   const requested = authority?.envelope?.capabilities ?? [];
@@ -3267,7 +3277,7 @@ export async function buildDoctorReport(options = {}) {
   const env = envOf(ctx);
   const roleCheck = parseRole(env);
   const role = roleCheck.ok ? roleCheck.role : null;
-  const activation = doctorActivation(roleCheck);
+  let activation = doctorActivation(roleCheck);
   const cwdValue = typeof ctx.cwd === "string" && ctx.cwd !== "" ? ctx.cwd : null;
   let cwd = null;
   if (cwdValue !== null) {
@@ -3335,7 +3345,7 @@ export async function buildDoctorReport(options = {}) {
       settingsStatus = profileStatus = "BLOCKED";
       settingsObserved = profileObserved = "activation snapshot unavailable";
     } else {
-      latchVerification = await verifyLatch(latch, env, configDir(env));
+      latchVerification = await verifyLatch(latch, env, configDir(env), ctx);
       try {
         const currentSettings = await readSettings(configDir(env));
         settingsObserved = currentSettings === null ? "missing" : (JSON.stringify(currentSettings) === JSON.stringify(latch.settings) ? "matches activation snapshot" : "drifted");
@@ -3347,12 +3357,14 @@ export async function buildDoctorReport(options = {}) {
         if (profileObserved !== "matches activation snapshot") profileStatus = "BLOCKED";
       } catch (err) { profileStatus = "BLOCKED"; profileObserved = err.message; }
       if (!latchVerification.ok) {
+        activation = "blocked";
         if (/profile/.test(latchVerification.error)) profileStatus = "BLOCKED";
-        if (/settings/.test(latchVerification.error)) settingsStatus = "BLOCKED";
-        if (/role environment|Paseo agent identity/.test(latchVerification.error)) {
-          const activationCheck = checks.find((check) => check.code === "ROLE_ACTIVATION");
-          if (activationCheck) { activationCheck.status = "BLOCKED"; activationCheck.observed = latchVerification.error; }
+        if (/settings|runtime model|thinking level/.test(latchVerification.error)) {
+          settingsStatus = "BLOCKED";
+          settingsObserved = latchVerification.error;
         }
+        const activationCheck = checks.find((check) => check.code === "ROLE_ACTIVATION");
+        if (activationCheck) { activationCheck.status = "BLOCKED"; activationCheck.observed = latchVerification.error; }
       }
     }
   }
@@ -3377,8 +3389,9 @@ export async function buildDoctorReport(options = {}) {
   checks.push(doctorCheck("WORKSPACE_PROTOCOL", "repository-root Workspace Protocol", protocolStatus, protocolRequired ? "strict protocol is valid and matches any current Lead pin" : "current protocol is informative in passive mode", protocolObserved, [{ kind: "file", source: repoRoot ? protocolPath(repoRoot) : "unavailable", digest: protocol?.ok ? protocol.protocol.digest : null, output: protocolObserved }], { owner: "lead", action: "Re-read the exact repository-root protocol, resolve drift with the Human, and rerun doctor.", applicable: repoRoot !== null, required: protocolRequired }));
 
   const toolReport = doctorEffectiveToolReport(pi, role);
-  const missingCore = role ? requireBaselineTools(toolReport.base, role) : { ok: true };
-  const toolDrift = role ? toolReport.actual.some((name) => !toolReport.expected.includes(name)) : false;
+  const missingCore = role ? requireBaselineTools(baseline, role) : { ok: true };
+  const expectedActiveTools = baseline === null ? null : (lastAppliedTools ?? baseline);
+  const toolDrift = role ? expectedActiveTools === null || !sameList(toolReport.actual, expectedActiveTools) : false;
   const toolStatus = !missingCore.ok || toolDrift || toolReport.actual.includes("mcp_script") ? (role ? "BLOCKED" : "WARN") : "PASS";
   checks.push(doctorCheck("TOOL_POLICY", "baseline, ceiling, authority, and effective tools", toolStatus, role ? "actual tools equal baseline ∩ role policy ∩ current authority" : "passive mode does not shape tools", JSON.stringify({ baseline: toolReport.base, ceiling: CEILINGS[role] ?? [], requested: toolReport.requested, effective: toolReport.actual }), [{ kind: "memory", source: "Pi active-tool API", output: JSON.stringify(toolReport.effective) }], { owner: "human", action: "Restore the Human-selected baseline and rerun the governed process; doctor never re-enables tools.", applicable: role !== null, required: role !== null }));
   const authorityState = doctorAuthorityState();
@@ -3740,6 +3753,28 @@ async function runSupervisorRecovery(_args, ctx) {
   notify("Pending authority stored; it activates on the next input event.", "info");
 }
 
+// Thinking levels the closed settings document may store. The picker filters
+// these per selected model via Model.thinkingLevelMap (null marks unsupported);
+// without a map the full closed set is offered and activation fails closed if
+// the runtime clamps.
+export function thinkingLevelsFor(model) {
+  if (!model) return [...THINKING_LEVELS];
+  if (model.reasoning === false) return ["off"];
+  const map = model.thinkingLevelMap;
+  if (!map || typeof map !== "object") return [...THINKING_LEVELS];
+  const supported = THINKING_LEVELS.filter((level) => level === "off" || (map[level] !== null && map[level] !== undefined));
+  return supported.length > 0 ? supported : ["off"];
+}
+
+const BACK_OPTION = "← Back";
+
+async function pickWithBack(ctx, title, options) {
+  const choice = await ctx.ui.select(title, [BACK_OPTION, ...options]);
+  if (choice === null || choice === undefined) return { cancelled: true };
+  if (choice === BACK_OPTION) return { back: true };
+  return { value: choice };
+}
+
 async function runSettings(_args, ctx) {
   const notify = (message, level) => ctx.ui?.notify?.(message, level);
   const env = ctx.env ?? process.env;
@@ -3760,25 +3795,45 @@ async function runSettings(_args, ctx) {
     return;
   }
 
+  const cancelNote = prior ? "Cancelled; settings unchanged." : "Cancelled; no settings written.";
+  const chosen = {};
   const roles = {};
-  for (const role of ROLES) {
-    const provider = await ctx.ui.select(`Provider for ${role}:`, providers);
-    if (!provider) {
-      notify(prior ? "Cancelled; settings unchanged." : "Cancelled; no settings written.", "info");
-      return;
+  let roleIdx = 0;
+  let field = 0; // 0 = provider, 1 = model, 2 = thinking
+  while (roleIdx < ROLES.length) {
+    const role = ROLES[roleIdx];
+    if (field === 0) {
+      const res = await pickWithBack(ctx, `Provider for ${role}:`, providers);
+      if (res.cancelled) { notify(cancelNote, "info"); return; }
+      if (res.back) {
+        if (roleIdx === 0) { notify(cancelNote, "info"); return; } // first field: back = cancel
+        roleIdx -= 1;
+        field = 2;
+        continue;
+      }
+      chosen[role] = { provider: res.value };
+      field = 1;
+      continue;
     }
-    const ids = models.filter((m) => m.provider === provider).map((m) => m.id).sort();
-    const model = await ctx.ui.select(`Model for ${role}:`, ids);
-    if (!model) {
-      notify("Cancelled; settings unchanged.", "info");
-      return;
+    if (field === 1) {
+      const ids = models.filter((m) => m.provider === chosen[role].provider).map((m) => m.id).sort();
+      const res = await pickWithBack(ctx, `Model for ${role}:`, ids);
+      if (res.cancelled) { notify(cancelNote, "info"); return; }
+      if (res.back) { field = 0; continue; }
+      chosen[role].model = res.value;
+      chosen[role].modelEntry = models.find(
+        (m) => m.provider === chosen[role].provider && m.id === res.value,
+      );
+      field = 2;
+      continue;
     }
-    const thinking = await ctx.ui.select(`Thinking level for ${role}:`, THINKING_LEVELS);
-    if (!thinking) {
-      notify("Cancelled; settings unchanged.", "info");
-      return;
-    }
-    roles[role] = { provider, model, thinking };
+    const levels = thinkingLevelsFor(chosen[role].modelEntry);
+    const res = await pickWithBack(ctx, `Thinking level for ${role}:`, levels);
+    if (res.cancelled) { notify(cancelNote, "info"); return; }
+    if (res.back) { field = 1; continue; }
+    roles[role] = { provider: chosen[role].provider, model: chosen[role].model, thinking: res.value };
+    roleIdx += 1;
+    field = 0;
   }
 
   const doc = { version: 1, roles };
@@ -3801,6 +3856,9 @@ async function runSettings(_args, ctx) {
 let latch = null;
 let blockedReason = null;
 let baseline = null;
+// The last tool set applied by this extension. It distinguishes intentional
+// policy transitions between runs from an external active-tool drift.
+let lastAppliedTools = null;
 // Protocol pin: { repoRoot, version, projectId, digest } for the Lead role,
 // process-latched like the role latch. Advisory-only for authority.
 let protocolPin = null;
@@ -4035,18 +4093,46 @@ function envOf(ctx) {
   return ctx?.env ?? process.env;
 }
 
-async function verifyOrBlock(ctx, dir) {
-  const check = await verifyLatch(latch, envOf(ctx), dir, ctx);
+function readActiveTools(pi) {
+  if (typeof pi?.getActiveTools !== "function") return { ok: false, error: "active tools are not observable" };
+  let actual;
+  try {
+    actual = pi.getActiveTools();
+  } catch {
+    return { ok: false, error: "active tools are not observable" };
+  }
+  if (!Array.isArray(actual) || actual.some((tool) => typeof tool !== "string" || tool === "")) {
+    return { ok: false, error: "active tools are not an array of tool names" };
+  }
+  return { ok: true, tools: [...actual] };
+}
+
+function verifyActiveTools(pi) {
+  if (baseline === null) return { ok: false, error: "active-tool baseline is not observable" };
+  const observed = readActiveTools(pi);
+  if (!observed.ok) return observed;
+  const expected = lastAppliedTools ?? baseline;
+  if (!sameList(observed.tools, expected)) {
+    return { ok: false, error: "active tools drifted from the latched session policy; start a fresh process" };
+  }
+  return { ok: true };
+}
+
+async function verifyOrBlock(ctx, dir, pi = null, { runtime = true } = {}) {
+  const check = await verifyLatch(latch, envOf(ctx), dir, ctx, { runtime });
   if (!check.ok) {
     blockedReason = check.error;
     ctx.ui?.notify?.(`pi-paseo-orchestration blocked: ${check.error}`, "error");
     return false;
   }
-  const runtime = verifyRuntimeSelection(latch, ctx);
-  if (!runtime.ok) {
-    blockedReason = runtime.error;
-    ctx.ui?.notify?.(`pi-paseo-orchestration blocked: ${runtime.error}`, "error");
-    return false;
+  if (pi !== null) {
+    const tools = verifyActiveTools(pi);
+    if (tools.ok !== true) {
+      const error = "error" in tools ? tools.error : "active tools are not observable";
+      blockedReason = error;
+      ctx.ui?.notify?.(`pi-paseo-orchestration blocked: ${error}`, "error");
+      return false;
+    }
   }
   return true;
 }
@@ -4067,24 +4153,32 @@ function blockWith(ctx, reason) {
   ctx.ui?.notify?.(`pi-paseo-orchestration blocked: ${reason}`, "error");
 }
 
+// Short aliases: the canonical `pi-paseo-orchestration:*` names stay registered
+// (spec contract), and `ppo:*` is offered because the long prefix truncates in
+// the slash-command menu. Both names share one handler and one description.
+function registerCommand(pi, name, definition) {
+  pi.registerCommand(`pi-paseo-orchestration:${name}`, definition);
+  pi.registerCommand(`ppo:${name}`, definition);
+}
+
 export default function (pi) {
-  pi.registerCommand("pi-paseo-orchestration:settings", {
+  registerCommand(pi, "settings", {
     description: "Choose the exact provider, model, and thinking level for Supervisor, Lead, and Peer roles",
     handler: runSettings,
   });
-  pi.registerCommand("pi-paseo-orchestration:lead-tiny", {
+  registerCommand(pi, "lead-tiny", {
     description: "Store a Human-confirmed tiny Lead edit/local-commit grant as a pending authority (idle lead process only)",
     handler: runLeadTiny,
   });
-  pi.registerCommand("pi-paseo-orchestration:supervisor-recovery", {
+  registerCommand(pi, "supervisor-recovery", {
     description: "Store a Human-confirmed Supervisor recovery grant binding provider, workspace, and handoff (idle supervisor process only)",
     handler: runSupervisorRecovery,
   });
-  pi.registerCommand(NOTEBOOK_INIT_COMMAND, {
+  registerCommand(pi, NOTEBOOK_INIT_COMMAND.replace("pi-paseo-orchestration:", ""), {
     description: "Create a Human-confirmed immutable Supervisor Notebook manifest (Supervisor only)",
     handler: runNotebookInit,
   });
-  pi.registerCommand("pi-paseo-orchestration:doctor", {
+  registerCommand(pi, "doctor", {
     description: "Report bounded observation-only readiness for the current Pi/Paseo context",
     handler: (args, ctx) => runDoctor(args, ctx, pi),
   });
@@ -4115,18 +4209,37 @@ export default function (pi) {
     lastPeerReport = null;
     lastAcceptance = null;
     authorityReason = null;
+    baseline = null;
+    lastAppliedTools = null;
     const env = envOf(ctx);
     const dir = configDir(env);
-    if (latch !== null) {
-      await verifyOrBlock(ctx, dir);
-      return;
-    }
     const roleCheck = parseRole(env);
     if (!roleCheck.ok) {
       blockWith(ctx, roleCheck.error);
       return;
     }
     if (roleCheck.role === null) return; // passive / ungoverned
+
+    // Capture the Human-selected active surface once, before this extension
+    // applies any run policy. A missing observation is never replaced by the
+    // current post-policy active set.
+    const observed = readActiveTools(pi);
+    baseline = observed.ok ? observed.tools : null;
+
+    if (latch !== null) {
+      const tools = requireBaselineTools(baseline, latch.role);
+      if (!tools.ok) {
+        blockWith(ctx, tools.error);
+        return;
+      }
+      if (!(await verifyOrBlock(ctx, dir, pi))) return;
+      if (latch.role === "lead") {
+        const pin = await ensureProtocolPin();
+        if (!pin.ok) blockWith(ctx, pin.error);
+      }
+      return;
+    }
+
     const source = await resolveProfileSource(env, bundledDir);
     if (!source.ok) {
       blockWith(ctx, source.error);
@@ -4145,21 +4258,14 @@ export default function (pi) {
       return;
     }
     latch = result.latch;
-    if (latch !== null && typeof pi.getActiveTools === "function") {
-      try {
-        baseline = pi.getActiveTools();
-      } catch {
-        baseline = null;
-      }
-      const tools = requireBaselineTools(baseline, latch.role);
-      if (!tools.ok) {
-        blockWith(ctx, tools.error);
-        return;
-      }
-      if (latch.role === "lead") {
-        const pin = await ensureProtocolPin();
-        if (!pin.ok) blockWith(ctx, pin.error);
-      }
+    const tools = requireBaselineTools(baseline, latch.role);
+    if (!tools.ok) {
+      blockWith(ctx, tools.error);
+      return;
+    }
+    if (latch.role === "lead") {
+      const pin = await ensureProtocolPin();
+      if (!pin.ok) blockWith(ctx, pin.error);
     }
   });
 
@@ -4169,7 +4275,7 @@ export default function (pi) {
       ctx.ui?.notify?.(`pi-paseo-orchestration blocked: ${blockedReason}`, "error");
       return { action: "handled" };
     }
-    if (!(await verifyOrBlock(ctx, configDir(envOf(ctx))))) return { action: "handled" };
+    if (!(await verifyOrBlock(ctx, configDir(envOf(ctx)), pi))) return { action: "handled" };
     // Governed orchestration requires a valid pinned protocol for the Lead:
     // re-read and re-validate at every gate; drift blocks permanently.
     if (latch.role === "lead") {
@@ -4288,7 +4394,7 @@ export default function (pi) {
       ctx.ui?.notify?.(`pi-paseo-orchestration blocked: ${blockedReason}`, "error");
       return undefined;
     }
-    if (!(await verifyOrBlock(ctx, configDir(envOf(ctx))))) return undefined;
+    if (!(await verifyOrBlock(ctx, configDir(envOf(ctx)), pi))) return undefined;
     if (latch.role === "lead") {
       const pin = await ensureProtocolPin();
       if (!pin.ok) {
@@ -4302,7 +4408,22 @@ export default function (pi) {
       return undefined;
     }
     const allowed = effectiveTools(baseline, latch.role, currentAuthority);
-    if (typeof pi.setActiveTools === "function") pi.setActiveTools(allowed);
+    if (typeof pi.setActiveTools !== "function") {
+      blockWith(ctx, "active-tool policy cannot be applied");
+      return undefined;
+    }
+    try {
+      pi.setActiveTools(allowed);
+    } catch {
+      blockWith(ctx, "active-tool policy cannot be applied");
+      return undefined;
+    }
+    const applied = readActiveTools(pi);
+    if (!applied.ok || !sameList(applied.tools, allowed)) {
+      blockWith(ctx, "active tools drifted while applying the session policy");
+      return undefined;
+    }
+    lastAppliedTools = [...allowed];
     return {
       systemPrompt: `${event.systemPrompt}\n\n${PROFILE_MARKER(latch.role, latch.profileDigest)}\n${latch.profileText}\n</pi-paseo-orchestration>`,
     };
@@ -4313,7 +4434,7 @@ export default function (pi) {
     if (blockedReason !== null) {
       return { block: true, reason: `pi-paseo-orchestration blocked: ${blockedReason}` };
     }
-    if (!(await verifyOrBlock(ctx, configDir(envOf(ctx))))) {
+    if (!(await verifyOrBlock(ctx, configDir(envOf(ctx)), pi))) {
       return { block: true, reason: `pi-paseo-orchestration blocked: ${blockedReason}` };
     }
     if (latch.role === "lead") {

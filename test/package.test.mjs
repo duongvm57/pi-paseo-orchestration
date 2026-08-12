@@ -43,6 +43,9 @@ const baseModels = () => [
 ];
 
 const fakePi = (ctxOverrides = {}) => {
+  const role = ctxOverrides.env?.PI_PASEO_ORCHESTRATION_ROLE;
+  const runtimeModel = role === "peer" ? baseModels()[1] : baseModels()[0];
+  const runtimeThinking = role === "supervisor" ? "high" : role === "peer" ? "off" : "medium";
   const handlers = new Map();
   const commands = new Map();
   const tools = new Map();
@@ -72,6 +75,8 @@ const fakePi = (ctxOverrides = {}) => {
     ctx: {
       ui,
       env: { ...process.env, ...(ctxOverrides.env ?? {}) },
+      model: runtimeModel,
+      thinkingLevel: runtimeThinking,
       modelRegistry: {
         getAvailable: () => baseModels(),
         find: (provider, id) => baseModels().find((m) => m.provider === provider && m.id === id),
@@ -217,12 +222,17 @@ test("extension registers the settings command and a handler that never calls a 
   const source = await readFile(join(root, manifest.pi.extensions[0]), "utf8");
   const ext = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
   ext.default(fake.pi);
-  assert.deepEqual([...fake.commands.keys()], [
-    "pi-paseo-orchestration:settings",
-    "pi-paseo-orchestration:lead-tiny",
-    "pi-paseo-orchestration:supervisor-recovery",
-    "pi-paseo-orchestration:notebook-init",
+  assert.deepEqual([...fake.commands.keys()].sort(), [
     "pi-paseo-orchestration:doctor",
+    "pi-paseo-orchestration:lead-tiny",
+    "pi-paseo-orchestration:notebook-init",
+    "pi-paseo-orchestration:settings",
+    "pi-paseo-orchestration:supervisor-recovery",
+    "ppo:doctor",
+    "ppo:lead-tiny",
+    "ppo:notebook-init",
+    "ppo:settings",
+    "ppo:supervisor-recovery",
   ]);
   assert.equal(fake.tools.has("pi-paseo-orchestration:supervisor_notebook_append"), true);
   assert.equal(fake.commands.has("pi-paseo-orchestration:notebook-append"), false);
@@ -407,25 +417,26 @@ test("verifyLatch: settings, profile, role, or agent drift blocks; unchanged pas
   try {
     await writeSettings(dir, validDoc);
     const baseEnv = { PI_PASEO_ORCHESTRATION_ROLE: "lead", PASEO_AGENT_ID: "agent-7" };
+    const runtime = { model: baseModels()[0], thinkingLevel: "medium" };
     const { latch } = await ext.activate({ env: baseEnv, dir, profileDir: profiles, models: baseModels(), setModel: async () => true, setThinkingLevel: async (l) => l });
 
-    assert.equal((await ext.verifyLatch(latch, baseEnv, dir, profiles)).ok, true);
+    assert.equal((await ext.verifyLatch(latch, baseEnv, dir, runtime)).ok, true);
 
     await writeSettings(dir, { ...validDoc, roles: { ...validDoc.roles, lead: { ...validDoc.roles.lead, thinking: "low" } } });
-    assert.equal((await ext.verifyLatch(latch, baseEnv, dir, profiles)).ok, false);
+    assert.equal((await ext.verifyLatch(latch, baseEnv, dir, runtime)).ok, false);
 
     await writeSettings(dir, validDoc);
     const drifted = { ...latch, role: "peer" };
-    assert.equal((await ext.verifyLatch(drifted, baseEnv, dir, profiles)).ok, false);
+    assert.equal((await ext.verifyLatch(drifted, baseEnv, dir, runtime)).ok, false);
 
     const driftedEnv = { ...baseEnv, PI_PASEO_ORCHESTRATION_ROLE: "peer" };
-    assert.equal((await ext.verifyLatch(latch, driftedEnv, dir, profiles)).ok, false);
+    assert.equal((await ext.verifyLatch(latch, driftedEnv, dir, runtime)).ok, false);
 
     const driftedAgent = { ...baseEnv, PASEO_AGENT_ID: "agent-8" };
-    assert.equal((await ext.verifyLatch(latch, driftedAgent, dir, profiles)).ok, false);
+    assert.equal((await ext.verifyLatch(latch, driftedAgent, dir, runtime)).ok, false);
 
     await writeFile(join(profiles, "lead.md"), "# changed profile\n");
-    assert.equal((await ext.verifyLatch(latch, baseEnv, dir, profiles)).ok, false);
+    assert.equal((await ext.verifyLatch(latch, baseEnv, dir, runtime)).ok, false);
   } finally {
     await rm(profiles, { recursive: true, force: true });
     await rm(dir, { recursive: true, force: true });
@@ -714,6 +725,83 @@ async function governedFixture(ext, { role = "peer", activeTools = ["read", "bas
 
 const inputText = (fake, text, source = "interactive") =>
   fake.handlers.get("input")({ text, source }, fake.ctx);
+
+test("wiring: runtime model and thinking observations are required and exact", async () => {
+  const cases = [
+    ["missing model", (ctx) => { ctx.model = undefined; }, /runtime model selection/],
+    ["missing thinking", (ctx) => { ctx.thinkingLevel = undefined; }, /runtime thinking level/],
+    ["mismatched model", (ctx) => { ctx.model = { provider: "anthropic", id: "wrong" }; }, /runtime model drifted/],
+    ["mismatched thinking", (ctx) => { ctx.thinkingLevel = "high"; }, /runtime thinking level drifted/],
+  ];
+  for (const [label, mutate, reason] of cases) {
+    const ext = await freshExtension();
+    const env = await governedFixture(ext, { role: "peer" });
+    try {
+      mutate(env.fake.ctx);
+      const before = await env.fake.handlers.get("before_agent_start")(
+        { prompt: "hi", systemPrompt: "base" }, env.fake.ctx,
+      );
+      assert.equal(before, undefined, `${label} must not start ordinary model work`);
+      const blocked = await env.fake.handlers.get("tool_call")({ toolName: "read", input: {} }, env.fake.ctx);
+      assert.equal(blocked.block, true, `${label} must block tool calls`);
+      assert.match(blocked.reason, reason, `${label} must report the exact runtime blocker`);
+    } finally {
+      await rm(env.dir, { recursive: true, force: true });
+      await rm(env.profiles, { recursive: true, force: true });
+    }
+  }
+});
+
+test("wiring: an attempted tool re-enablement is active-policy drift", async () => {
+  const ext = await freshExtension();
+  const env = await governedFixture(ext, { role: "peer", activeTools: ["read", "bash"] });
+  try {
+    await env.fake.handlers.get("before_agent_start")({ prompt: "hi", systemPrompt: "base" }, env.fake.ctx);
+    env.fake.holder.activeTools.push("write");
+    const blocked = await env.fake.handlers.get("tool_call")({ toolName: "write", input: { path: "/x" } }, env.fake.ctx);
+    assert.equal(blocked.block, true);
+    assert.match(blocked.reason, /active tools drifted/);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+  }
+});
+
+test("doctor: missing baseline is blocked and never inferred from active tools", async () => {
+  const ext = await freshExtension();
+  const dir = await mkdtemp(join(tmpdir(), "ppo-doctor-no-baseline-"));
+  try {
+    await writeSettings(dir, validDoc);
+    const fake = fakePi({
+      activeTools: ["read", "bash"],
+      env: { PI_CODING_AGENT_DIR: dir, PI_PASEO_ORCHESTRATION_ROLE: "peer", PASEO_AGENT_ID: "agent-7" },
+    });
+    const report = await ext.buildDoctorReport({ ctx: fake.ctx, pi: fake.pi, now: "2026-01-01T00:00:00.000Z", reportId: "doctor-no-baseline" });
+    assert.deepEqual(report.policy.session_baseline, []);
+    assert.equal(report.checks.find((check) => check.code === "TOOL_POLICY").status, "BLOCKED");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("doctor: runtime drift is reported without latching the doctor mutation", async () => {
+  const ext = await freshExtension();
+  const env = await governedFixture(ext, { role: "peer" });
+  try {
+    env.fake.ctx.model = { provider: "openai", id: "wrong" };
+    const report = await ext.buildDoctorReport({ ctx: env.fake.ctx, pi: env.fake.pi, now: "2026-01-01T00:00:00.000Z", reportId: "doctor-runtime-drift" });
+    assert.equal(report.activation, "blocked");
+    assert.equal(report.checks.find((check) => check.code === "ROLE_SETTINGS").status, "BLOCKED");
+    assert.equal(report.overall_status, "BLOCKED");
+
+    env.fake.ctx.model = { provider: "openai", id: "gpt-5" };
+    const before = await env.fake.handlers.get("before_agent_start")({ prompt: "hi", systemPrompt: "base" }, env.fake.ctx);
+    assert.match(before.systemPrompt, /role="peer"/);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+  }
+});
 
 test("parseEnvelope: valid Peer, tiny Lead, and Supervisor recovery envelopes parse", () => {
   const editOnly = parseEnvelope(envelopeText(peerEnvelope({ capabilities: ["edit"], base: undefined })));
@@ -3340,5 +3428,77 @@ test("Doctor: paseo CLI observer proves identity/model/thinking; attestation sta
     await rm(repo.dir, { recursive: true, force: true });
     await rm(config, { recursive: true, force: true });
     await rm(profiles, { recursive: true, force: true });
+  }
+});
+
+test("thinkingLevelsFor: filters by the selected model's thinkingLevelMap, off-only without reasoning", () => {
+  assert.deepEqual(extension.thinkingLevelsFor(undefined), extension.THINKING_LEVELS);
+  assert.deepEqual(extension.thinkingLevelsFor({ reasoning: false }), ["off"]);
+  assert.deepEqual(
+    extension.thinkingLevelsFor({ reasoning: true, thinkingLevelMap: { off: null, high: "high", max: "max" } }),
+    ["off", "high", "max"],
+  );
+  assert.deepEqual(extension.thinkingLevelsFor({ reasoning: true, thinkingLevelMap: {} }), ["off"]);
+});
+
+test("settings command: Back re-prompts the previous field; a wrong pick is recoverable", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ppo-cmd-back-"));
+  try {
+    // supervisor: provider anthropic → model → Back → provider anthropic → model claude → thinking high
+    // lead: provider openai → Back (to supervisor thinking) → redo supervisor thinking high → then lead again
+    const queue = [
+      "anthropic", "claude-sonnet-4-5", "← Back", "← Back", // supervisor: back at model → provider, back at provider → cancel? NO: back at first provider = cancel
+    ];
+    // Simpler deterministic flow: wrong provider for supervisor, back to fix it.
+    const queue2 = [
+      "openai", "← Back", "anthropic", "claude-sonnet-4-5", "high", // supervisor
+      "anthropic", "claude-sonnet-4-5", "medium", // lead
+      "openai", "gpt-5", "off", // peer
+    ];
+    const fake = fakePi({ ui: { select: async () => queue2.shift() ?? null, confirm: async () => true } });
+    await runSettingsWith(fake, { ...process.env, PI_CODING_AGENT_DIR: dir });
+    assert.deepEqual(
+      JSON.parse(await readFile(join(dir, "pi-paseo-orchestration", "settings.json"), "utf8")),
+      validDoc,
+    );
+    assert.equal(fake.notifications.some(([, level]) => level === "error"), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("settings command: thinking picker offers only the selected model's supported levels", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ppo-cmd-levels-"));
+  try {
+    const selectCalls = [];
+    const models = [
+      { provider: "opencode", id: "deepseek-v4-flash", reasoning: true, thinkingLevelMap: { off: null, xhigh: "xhigh", max: "max" } },
+      { provider: "anthropic", id: "claude-sonnet-4-5", reasoning: true },
+    ];
+    const queue = [
+      "opencode", "deepseek-v4-flash", "max", // supervisor: only off/xhigh/max offered
+      "anthropic", "claude-sonnet-4-5", "high", // lead: no map → full closed set
+      "opencode", "deepseek-v4-flash", "xhigh", // peer
+    ];
+    const fake = fakePi({
+      ui: {
+        select: async (title, options) => { selectCalls.push([title, [...options]]); return queue.shift() ?? null; },
+        confirm: async () => true,
+      },
+      ctx: { modelRegistry: { getAvailable: () => models, find: (p, id) => models.find((m) => m.provider === p && m.id === id) } },
+    });
+    await runSettingsWith(fake, { ...process.env, PI_CODING_AGENT_DIR: dir });
+    const thinkingCalls = selectCalls.filter(([title]) => /Thinking level/.test(title));
+    assert.deepEqual(thinkingCalls.map(([, options]) => options), [
+      ["← Back", "off", "xhigh", "max"],
+      ["← Back", ...extension.THINKING_LEVELS],
+      ["← Back", "off", "xhigh", "max"],
+    ]);
+    const doc = JSON.parse(await readFile(join(dir, "pi-paseo-orchestration", "settings.json"), "utf8"));
+    assert.equal(doc.roles.supervisor.thinking, "max");
+    assert.equal(doc.roles.lead.thinking, "high");
+    assert.equal(doc.roles.peer.thinking, "xhigh");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 });
