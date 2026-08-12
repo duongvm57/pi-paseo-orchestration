@@ -535,6 +535,71 @@ test("checkToolCall: closed per-role gates, outer MCP validation, git publicatio
   }
 });
 
+test("checkToolCall: create_agent is role-bound to exact alias, model, thinking, workspace, and recovery handoff", () => {
+  const peerSelection = { provider: "opencode-go", model: "deepseek-v4-flash", thinking: "max" };
+  const leadSelection = { provider: "openai-codex", model: "gpt-5.6-luna", thinking: "max" };
+  const base = {
+    allowed: ["read", "bash", "mcp"],
+    mcpTargets: { paseo: new Set(["paseo_create_agent"]) },
+    roleSettings: { lead: leadSelection, peer: peerSelection },
+    currentAgentId: "lead-7",
+  };
+  const leadArgs = {
+    title: "Read-only topology peer",
+    provider: "ppo-peer/opencode-go/deepseek-v4-flash",
+    settings: { thinkingOptionId: "max" },
+    initialPrompt: 'Run /ppo:doctor, inspect the bounded question, and return a terminal Peer Report with "parent_lead_agent_id": "lead-7".',
+    notifyOnFinish: true,
+  };
+  const leadPolicy = { ...base, role: "lead", peerProviderAlias: "ppo-peer" };
+  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_create_agent", args: leadArgs }, leadPolicy), undefined);
+  assert.equal(extension.checkToolCall("mcp", {
+    server: "paseo", tool: "paseo_create_agent", args: { ...leadArgs, provider: "My_Peer/opencode-go/deepseek-v4-flash" },
+  }, { ...leadPolicy, peerProviderAlias: "My_Peer" }), undefined, "Paseo aliases are user-renamable strings");
+
+  for (const [label, args] of [
+    ["wrong alias", { ...leadArgs, provider: "pi/opencode-go/deepseek-v4-flash" }],
+    ["wrong model", { ...leadArgs, provider: "ppo-peer/opencode-go/deepseek-v4-pro" }],
+    ["wrong thinking", { ...leadArgs, settings: { thinkingOptionId: "high" } }],
+    ["custom workspace", { ...leadArgs, workspaceId: "other-workspace" }],
+    ["wrong parent binding", { ...leadArgs, initialPrompt: 'Return a Peer Report with "parent_lead_agent_id":"lead-8".' }],
+    ["conflicting parent bindings", { ...leadArgs, initialPrompt: 'Use "parent_lead_agent_id":"lead-7" but report "parent_lead_agent_id":"lead-8".' }],
+    ["no notification", { ...leadArgs, notifyOnFinish: false }],
+    ["extra field", { ...leadArgs, background: true }],
+  ]) {
+    assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_create_agent", args }, leadPolicy).block, true, label);
+  }
+  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_create_agent", args: leadArgs }, { ...base, role: "lead" }).block, true);
+
+  const recoveryEnvelope = {
+    grant_kind: "supervisor_recovery",
+    provider: "ppo-lead",
+    workspace_id: "wks-1",
+    handoff_id: "handoff-7",
+    objective: "Recover the governed Lead",
+  };
+  const recoveryArgs = {
+    title: "Recover governed Lead",
+    provider: "ppo-lead/openai-codex/gpt-5.6-luna",
+    workspaceId: "wks-1",
+    labels: { "pi-paseo-orchestration.handoff-id": "handoff-7" },
+    settings: { thinkingOptionId: "max" },
+    initialPrompt: "Recovery objective: Recover the governed Lead\nHandoff ID: handoff-7\nRun /ppo:doctor before any handoff.",
+    notifyOnFinish: true,
+  };
+  const supervisorPolicy = { ...base, role: "supervisor", envelope: recoveryEnvelope };
+  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_create_agent", args: recoveryArgs }, supervisorPolicy), undefined);
+  for (const [label, args] of [
+    ["wrong recovery alias", { ...recoveryArgs, provider: "ppo-peer/openai-codex/gpt-5.6-luna" }],
+    ["wrong workspace", { ...recoveryArgs, workspaceId: "wks-2" }],
+    ["wrong handoff", { ...recoveryArgs, labels: { "pi-paseo-orchestration.handoff-id": "handoff-8" } }],
+    ["missing doctor", { ...recoveryArgs, initialPrompt: "Recovery objective: Recover the governed Lead\nHandoff ID: handoff-7" }],
+  ]) {
+    assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_create_agent", args }, supervisorPolicy).block, true, label);
+  }
+  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_create_agent", args: recoveryArgs }, { ...base, role: "supervisor" }).block, true);
+});
+
 test("wiring: passive env stays ungoverned; governed blocks input, injects profile, shapes tools, gates calls", async () => {
   const ext = await freshExtension();
   const profiles = await profileDirFixture();
@@ -546,7 +611,7 @@ test("wiring: passive env stays ungoverned; governed blocks input, injects profi
     await writeSettings(dir, validDoc);
     const fake = fakePi({
       activeTools: ["read", "bash", "write", "mcp", "mcp_script"],
-      env: { PI_PASEO_ORCHESTRATION_ROLE: "lead", PASEO_AGENT_ID: "agent-7", PI_CODING_AGENT_DIR: dir, PI_PASEO_ORCHESTRATION_PROFILES_DIR: profiles },
+      env: { PI_PASEO_ORCHESTRATION_ROLE: "lead", PI_PASEO_ORCHESTRATION_PEER_ALIAS: "ppo-peer", PASEO_AGENT_ID: "agent-7", PI_CODING_AGENT_DIR: dir, PI_PASEO_ORCHESTRATION_PROFILES_DIR: profiles },
     });
     fake.pi.setActiveTools = (tools) => { fake.holder.activeTools = [...tools]; };
     fake.pi.getActiveTools = () => [...fake.holder.activeTools];
@@ -573,15 +638,32 @@ test("wiring: passive env stays ungoverned; governed blocks input, injects profi
     assert.deepEqual(fake.holder.activeTools, ["read", "bash", "mcp"]);
     assert.match(beforeResult.systemPrompt, /<pi-paseo-orchestration role="lead"/);
     assert.match(beforeResult.systemPrompt, /# lead profile/);
+    assert.match(beforeResult.systemPrompt, /ppo-peer\/openai\/gpt-5/);
     assert.doesNotMatch(beforeResult.systemPrompt, /write/);
 
-    // tool_call: write blocked, read passes, mcp blocked (no validated targets).
+    // tool_call: write blocked, read passes, unknown MCP is blocked, and the
+    // exact role-bound create_agent route passes through the real handler.
     const blocked = await fake.handlers.get("tool_call")({ toolName: "write", input: { path: "/x" } }, fake.ctx);
     assert.equal(blocked.block, true);
     const passed = await fake.handlers.get("tool_call")({ toolName: "read", input: {} }, fake.ctx);
     assert.equal(passed, undefined);
     const mcpBlocked = await fake.handlers.get("tool_call")({ toolName: "mcp", input: { server: "paseo", tool: "x" } }, fake.ctx);
     assert.equal(mcpBlocked.block, true);
+    const createPassed = await fake.handlers.get("tool_call")({
+      toolName: "mcp",
+      input: {
+        server: "paseo",
+        tool: "paseo_create_agent",
+        args: {
+          title: "Bounded peer",
+          provider: "ppo-peer/openai/gpt-5",
+          settings: { thinkingOptionId: "off" },
+          initialPrompt: 'Run /ppo:doctor and return the bounded read-only Peer Report with "parent_lead_agent_id":"agent-7".',
+          notifyOnFinish: true,
+        },
+      },
+    }, fake.ctx);
+    assert.equal(createPassed, undefined);
 
     // Governed: Pi-native new/fork are cancelled.
     assert.equal((await fake.handlers.get("session_before_switch")({}, fake.ctx)).cancel, true);
@@ -1217,7 +1299,7 @@ test("wiring: the envelope never re-enables tools the Human disabled in the base
   }
 });
 
-test("wiring: tiny Lead and Supervisor recovery envelopes never activate — their routes do not exist", async () => {
+test("wiring: tiny Lead and Supervisor recovery envelopes never activate from direct messages", async () => {
   const repo = await gitRepoFixture();
   const previous = process.cwd();
   process.chdir(repo.dir);

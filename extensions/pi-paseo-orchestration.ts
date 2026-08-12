@@ -93,6 +93,7 @@ export async function writeSettings(dir, doc) {
 
 export const ROLE_ENV = "PI_PASEO_ORCHESTRATION_ROLE";
 export const PROFILES_ENV = "PI_PASEO_ORCHESTRATION_PROFILES_DIR";
+export const PEER_ALIAS_ENV = "PI_PASEO_ORCHESTRATION_PEER_ALIAS";
 export const AGENT_ENV = "PASEO_AGENT_ID";
 
 // Closed role ceilings: Peer is read+Bash; Supervisor and Lead add the outer
@@ -105,9 +106,14 @@ export const CEILINGS = {
   peer: ["read", "bash"],
 };
 
-// Validated outer-MCP inner targets: server name → closed tool set. Empty until
-// the adapter's public observer contract is verified; empty means deny all.
-export const MCP_TARGETS = {};
+// Validated outer-MCP inner targets. v0.1 opens only the creation route needed
+// for the governed Supervisor → Lead → Peer topology; every call is then bound
+// to the role-specific model, thinking, alias, workspace, and authority below.
+export const MCP_TARGETS = {
+  supervisor: { paseo: new Set(["paseo_create_agent"]) },
+  lead: { paseo: new Set(["paseo_create_agent"]) },
+  peer: {},
+};
 
 // Read-family tools whose targets are checked against the protocol path by the
 // peer read gate inside checkToolCall.
@@ -281,6 +287,7 @@ export async function activate({ env, dir, profileDir, models, setModel, setThin
     profileText,
     profileDigest: profileDigest(profileText),
     profileDigests,
+    peerProviderAlias: env[PEER_ALIAS_ENV] ?? null,
     selectedModel: { provider: sel.provider, id: sel.model },
     selectedThinking: sel.thinking,
   };
@@ -309,6 +316,7 @@ export async function verifyLatch(latch, env, dir, ctx = {}, { runtime = true } 
   if (parseRole(env).role !== latch.role) return { ok: false, error: "role environment drifted" };
   if ((env[AGENT_ENV] ?? "").trim() !== latch.agentId) return { ok: false, error: "Paseo agent identity drifted" };
   if ((env[PROFILES_ENV] ?? null) !== latch.profileOverride) return { ok: false, error: "profile source drifted" };
+  if ((env[PEER_ALIAS_ENV] ?? null) !== latch.peerProviderAlias) return { ok: false, error: "Peer provider alias drifted" };
   let current;
   try {
     current = await readSettings(dir);
@@ -340,6 +348,107 @@ export function intersectTools(baseline, role) {
 
 // One shared policy decision for run shaping and call-time gating (one
 // mechanism, not scattered checks). policy = { role, allowed, mcpTargets }.
+function closedKeys(value, required, optional = []) {
+  if (!isRecord(value)) return false;
+  const allowed = new Set([...required, ...optional]);
+  return required.every((key) => Object.prototype.hasOwnProperty.call(value, key))
+    && Object.keys(value).every((key) => allowed.has(key));
+}
+
+function validProviderAlias(value) {
+  return typeof value === "string" && value !== "" && value === value.trim() && !value.includes("/");
+}
+
+function createAgentPolicyPrompt(activeLatch, authority) {
+  const envelope = authority?.envelope ?? null;
+  if (activeLatch.role === "lead") {
+    const selection = activeLatch.settings.roles.peer;
+    if (!validProviderAlias(activeLatch.peerProviderAlias)) {
+      return `Paseo paseo_create_agent is blocked until ${PEER_ALIAS_ENV} names the Human-configured Peer provider alias.`;
+    }
+    return [
+      "Paseo paseo_create_agent policy (closed v1):",
+      `- provider must be ${activeLatch.peerProviderAlias}/${selection.provider}/${selection.model}`,
+      `- settings must be exactly {\"thinkingOptionId\":${JSON.stringify(selection.thinking)}}`,
+      "- omit workspaceId and labels (the child inherits this exact workspace and Paseo supplies parentage)",
+      `- initialPrompt must bind \"parent_lead_agent_id\" to ${activeLatch.agentId}`,
+      "- notifyOnFinish must be true; title and initialPrompt must be nonempty",
+    ].join("\n");
+  }
+  if (activeLatch.role === "supervisor" && envelope?.grant_kind === "supervisor_recovery") {
+    const selection = activeLatch.settings.roles.lead;
+    return [
+      "Paseo recovery paseo_create_agent policy (closed v1):",
+      `- provider must be ${envelope.provider}/${selection.provider}/${selection.model}`,
+      `- workspaceId must be ${envelope.workspace_id}`,
+      `- labels must be exactly {\"pi-paseo-orchestration.handoff-id\":${JSON.stringify(envelope.handoff_id)}}`,
+      `- settings must be exactly {\"thinkingOptionId\":${JSON.stringify(selection.thinking)}}`,
+      "- notifyOnFinish must be true; initialPrompt must contain the exact recovery objective, handoff ID, and require Human /ppo:doctor evidence before handoff",
+    ].join("\n");
+  }
+  return "Paseo create_agent is unavailable for this run.";
+}
+
+function validateCreateAgentArgs(args, policy) {
+  const block = (reason) => ({ block: true, reason });
+  const selection = policy.role === "supervisor"
+    ? policy.roleSettings?.lead
+    : policy.role === "lead" ? policy.roleSettings?.peer : null;
+  if (!isRecord(selection)
+      || typeof selection.provider !== "string" || selection.provider === ""
+      || typeof selection.model !== "string" || selection.model === ""
+      || typeof selection.thinking !== "string" || selection.thinking === "") {
+    return block("create_agent target role settings are unavailable");
+  }
+
+  const recovery = policy.role === "supervisor" ? policy.envelope : null;
+  const alias = policy.role === "supervisor" ? recovery?.provider : policy.peerProviderAlias;
+  if (!validProviderAlias(alias)) {
+    return block(`create_agent ${policy.role === "lead" ? PEER_ALIAS_ENV : "recovery provider alias"} is unavailable or invalid`);
+  }
+  if (policy.role === "supervisor" && recovery?.grant_kind !== "supervisor_recovery") {
+    return block("Supervisor create_agent requires a current-run supervisor_recovery grant");
+  }
+
+  const supervisor = policy.role === "supervisor";
+  const required = ["title", "provider", "settings", "initialPrompt", "notifyOnFinish"];
+  if (supervisor) required.push("workspaceId", "labels");
+  if (!closedKeys(args, required)) return block("create_agent arguments are not the closed role-specific shape");
+  if (typeof args.title !== "string" || args.title.trim() === "" || args.title !== args.title.trim() || args.title.length > 60) {
+    return block("create_agent title must be a trimmed nonempty string of at most 60 characters");
+  }
+  const expectedProvider = `${alias}/${selection.provider}/${selection.model}`;
+  if (args.provider !== expectedProvider) return block(`create_agent provider must be exactly ${expectedProvider}`);
+  if (!closedKeys(args.settings, ["thinkingOptionId"]) || args.settings.thinkingOptionId !== selection.thinking) {
+    return block(`create_agent thinking must be exactly ${selection.thinking}`);
+  }
+  if (typeof args.initialPrompt !== "string" || args.initialPrompt.trim() === "") {
+    return block("create_agent initialPrompt must be a nonempty string");
+  }
+  if (!supervisor) {
+    const parentBindings = [...args.initialPrompt.matchAll(/"parent_lead_agent_id"\s*:\s*"([^"]*)"/g)];
+    if (typeof policy.currentAgentId !== "string" || policy.currentAgentId === ""
+        || parentBindings.length !== 1 || parentBindings[0][1] !== policy.currentAgentId) {
+      return block("Peer create_agent prompt must bind parent_lead_agent_id exactly once to the current Lead");
+    }
+  }
+  if (args.notifyOnFinish !== true) return block("create_agent must request the native finish notification");
+
+  if (supervisor) {
+    if (args.workspaceId !== recovery.workspace_id) return block("recovery create_agent workspace does not match the current grant");
+    if (!closedKeys(args.labels, ["pi-paseo-orchestration.handoff-id"])
+        || args.labels["pi-paseo-orchestration.handoff-id"] !== recovery.handoff_id) {
+      return block("recovery create_agent handoff does not match the current grant");
+    }
+    if (!args.initialPrompt.includes(recovery.objective)
+        || !args.initialPrompt.includes(recovery.handoff_id)
+        || !/(?:\/ppo:doctor|\/pi-paseo-orchestration:doctor)/.test(args.initialPrompt)) {
+      return block("recovery create_agent prompt must bind the objective and handoff and require doctor");
+    }
+  }
+  return undefined;
+}
+
 export function checkToolCall(toolName, input, policy) {
   const block = (reason) => ({ block: true, reason });
   const allowed = policy.allowed instanceof Set ? policy.allowed : new Set(policy.allowed);
@@ -377,6 +486,9 @@ export function checkToolCall(toolName, input, policy) {
     }
     if (input.args !== undefined && (input.args === null || typeof input.args !== "object" || Array.isArray(input.args))) {
       return block("outer mcp args must be an object");
+    }
+    if (input.server === "paseo" && input.tool === "paseo_create_agent") {
+      return validateCreateAgentArgs(input.args, policy);
     }
     return undefined;
   }
@@ -4508,7 +4620,7 @@ export default function (pi) {
     }
     lastAppliedTools = [...allowed];
     return {
-      systemPrompt: `${event.systemPrompt}\n\n${PROFILE_MARKER(latch.role, latch.profileDigest)}\n${latch.profileText}\n</pi-paseo-orchestration>`,
+      systemPrompt: `${event.systemPrompt}\n\n${PROFILE_MARKER(latch.role, latch.profileDigest)}\n${latch.profileText}\n\n${createAgentPolicyPrompt(latch, currentAuthority)}\n</pi-paseo-orchestration>`,
     };
   });
 
@@ -4537,7 +4649,10 @@ export default function (pi) {
     const decision = checkToolCall(event.toolName, event.input, {
       role: latch.role,
       allowed,
-      mcpTargets: MCP_TARGETS,
+      mcpTargets: MCP_TARGETS[latch.role] ?? {},
+      roleSettings: latch.settings.roles,
+      peerProviderAlias: latch.peerProviderAlias,
+      currentAgentId: latch.agentId,
       envelope: currentAuthority?.envelope ?? null,
       repoRoot,
     });
