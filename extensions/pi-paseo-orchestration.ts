@@ -106,6 +106,10 @@ export const CEILINGS = {
 // the adapter's public observer contract is verified; empty means deny all.
 export const MCP_TARGETS = {};
 
+// Read-family tools whose targets are checked against the protocol path by the
+// peer read gate inside checkToolCall.
+const PROTOCOL_READ_TOOLS = ["read", "grep", "ls", "find"];
+
 // Cooperative, recognizable-only command detection. Not a sandbox: aliases,
 // scripts, and child programs can bypass it. The git patterns also catch global
 // flag forms (`git --no-pager commit`) by scanning the command line for the
@@ -292,6 +296,23 @@ export function checkToolCall(toolName, input, policy) {
   const allowed = policy.allowed instanceof Set ? policy.allowed : new Set(policy.allowed);
   if (toolName === "mcp_script") {
     return block("mcp_script is unavailable to every governed role");
+  }
+  // Peer read gate: the repository-wide Workspace Protocol is Lead governance
+  // material. Reading the full protocol is a governance violation for the peer
+  // role — assignment-relevant constraints arrive via the prompt, not the
+  // file. The gate is role-based, so a current-run edit grant never unlocks
+  // protocol reads, and protocol presence never bypasses this check.
+  if (policy.role === "peer" && PROTOCOL_READ_TOOLS.includes(toolName)) {
+    const target = input?.path ?? input?.file_path ?? null;
+    if (typeof target === "string" && target !== "") {
+      if (policy.repoRoot == null) {
+        return block("peer read target cannot be checked without a repository root");
+      }
+      const rel = targetToRepoRelative(policy.repoRoot, target);
+      if (rel !== null && (rel === ".orchestration" || rel.startsWith(".orchestration/"))) {
+        return block("reading the workspace protocol is a governance violation for the peer role");
+      }
+    }
   }
   if (!allowed.has(toolName)) {
     return block(`${toolName} is not permitted for the ${policy.role} role`);
@@ -652,6 +673,219 @@ export async function checkCommitGate(command, authority) {
   return undefined;
 }
 
+// ─── Workspace Protocol ──────────────────────────────────────────────────────
+
+// One canonical repository-wide protocol at the repository root; v0.1 has no
+// overlays. This slice is read/validate/pin/guard only: workflow consumption
+// of the protocol (classification, routing) is a later slice. The protocol can
+// narrow workflow, but it cannot grant a Capability or override the Role
+// Profile / Task Authority Envelope — the pin is advisory-only for authority
+// and checkToolCall never consults it.
+
+// Required core section headings, normalized (lowercase, whitespace-collapsed).
+// Optional sections (criticality, review/council rules, anti-patterns,
+// Supervisor hints — and even model/effort routing) may be absent; their
+// presence grants nothing.
+const REQUIRED_CORE_SECTIONS = [
+  "decision matrix",
+  "task classes and routing",
+  "ownership and isolation",
+  "candidate, verification, review, and acceptance",
+  "reopen, dependency, and blocked handling",
+  "evolution",
+];
+
+export function protocolPath(repoRoot) {
+  return join(repoRoot, ".orchestration", "workspace-protocol.md");
+}
+
+// Line-based YAML frontmatter subset — no parser framework: the protocol is
+// markdown with a small `key: value` header, so a closed line reader is
+// enough. Rejects missing/malformed/duplicate metadata with the exact reason;
+// extra non-canonical keys are tolerated (the five canonical keys are still
+// required and individually validated).
+function parseFrontmatter(text) {
+  const lines = String(text).split(/\r?\n/);
+  if (lines[0] !== "---") {
+    return { ok: false, error: "protocol must start with a --- frontmatter block" };
+  }
+  let end = -1;
+  for (let i = 1; i < lines.length; i++) {
+    if (lines[i].trimEnd() === "---") {
+      end = i;
+      break;
+    }
+  }
+  if (end === -1) return { ok: false, error: "protocol frontmatter has no closing --- line" };
+  const meta = {};
+  for (let i = 1; i < end; i++) {
+    const line = lines[i].trim();
+    if (line === "" || line.startsWith("#")) continue;
+    const colon = line.indexOf(":");
+    if (colon === -1) {
+      return { ok: false, error: `malformed frontmatter line ${i + 1}: expected "key: value"` };
+    }
+    const key = line.slice(0, colon).trim();
+    const raw = line.slice(colon + 1).trim();
+    if (key === "") return { ok: false, error: `malformed frontmatter line ${i + 1}: empty key` };
+    if (Object.prototype.hasOwnProperty.call(meta, key)) {
+      return { ok: false, error: `duplicate metadata key ${JSON.stringify(key)}` };
+    }
+    const quoted =
+      raw.length >= 2 &&
+      ((raw[0] === '"' && raw[raw.length - 1] === '"') || (raw[0] === "'" && raw[raw.length - 1] === "'"));
+    meta[key] = quoted ? raw.slice(1, -1) : raw;
+  }
+  const required = ["status", "version", "last_reviewed", "project_id", "repository_root"];
+  for (const key of required) {
+    if (!Object.prototype.hasOwnProperty.call(meta, key)) {
+      return { ok: false, error: `metadata ${key} is missing` };
+    }
+  }
+  if (meta.status === "") return { ok: false, error: "metadata status must be a nonempty string" };
+  if (!/^\d+$/.test(meta.version) || !Number.isSafeInteger(Number(meta.version)) || Number(meta.version) < 1) {
+    return { ok: false, error: "metadata version must be a positive integer" };
+  }
+  // Real calendar check: Date.parse rolls over (2025-02-30 → Mar 2), so the
+  // parsed components must round-trip exactly.
+  const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(meta.last_reviewed);
+  const dateValid =
+    dateMatch !== null &&
+    (() => {
+      const date = new Date(Date.UTC(Number(dateMatch[1]), Number(dateMatch[2]) - 1, Number(dateMatch[3])));
+      return (
+        date.getUTCFullYear() === Number(dateMatch[1]) &&
+        date.getUTCMonth() === Number(dateMatch[2]) - 1 &&
+        date.getUTCDate() === Number(dateMatch[3])
+      );
+    })();
+  if (!dateValid) {
+    return { ok: false, error: "metadata last_reviewed must be a YYYY-MM-DD date" };
+  }
+  if (meta.project_id === "") return { ok: false, error: "metadata project_id must be a nonempty string" };
+  if (meta.repository_root !== ".") {
+    return { ok: false, error: 'metadata repository_root must be "." (repository-root applicability)' };
+  }
+  return { ok: true, meta, bodyStart: end + 1 };
+}
+
+function normalizedHeading(line) {
+  const match = /^#{1,6}\s+(.+?)\s*$/.exec(line);
+  return match === null ? null : match[1].toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+// Required core sections per the spec; a missing section fails closed with its
+// exact normalized name. The decision matrix must include must-ask boundaries.
+function checkCoreSections(text, bodyStart) {
+  const lines = String(text).split(/\r?\n/);
+  const bodies = new Map();
+  let current = null;
+  for (let i = bodyStart; i < lines.length; i++) {
+    const heading = normalizedHeading(lines[i]);
+    if (heading !== null) {
+      current = heading;
+      bodies.set(heading, []);
+    } else if (current !== null) {
+      bodies.get(current).push(lines[i]);
+    }
+  }
+  for (const required of REQUIRED_CORE_SECTIONS) {
+    if (!bodies.has(required)) {
+      return { ok: false, error: `missing required core section "${required}"` };
+    }
+  }
+  const matrix = (bodies.get("decision matrix") ?? []).join("\n");
+  if (!/must-ask|must_ask/i.test(matrix)) {
+    return { ok: false, error: "the decision matrix core section must include must-ask boundaries" };
+  }
+  return { ok: true };
+}
+
+// Validates protocol text: nonempty, frontmatter metadata, required core
+// sections. Returns { ok: true, meta, digest } or { ok: false, error }; digest
+// is the canonical sha256 of the raw bytes (utf8 of the text).
+export function validateProtocol(text) {
+  if (typeof text !== "string" || text.trim() === "") {
+    return { ok: false, error: "workspace protocol must be nonempty" };
+  }
+  const frontmatter = parseFrontmatter(text);
+  if (!frontmatter.ok) return frontmatter;
+  const sections = checkCoreSections(text, frontmatter.bodyStart);
+  if (!sections.ok) return sections;
+  return {
+    ok: true,
+    meta: {
+      status: frontmatter.meta.status,
+      version: Number(frontmatter.meta.version),
+      last_reviewed: frontmatter.meta.last_reviewed,
+      project_id: frontmatter.meta.project_id,
+      repository_root: frontmatter.meta.repository_root,
+    },
+    digest: createHash("sha256").update(text).digest("hex"),
+  };
+}
+
+// Reads and validates the canonical protocol file. The digest is computed over
+// the raw file bytes; missing, empty, malformed, and core-incomplete files
+// fail closed with the exact reason.
+export async function readAndValidateProtocol(repoRoot) {
+  const path = protocolPath(repoRoot);
+  let buffer;
+  try {
+    buffer = await readFile(path);
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      return { ok: false, error: `workspace protocol file is missing at ${path}` };
+    }
+    return { ok: false, error: `workspace protocol read failed: ${err.message}` };
+  }
+  if (buffer.length === 0) {
+    return { ok: false, error: "workspace protocol file must be nonempty" };
+  }
+  const digest = createHash("sha256").update(buffer).digest("hex");
+  const check = validateProtocol(buffer.toString("utf8"));
+  if (!check.ok) return check;
+  return { ok: true, protocol: { repoRoot, path, digest, meta: check.meta } };
+}
+
+// Protocol pin (process-latched like the role latch): the Lead pins
+// { repoRoot, version, projectId, digest } on first successful read+validate,
+// and every later gate (input / before_agent_start / tool_call) re-reads,
+// re-validates, and compares. Drift or identity mismatch blocks permanently;
+// the pin is per repoRoot and re-pins when the resolved root changes. Peer and
+// Supervisor roles never pin: the protocol is advisory-only for authority, so
+// authority checks never consult it.
+async function ensureProtocolPin() {
+  if (latch === null || latch.role !== "lead") return { ok: true };
+  const repoRoot = await findRepoRoot();
+  if (repoRoot === null) {
+    return { ok: false, error: "no git repository root is observable for workspace protocol pinning" };
+  }
+  if (protocolPin === null || protocolPin.repoRoot !== repoRoot) {
+    const read = await readAndValidateProtocol(repoRoot);
+    if (!read.ok) return read;
+    protocolPin = {
+      repoRoot,
+      version: read.protocol.meta.version,
+      projectId: read.protocol.meta.project_id,
+      digest: read.protocol.digest,
+    };
+    return { ok: true };
+  }
+  const read = await readAndValidateProtocol(repoRoot);
+  if (!read.ok) return read;
+  if (read.protocol.meta.project_id !== protocolPin.projectId) {
+    return { ok: false, error: "workspace protocol project identity changed from the pinned project_id; a fresh process is required" };
+  }
+  if (read.protocol.meta.version !== protocolPin.version) {
+    return { ok: false, error: "workspace protocol version changed from the pinned version; a fresh process is required" };
+  }
+  if (read.protocol.digest !== protocolPin.digest) {
+    return { ok: false, error: "workspace protocol bytes drifted from the pinned digest; a fresh process is required" };
+  }
+  return { ok: true };
+}
+
 // Route binding: the direct Human task message is the only authority route in
 // this slice. tiny Lead and Supervisor recovery grant kinds are parsed and
 // schema-validated above, but their idle governed slash-command flows do not
@@ -662,6 +896,16 @@ async function activateEnvelope(envelope) {
   }
   if (envelope.agent_id !== latch.agentId) {
     return { ok: false, error: `envelope agent_id ${JSON.stringify(envelope.agent_id)} does not match the latched Paseo agent ${JSON.stringify(latch.agentId)}` };
+  }
+  // lead_tiny binds the currently pinned protocol digest; a mismatch fails
+  // closed even though the idle slash-command route does not exist yet.
+  if (envelope.grant_kind === "lead_tiny") {
+    if (protocolPin === null) {
+      return { ok: false, error: "lead_tiny requires a pinned workspace protocol digest" };
+    }
+    if (envelope.protocol_digest !== protocolPin.digest) {
+      return { ok: false, error: "protocol_digest does not match the pinned workspace protocol digest" };
+    }
   }
   if (envelope.grant_kind !== "peer") {
     return { ok: false, error: `grant_kind ${envelope.grant_kind} has no route in this slice: its idle slash-command flow does not exist yet, so it grants nothing` };
@@ -736,6 +980,9 @@ async function runSettings(_args, ctx) {
 let latch = null;
 let blockedReason = null;
 let baseline = null;
+// Protocol pin: { repoRoot, version, projectId, digest } for the Lead role,
+// process-latched like the role latch. Advisory-only for authority.
+let protocolPin = null;
 // Current-run authority record: { envelope, repoRoot, scope, exclusions } or
 // null when the run carries no valid grant. Replaced on every input event.
 let currentAuthority = null;
@@ -749,6 +996,10 @@ export function getAuthority() {
 
 export function getAuthorityReason() {
   return authorityReason;
+}
+
+export function getProtocolPin() {
+  return protocolPin === null ? null : { ...protocolPin };
 }
 
 const bundledDir = (() => {
@@ -836,7 +1087,14 @@ export default function (pi) {
         baseline = null;
       }
       const tools = requireBaselineTools(baseline, latch.role);
-      if (!tools.ok) blockWith(ctx, tools.error);
+      if (!tools.ok) {
+        blockWith(ctx, tools.error);
+        return;
+      }
+      if (latch.role === "lead") {
+        const pin = await ensureProtocolPin();
+        if (!pin.ok) blockWith(ctx, pin.error);
+      }
     }
   });
 
@@ -847,6 +1105,15 @@ export default function (pi) {
       return { action: "handled" };
     }
     if (!(await verifyOrBlock(ctx, configDir(envOf(ctx))))) return { action: "handled" };
+    // Governed orchestration requires a valid pinned protocol for the Lead:
+    // re-read and re-validate at every gate; drift blocks permanently.
+    if (latch.role === "lead") {
+      const pin = await ensureProtocolPin();
+      if (!pin.ok) {
+        blockWith(ctx, pin.error);
+        return { action: "handled" };
+      }
+    }
     // Authority lifetime: every run (input) replaces the internal current-run
     // authority record — including replacement with NO authority when the
     // message carries no valid envelope. Only the direct Human task-message
@@ -884,6 +1151,13 @@ export default function (pi) {
       return undefined;
     }
     if (!(await verifyOrBlock(ctx, configDir(envOf(ctx))))) return undefined;
+    if (latch.role === "lead") {
+      const pin = await ensureProtocolPin();
+      if (!pin.ok) {
+        blockWith(ctx, pin.error);
+        return undefined;
+      }
+    }
     if (baseline === null) baseline = event.systemPromptOptions?.selectedTools ?? [];
     const tools = requireBaselineTools(baseline, latch.role);
     if (!tools.ok) {
@@ -905,13 +1179,26 @@ export default function (pi) {
     if (!(await verifyOrBlock(ctx, configDir(envOf(ctx))))) {
       return { block: true, reason: `pi-paseo-orchestration blocked: ${blockedReason}` };
     }
+    if (latch.role === "lead") {
+      const pin = await ensureProtocolPin();
+      if (!pin.ok) {
+        blockWith(ctx, pin.error);
+        return { block: true, reason: `pi-paseo-orchestration blocked: ${pin.error}` };
+      }
+    }
+    // Resolve the repository root for the peer read gate when no envelope
+    // carries one; the gate needs a root to resolve read targets.
+    let repoRoot = currentAuthority?.repoRoot ?? null;
+    if (repoRoot === null && latch.role === "peer" && PROTOCOL_READ_TOOLS.includes(event.toolName)) {
+      repoRoot = await findRepoRoot();
+    }
     const allowed = new Set(effectiveTools(baseline ?? [], latch.role, currentAuthority));
     const decision = checkToolCall(event.toolName, event.input, {
       role: latch.role,
       allowed,
       mcpTargets: MCP_TARGETS,
       envelope: currentAuthority?.envelope ?? null,
-      repoRoot: currentAuthority?.repoRoot ?? null,
+      repoRoot,
     });
     if (decision?.block) {
       ctx.ui?.notify?.(`Blocked ${event.toolName}: ${decision.reason}`, "error");

@@ -465,6 +465,9 @@ test("wiring: passive env stays ungoverned; governed blocks input, injects profi
   const ext = await freshExtension();
   const profiles = await profileDirFixture();
   const dir = await mkdtemp(join(tmpdir(), "ppo-wire-"));
+  const repo = await gitRepoFixture(); // governed Lead processes need a valid pinned protocol
+  const previous = process.cwd();
+  process.chdir(repo.dir);
   try {
     await writeSettings(dir, validDoc);
     const fake = fakePi({
@@ -520,6 +523,8 @@ test("wiring: passive env stays ungoverned; governed blocks input, injects profi
   } finally {
     await rm(profiles, { recursive: true, force: true });
     await rm(dir, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+    process.chdir(previous);
   }
 });
 
@@ -611,13 +616,49 @@ const gitEnv = {
 };
 const git = (args, cwd) => execFile("git", ["-c", "commit.gpgsign=false", ...args], { cwd, env: gitEnv });
 
-// Real hermetic git repository with a committed base.
-async function gitRepoFixture() {
+// Real hermetic git repository with a committed base. A valid canonical
+// Workspace Protocol is committed at the root by default (withProtocol: false
+// omits it for missing/malformed-protocol fixtures).
+const validMeta = {
+  status: "active",
+  version: 1,
+  last_reviewed: "2025-06-01",
+  project_id: "ppo-fixture",
+  repository_root: ".",
+};
+
+const coreSections = [
+  ["decision matrix", "The Human decides product, priority, irreversible trade-off, external-effect, authority, protocol, subjective, and material cost/risk questions; every other role treats those as must-ask boundaries. Supervisor owns observation and authoring; Lead owns framing, routing, and verdicts; Peer owns assigned work."],
+  ["task classes and routing", "Tiny/bounded work may route to the Lead only when the protocol permits it; otherwise bounded work routes to one Peer. Cross-module/lifecycle work routes to one Engineer Peer with an isolated checkout. Architecture-sensitive work routes to an Architect disposition and independent review."],
+  ["ownership and isolation", "One writer per moving scope; concurrent writers use disjoint scopes and isolated checkouts; ownership returns by explicit handback; the Lead does not take over an owned scope."],
+  ["candidate, verification, review, and acceptance", "Every class produces one git Stable Candidate; verification is exact commands with recorded evidence; review triggers follow risk class; acceptance is a direct Human message only."],
+  ["reopen, dependency, and blocked handling", "REOPEN_REQUEST names the failed premise; DEPENDENCY_REQUEST names the owner and requirement; BLOCKED reports bounded attempts; requests are decisions, not candidate acceptance."],
+  ["evolution", "Revisions increment version and refresh last_reviewed with Human confirmation; material changes stop and re-evaluate running work."],
+];
+
+const coreBody = (sections = coreSections) =>
+  `# Workspace Protocol\n\n${sections.map(([h, b]) => `## ${h}\n\n${b}`).join("\n\n")}\n`;
+
+const metaLines = (over = {}) =>
+  Object.entries({ ...validMeta, ...over })
+    .map(([k, v]) => (v === undefined ? null : `${k}: ${v}`))
+    .filter((line) => line !== null)
+    .join("\n");
+
+const protocolText = (over = {}, body = coreBody()) => `---\n${metaLines(over)}\n---\n\n${body}`;
+
+const validProtocol = protocolText();
+
+async function gitRepoFixture({ withProtocol = true } = {}) {
   const dir = await mkdtemp(join(tmpdir(), "ppo-repo-"));
   await git(["init"], dir);
   await mkdir(join(dir, "src"), { recursive: true });
   await writeFile(join(dir, "src", "main.go"), "package main\n");
   await writeFile(join(dir, "README.md"), "readme\n");
+  if (withProtocol) {
+    await mkdir(join(dir, ".orchestration"), { recursive: true });
+    await writeFile(join(dir, ".orchestration", "workspace-protocol.md"), validProtocol, "utf8");
+  }
   await git(["add", "-A"], dir);
   await git(["commit", "-m", "base"], dir);
   const { stdout } = await git(["rev-parse", "HEAD"], dir);
@@ -1027,7 +1068,7 @@ test("wiring: tiny Lead and Supervisor recovery envelopes never activate — the
   const tiny = envelopeText({
     version: 1, grant_kind: "lead_tiny", role: "lead", issuer: "human",
     agent_id: "agent-7", task_id: "t-1", objective: "tiny fix",
-    capabilities: ["edit"], scope: "src", protocol_digest: "a".repeat(64),
+    capabilities: ["edit"], scope: "src", protocol_digest: digestOf(validProtocol),
   });
   const recovery = envelopeText({
     version: 1, grant_kind: "supervisor_recovery", role: "lead", issuer: "human",
@@ -1112,5 +1153,396 @@ test("checkCommitGate: direct gate checks HEAD against base and rejects scope dr
     assert.equal(await checkCommitGate("echo hi", authority), undefined, "non-commit commands are not gated here");
   } finally {
     await rm(repo.dir, { recursive: true, force: true });
+  }
+});
+
+// ─── Lát 4: Workspace Protocol ───────────────────────────────────────────────
+
+const { protocolPath, validateProtocol, readAndValidateProtocol, getProtocolPin } = extension;
+
+test("protocolPath: canonical repository-root location", () => {
+  assert.equal(protocolPath("/repo"), join("/repo", ".orchestration", "workspace-protocol.md"));
+});
+
+test("validateProtocol: valid protocol passes with metadata and canonical digest", () => {
+  const check = validateProtocol(validProtocol);
+  assert.equal(check.ok, true);
+  assert.deepEqual(check.meta, validMeta);
+  assert.equal(check.digest, digestOf(validProtocol));
+  assert.equal(check.digest, createHash("sha256").update(Buffer.from(validProtocol, "utf8")).digest("hex"));
+
+  // Quoted YAML values and extra non-canonical keys are tolerated.
+  assert.equal(validateProtocol(protocolText({ project_id: '"ppo-fixture"', title: "Repo protocol" })).ok, true);
+});
+
+test("validateProtocol: metadata is closed — malformed, duplicate, missing, or mistyped values fail", () => {
+  const cases = [
+    ["empty", "", /nonempty/],
+    ["whitespace", "   \n  ", /nonempty/],
+    ["no frontmatter", "# Plain markdown\n\n## Decision matrix\n", /frontmatter/],
+    ["leading blank line", "\n---\nstatus: active\nversion: 1\n---\n", /frontmatter/],
+    ["unclosed frontmatter", "---\nstatus: active\nversion: 1\n", /closing/],
+    ["bad line", "---\nstatus active\nversion: 1\n---\n", /malformed frontmatter line/],
+    ["empty key", "---\n: active\nversion: 1\n---\n", /malformed frontmatter line/],
+    ["duplicate version", "---\nstatus: active\nversion: 1\nversion: 2\n---\n", /duplicate metadata key "version"/],
+    ["duplicate extra key", "---\nstatus: active\nversion: 1\nlast_reviewed: 2025-06-01\nproject_id: p\nrepository_root: .\ntitle: a\ntitle: b\n---\n", /duplicate metadata key "title"/],
+    ["version zero", protocolText({ version: 0 }), /positive integer/],
+    ["version negative", protocolText({ version: -1 }), /positive integer/],
+    ["version float", protocolText({ version: 1.5 }), /positive integer/],
+    ["version text", protocolText({ version: "one" }), /positive integer/],
+    ["missing version", protocolText({ version: undefined }), /version is missing/],
+    ["missing status", protocolText({ status: undefined }), /status is missing/],
+    ["empty status", protocolText({ status: "" }), /status must be a nonempty/],
+    ["missing last_reviewed", protocolText({ last_reviewed: undefined }), /last_reviewed is missing/],
+    ["bad date month", protocolText({ last_reviewed: "2025-13-01" }), /YYYY-MM-DD/],
+    ["bad date day", protocolText({ last_reviewed: "2025-02-30" }), /YYYY-MM-DD/],
+    ["non-date", protocolText({ last_reviewed: "yesterday" }), /YYYY-MM-DD/],
+    ["missing project_id", protocolText({ project_id: undefined }), /project_id is missing/],
+    ["empty project_id", protocolText({ project_id: " " }), /project_id must be a nonempty/],
+    ["missing repository_root", protocolText({ repository_root: undefined }), /repository_root is missing/],
+    ["wrong repository_root", protocolText({ repository_root: "src" }), /repository_root must be "."/],
+  ];
+  for (const [label, text, re] of cases) {
+    const check = validateProtocol(text);
+    assert.equal(check.ok, false, `${label} must fail`);
+    assert.match(check.error, re, label);
+  }
+});
+
+test("validateProtocol: every required core section is enforced; optional sections and model routing grant nothing", () => {
+  assert.equal(validateProtocol(protocolText()).ok, true);
+
+  for (const [heading] of coreSections) {
+    const body = coreBody(coreSections.filter(([h]) => h !== heading));
+    const check = validateProtocol(protocolText({}, body));
+    assert.equal(check.ok, false, `missing core section ${heading} must fail`);
+    assert.match(check.error, new RegExp(`missing required core section "${heading}"`));
+  }
+
+  // The decision matrix must include must-ask boundaries.
+  const bodyNoMustAsk = coreBody(
+    coreSections.map(([h, b]) => (h === "decision matrix" ? [h, b.replace(/must-ask/, "role-owned")] : [h, b])),
+  );
+  const noMustAsk = validateProtocol(protocolText({}, bodyNoMustAsk));
+  assert.equal(noMustAsk.ok, false);
+  assert.match(noMustAsk.error, /must-ask boundaries/);
+
+  // Optional sections may be absent; model/effort routing presence neither
+  // required nor granting anything.
+  const withOptionals = `${coreBody()}\n\n## Project criticality\n\nHigh.\n\n## Review and council\n\nA council appears only for genuinely independent decisions.\n\n## Anti-patterns\n\nNo ceremony for tiny work.\n\n## Supervisor hints\n\nObserve, do not implement.\n\n## Model routing\n\nReserved for a later version; not normative here.`;
+  assert.equal(validateProtocol(protocolText({}, withOptionals)).ok, true, "optional and model-routing sections must not break validation");
+});
+
+test("readAndValidateProtocol: missing and empty files fail closed; valid file returns digest and metadata", async () => {
+  const repo = await gitRepoFixture();
+  const bare = await gitRepoFixture({ withProtocol: false });
+  try {
+    const read = await readAndValidateProtocol(repo.dir);
+    assert.equal(read.ok, true);
+    assert.equal(read.protocol.path, protocolPath(repo.dir));
+    assert.equal(read.protocol.repoRoot, repo.dir);
+    assert.equal(read.protocol.digest, digestOf(validProtocol));
+    assert.deepEqual(read.protocol.meta, validMeta);
+
+    const missing = await readAndValidateProtocol(bare.dir);
+    assert.equal(missing.ok, false);
+    assert.match(missing.error, /missing/);
+
+    await mkdir(join(bare.dir, ".orchestration"), { recursive: true });
+    await writeFile(protocolPath(bare.dir), "");
+    const emptyFile = await readAndValidateProtocol(bare.dir);
+    assert.equal(emptyFile.ok, false);
+    assert.match(emptyFile.error, /nonempty/);
+
+    await writeFile(protocolPath(bare.dir), "   \n");
+    const whitespace = await readAndValidateProtocol(bare.dir);
+    assert.equal(whitespace.ok, false);
+    assert.match(whitespace.error, /nonempty/);
+
+    await writeFile(protocolPath(bare.dir), "---\nstatus: active\nversion: 1\nlast_reviewed: 2025-06-01\nproject_id: p\nrepository_root: .\n---\n\n## Decision matrix\n\nMust-ask boundaries are Human-owned.\n");
+    const incomplete = await readAndValidateProtocol(bare.dir);
+    assert.equal(incomplete.ok, false);
+    assert.match(incomplete.error, /missing required core section/);
+  } finally {
+    await rm(repo.dir, { recursive: true, force: true });
+    await rm(bare.dir, { recursive: true, force: true });
+  }
+});
+
+test("wiring: a valid protocol is pinned at session_start and re-verified at every gate", async () => {
+  const repo = await gitRepoFixture();
+  const previous = process.cwd();
+  process.chdir(repo.dir);
+  const ext = await freshExtension();
+  const env = await governedFixture(ext, { role: "lead", activeTools: ["read", "bash", "mcp"] });
+  try {
+    assert.deepEqual(ext.getProtocolPin(), {
+      repoRoot: repo.dir,
+      version: 1,
+      projectId: "ppo-fixture",
+      digest: digestOf(validProtocol),
+    });
+
+    // Pin survives repeated reads: input, before_agent_start, and tool_call
+    // all re-read and re-validate without complaint.
+    for (let i = 0; i < 3; i++) {
+      assert.deepEqual(await inputText(env.fake, "continue"), { action: "continue" });
+    }
+    const before = await env.fake.handlers.get("before_agent_start")(
+      { prompt: "hi", systemPrompt: "base", systemPromptOptions: { selectedTools: ["read", "bash", "mcp"] } },
+      env.fake.ctx,
+    );
+    assert.match(before.systemPrompt, /# lead profile/);
+    const readCall = await env.fake.handlers.get("tool_call")({ toolName: "read", input: { path: join(repo.dir, "README.md") } }, env.fake.ctx);
+    assert.equal(readCall, undefined);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+    process.chdir(previous);
+  }
+});
+
+test("wiring: protocol byte drift blocks permanently and restoring the bytes does not clear it", async () => {
+  const repo = await gitRepoFixture();
+  const previous = process.cwd();
+  process.chdir(repo.dir);
+  const ext = await freshExtension();
+  const env = await governedFixture(ext, { role: "lead", activeTools: ["read", "bash", "mcp"] });
+  try {
+    const p = protocolPath(repo.dir);
+    await writeFile(p, validProtocol + "\n# late edit\n", "utf8");
+    const blocked = await inputText(env.fake, "hi");
+    assert.deepEqual(blocked, { action: "handled" });
+    assert.equal(env.fake.notifications.some(([msg]) => /drifted/.test(msg)), true);
+
+    const before = await env.fake.handlers.get("before_agent_start")(
+      { prompt: "hi", systemPrompt: "base", systemPromptOptions: { selectedTools: ["read", "bash", "mcp"] } },
+      env.fake.ctx,
+    );
+    assert.equal(before, undefined);
+
+    // Restoring the exact pinned bytes does NOT clear the in-process block.
+    await writeFile(p, validProtocol, "utf8");
+    assert.deepEqual(await inputText(env.fake, "hi"), { action: "handled" });
+    const call = await env.fake.handlers.get("tool_call")({ toolName: "read", input: {} }, env.fake.ctx);
+    assert.equal(call.block, true);
+    assert.match(call.reason, /blocked/);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+    process.chdir(previous);
+  }
+});
+
+test("wiring: protocol project identity mismatch blocks permanently with the exact reason", async () => {
+  const repo = await gitRepoFixture();
+  const previous = process.cwd();
+  process.chdir(repo.dir);
+  const ext = await freshExtension();
+  const env = await governedFixture(ext, { role: "lead", activeTools: ["read", "bash", "mcp"] });
+  try {
+    await writeFile(protocolPath(repo.dir), protocolText({ project_id: "other-project" }), "utf8");
+    const blocked = await inputText(env.fake, "hi");
+    assert.deepEqual(blocked, { action: "handled" });
+    assert.equal(env.fake.notifications.some(([msg]) => /project identity changed/.test(msg)), true);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+    process.chdir(previous);
+  }
+});
+
+test("wiring: a lead without a valid protocol pin is blocked at input and before_agent_start", async () => {
+  const previous = process.cwd();
+  const bare = await gitRepoFixture({ withProtocol: false });
+  process.chdir(bare.dir);
+  const ext = await freshExtension();
+  const env = await governedFixture(ext, { role: "lead", activeTools: ["read", "bash", "mcp"] });
+  try {
+    assert.equal(ext.getProtocolPin(), null);
+    const input = await inputText(env.fake, "hi");
+    assert.deepEqual(input, { action: "handled" });
+    assert.equal(env.fake.notifications.some(([msg]) => /protocol file is missing/.test(msg)), true);
+    const before = await env.fake.handlers.get("before_agent_start")(
+      { prompt: "hi", systemPrompt: "base", systemPromptOptions: { selectedTools: ["read", "bash", "mcp"] } },
+      env.fake.ctx,
+    );
+    assert.equal(before, undefined);
+    const call = await env.fake.handlers.get("tool_call")({ toolName: "read", input: {} }, env.fake.ctx);
+    assert.equal(call.block, true);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+    await rm(bare.dir, { recursive: true, force: true });
+    process.chdir(previous);
+  }
+
+  // Malformed protocol state also blocks with the exact reason.
+  const malformed = await gitRepoFixture({ withProtocol: false });
+  await mkdir(join(malformed.dir, ".orchestration"), { recursive: true });
+  await writeFile(protocolPath(malformed.dir), "not a protocol", "utf8");
+  process.chdir(malformed.dir);
+  const ext2 = await freshExtension();
+  const env2 = await governedFixture(ext2, { role: "lead", activeTools: ["read", "bash", "mcp"] });
+  try {
+    assert.deepEqual(await inputText(env2.fake, "hi"), { action: "handled" });
+    assert.equal(env2.fake.notifications.some(([msg]) => /frontmatter/.test(msg)), true);
+  } finally {
+    await rm(env2.dir, { recursive: true, force: true });
+    await rm(env2.profiles, { recursive: true, force: true });
+    await rm(malformed.dir, { recursive: true, force: true });
+    process.chdir(previous);
+  }
+});
+
+test("wiring: peer read/grep/ls/find of the protocol or .orchestration is blocked; other reads pass", async () => {
+  const repo = await gitRepoFixture();
+  const previous = process.cwd();
+  process.chdir(repo.dir);
+  const ext = await freshExtension();
+  const env = await governedFixture(ext, { activeTools: ["read", "bash", "write", "edit"] });
+  try {
+    const protoAbs = protocolPath(repo.dir);
+
+    // Absolute and repo-relative targets both resolve to the protocol.
+    for (const path of [protoAbs, ".orchestration/workspace-protocol.md"]) {
+      const blocked = await env.fake.handlers.get("tool_call")({ toolName: "read", input: { path } }, env.fake.ctx);
+      assert.equal(blocked.block, true, `read ${path} must be blocked`);
+      assert.match(blocked.reason, /governance violation/);
+    }
+
+    // The .orchestration directory itself is off-limits for ls/grep/find too.
+    const lsDir = await env.fake.handlers.get("tool_call")({ toolName: "ls", input: { path: join(repo.dir, ".orchestration") } }, env.fake.ctx);
+    assert.equal(lsDir.block, true);
+    const grepProto = await env.fake.handlers.get("tool_call")({ toolName: "grep", input: { pattern: "version", path: join(repo.dir, ".orchestration") } }, env.fake.ctx);
+    assert.equal(grepProto.block, true);
+    const findProto = await env.fake.handlers.get("tool_call")({ toolName: "find", input: { pattern: "**", path: ".orchestration" } }, env.fake.ctx);
+    assert.equal(findProto.block, true);
+
+    // Other reads pass.
+    const readOk = await env.fake.handlers.get("tool_call")({ toolName: "read", input: { path: join(repo.dir, "README.md") } }, env.fake.ctx);
+    assert.equal(readOk, undefined);
+    const readSrc = await env.fake.handlers.get("tool_call")({ toolName: "read", input: { path: "src/main.go" } }, env.fake.ctx);
+    assert.equal(readSrc, undefined);
+
+    // A peer with a valid current edit grant still may not read the protocol.
+    await inputText(env.fake, envelopeText(peerEnvelope({ base: undefined, capabilities: ["edit"] })));
+    assert.notEqual(ext.getAuthority(), null);
+    const grantedRead = await env.fake.handlers.get("tool_call")({ toolName: "read", input: { path: protoAbs } }, env.fake.ctx);
+    assert.equal(grantedRead.block, true);
+    const grantedWrite = await env.fake.handlers.get("tool_call")({ toolName: "write", input: { path: join(repo.dir, "src", "x.go") } }, env.fake.ctx);
+    assert.equal(grantedWrite, undefined, "the grant still works outside the protocol path");
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+    process.chdir(previous);
+  }
+});
+
+test("checkToolCall: the peer read gate resolves protocol targets and passes everything else", () => {
+  const peerPolicy = { role: "peer", allowed: ["read", "grep", "ls", "find", "bash"], repoRoot: "/repo" };
+  assert.equal(extension.checkToolCall("read", { path: "/repo/.orchestration/workspace-protocol.md" }, peerPolicy).block, true);
+  assert.equal(extension.checkToolCall("read", { path: ".orchestration/workspace-protocol.md" }, peerPolicy).block, true);
+  assert.equal(extension.checkToolCall("read", { path: ".orchestration/" }, peerPolicy).block, true);
+  assert.equal(extension.checkToolCall("grep", { pattern: "x", path: "/repo/.orchestration" }, peerPolicy).block, true);
+  assert.equal(extension.checkToolCall("ls", { path: "/repo/.orchestration" }, peerPolicy).block, true);
+  assert.equal(extension.checkToolCall("find", { pattern: "**", path: ".orchestration" }, peerPolicy).block, true);
+  assert.equal(extension.checkToolCall("read", { path: "/repo/README.md" }, peerPolicy), undefined);
+  assert.equal(extension.checkToolCall("read", { path: "/repo/.orchestration.md" }, peerPolicy), undefined, "similar names are not the protocol");
+  assert.equal(extension.checkToolCall("read", { path: "src/main.go" }, peerPolicy), undefined);
+  // Unresolvable target without a repository root fails closed.
+  assert.equal(extension.checkToolCall("read", { path: "/repo/.orchestration/x" }, { role: "peer", allowed: ["read"] }).block, true);
+  // Supervisor is not gated.
+  assert.equal(extension.checkToolCall("read", { path: "/repo/.orchestration/workspace-protocol.md" }, { role: "supervisor", allowed: ["read"], repoRoot: "/repo" }), undefined);
+});
+
+test("wiring: supervisor never pins and may read the protocol; passive is unaffected", async () => {
+  const repo = await gitRepoFixture();
+  const previous = process.cwd();
+  process.chdir(repo.dir);
+  const ext = await freshExtension();
+  const env = await governedFixture(ext, { role: "supervisor", activeTools: ["read", "bash", "mcp"] });
+  try {
+    assert.equal(ext.getProtocolPin(), null, "supervisor never pins the protocol");
+    assert.deepEqual(await inputText(env.fake, "observe"), { action: "continue" });
+    const read = await env.fake.handlers.get("tool_call")({ toolName: "read", input: { path: protocolPath(repo.dir) } }, env.fake.ctx);
+    assert.equal(read, undefined, "supervisor may read the protocol");
+
+    // Passive process: no latch, no gate, no pin.
+    const ext2 = await freshExtension();
+    const fake2 = fakePi({ env: { PI_CODING_AGENT_DIR: join(tmpdir(), "ppo-passive-none") } });
+    ext2.default(fake2.pi);
+    await fake2.handlers.get("session_start")({ reason: "startup" }, fake2.ctx);
+    assert.equal(ext2.getProtocolPin(), null);
+    const passiveRead = await fake2.handlers.get("tool_call")({ toolName: "read", input: { path: protocolPath(repo.dir) } }, fake2.ctx);
+    assert.equal(passiveRead, undefined);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+    process.chdir(previous);
+  }
+});
+
+test("wiring: protocol presence never grants write, edit, or commit without an envelope", async () => {
+  const repo = await gitRepoFixture();
+  const previous = process.cwd();
+  process.chdir(repo.dir);
+  const ext = await freshExtension();
+  const env = await governedFixture(ext, { role: "lead", activeTools: ["read", "bash", "mcp", "write", "edit"] });
+  try {
+    assert.notEqual(ext.getProtocolPin(), null, "the pin exists");
+    const write = await env.fake.handlers.get("tool_call")({ toolName: "write", input: { path: join(repo.dir, "src", "x.go") } }, env.fake.ctx);
+    assert.equal(write.block, true);
+    assert.match(write.reason, /not permitted|edit grant/);
+    const edit = await env.fake.handlers.get("tool_call")({ toolName: "edit", input: { path: join(repo.dir, "src", "main.go") } }, env.fake.ctx);
+    assert.equal(edit.block, true);
+    const commit = await env.fake.handlers.get("tool_call")({ toolName: "bash", input: { command: "git commit -m x" } }, env.fake.ctx);
+    assert.equal(commit.block, true);
+    assert.match(commit.reason, /local_commit grant/);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+    process.chdir(previous);
+  }
+});
+
+test("wiring: a lead_tiny envelope whose digest does not match the pinned protocol fails activation", async () => {
+  const repo = await gitRepoFixture();
+  const previous = process.cwd();
+  process.chdir(repo.dir);
+  const ext = await freshExtension();
+  const env = await governedFixture(ext, { role: "lead", activeTools: ["read", "bash", "mcp", "write", "edit"] });
+  try {
+    const tiny = envelopeText({
+      version: 1, grant_kind: "lead_tiny", role: "lead", issuer: "human",
+      agent_id: "agent-7", task_id: "t-1", objective: "tiny fix",
+      capabilities: ["edit"], scope: "src", protocol_digest: "a".repeat(64),
+    });
+    await inputText(env.fake, tiny);
+    assert.equal(ext.getAuthority(), null);
+    assert.match(ext.getAuthorityReason(), /protocol_digest/);
+    const write = await env.fake.handlers.get("tool_call")({ toolName: "write", input: { path: join(repo.dir, "src", "x.go") } }, env.fake.ctx);
+    assert.equal(write.block, true, "a failed lead_tiny attempt grants nothing");
+
+    // A matching digest still does not activate: the route does not exist.
+    const matched = envelopeText({
+      version: 1, grant_kind: "lead_tiny", role: "lead", issuer: "human",
+      agent_id: "agent-7", task_id: "t-1", objective: "tiny fix",
+      capabilities: ["edit"], scope: "src", protocol_digest: digestOf(validProtocol),
+    });
+    await inputText(env.fake, matched);
+    assert.equal(ext.getAuthority(), null);
+    assert.match(ext.getAuthorityReason(), /no route in this slice/);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+    process.chdir(previous);
   }
 });
