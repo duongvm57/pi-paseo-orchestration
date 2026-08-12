@@ -1,0 +1,19 @@
+{
+  "name": "pi-paseo-orchestration",
+  "private": true,
+  "type": "module",
+  "keywords": [
+    "pi-package"
+  ],
+  "scripts": {
+    "test": "node --test test/package.test.mjs"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/pi-paseo-orchestration.ts"
+    ],
+    "skills": [
+      "./skills/workspace-protocol/SKILL.md"
+    ]
+  }
+}
