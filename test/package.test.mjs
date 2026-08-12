@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const execFile = promisify(execFileCallback);
 
@@ -93,7 +93,7 @@ test("manifest declares only one Pi extension and one Pi skill", () => {
     extensions: ["./extensions/pi-paseo-orchestration.ts"],
     skills: ["./skills/workspace-protocol/SKILL.md"],
   });
-  assert.deepEqual(manifest.scripts, { test: "node --test test/package.test.mjs" });
+  assert.deepEqual(manifest.scripts, { test: "node --test test/package.test.mjs", "release:smoke": "node test/release-smoke.mjs" });
 
   for (const field of ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]) {
     assert.equal(manifest[field]?.["pi-mcp-adapter"], undefined);
@@ -2924,5 +2924,312 @@ test("Doctor: secret-shaped values are redacted from the report", async () => {
     assert.equal(block.includes("[REDACTED]"), true);
   } finally {
     await rm(config, { recursive: true, force: true });
+  }
+});
+
+// ─── Lát 8: package verification and release gate ───────────────────────────
+
+const { resolvePackageResources, releaseGate } = extension;
+
+// Copy the dev root (without Git/session internals) into a fresh directory so
+// resource resolution can be proven from a relocated package root.
+const copyPackageRoot = async (target) => {
+  for (const entry of await readdir(root)) {
+    if ([".git", ".scratch", ".pi-glla", ".pi-subagents", "node_modules"].includes(entry)) continue;
+    await cp(join(root, entry), join(target, entry), { recursive: true, force: true });
+  }
+};
+
+// Sorted [relative path, "dir"|hex bytes] recursive tree; .git is excluded and
+// Git mutation is asserted separately through porcelain/log state.
+const treeBytes = async (base) => {
+  const map = new Map();
+  const walk = async (rel) => {
+    for (const name of await readdir(join(base, rel))) {
+      if (rel === "" && name === ".git") continue;
+      const full = join(base, rel, name);
+      const st = await stat(full);
+      const key = join(rel, name);
+      if (st.isDirectory()) { map.set(key, "dir"); await walk(key); }
+      else map.set(key, (await readFile(full)).toString("hex"));
+    }
+  };
+  await walk("");
+  return [...map.entries()].sort();
+};
+
+const gitSnapshot = async (dir) => {
+  const head = await git(["rev-parse", "HEAD"], dir);
+  const status = await git(["status", "--porcelain=v1", "--untracked-files=all"], dir);
+  const log = await git(["log", "--oneline", "--all"], dir);
+  return [head.stdout, status.stdout, log.stdout].join("\n");
+};
+
+test("package resources resolve from canonical loaded-module provenance: real root, copied root, and unrelated cwd", async () => {
+  const moduleUrl = pathToFileURL(join(root, manifest.pi.extensions[0]));
+  const resolved = await resolvePackageResources(moduleUrl);
+  assert.equal(resolved.ok, true, resolved.error);
+  const realRoot = await realpath(root);
+  assert.equal(resolved.resources.package_root, realRoot);
+  assert.equal(resolved.resources.extension, join(realRoot, manifest.pi.extensions[0]));
+  assert.equal(resolved.resources.skill, join(realRoot, manifest.pi.skills[0]));
+  assert.deepEqual(Object.keys(resolved.resources.profiles).sort(), ["lead", "peer", "supervisor"]);
+  for (const [role, rel] of [["supervisor", "profiles/supervisor.md"], ["lead", "profiles/lead.md"], ["peer", "profiles/peer.md"]]) {
+    assert.equal(resolved.resources.profiles[role], join(realRoot, rel));
+  }
+
+  const copy = await mkdtemp(join(tmpdir(), "ppo-pkgcopy-"));
+  const elsewhere = await mkdtemp(join(tmpdir(), "ppo-elsewhere-"));
+  const previousCwd = process.cwd();
+  try {
+    await copyPackageRoot(copy);
+    const copied = await resolvePackageResources(pathToFileURL(join(copy, manifest.pi.extensions[0])));
+    assert.equal(copied.ok, true, copied.error);
+    assert.notEqual(copied.resources.package_root, realRoot);
+    assert.deepEqual(copied.resources.profiles, {
+      supervisor: join(copied.resources.package_root, "profiles/supervisor.md"),
+      lead: join(copied.resources.package_root, "profiles/lead.md"),
+      peer: join(copied.resources.package_root, "profiles/peer.md"),
+    });
+
+    // Unrelated cwd: the function must not consult cwd/repo-root/config-root.
+    process.chdir(elsewhere);
+    const fromElsewhere = await resolvePackageResources(pathToFileURL(join(copy, manifest.pi.extensions[0])));
+    assert.equal(fromElsewhere.ok, true, fromElsewhere.error);
+    assert.deepEqual(fromElsewhere.resources, copied.resources);
+  } finally {
+    process.chdir(previousCwd);
+    await rm(copy, { recursive: true, force: true });
+    await rm(elsewhere, { recursive: true, force: true });
+  }
+});
+
+test("package resources fail closed on missing, empty, non-regular, symlink-escaped, and manifest violations", async () => {
+  const makeCopy = async () => {
+    const copy = await mkdtemp(join(tmpdir(), "ppo-pkgadv-"));
+    await copyPackageRoot(copy);
+    return copy;
+  };
+  const urlOf = (copy) => pathToFileURL(join(copy, manifest.pi.extensions[0]));
+  const writeManifest = async (copy, over) => {
+    const doc = JSON.parse(await readFile(join(copy, "package.json"), "utf8"));
+    Object.assign(doc, over);
+    await writeFile(join(copy, "package.json"), JSON.stringify(doc), "utf8");
+  };
+
+  const cases = [];
+  const missing = await makeCopy();
+  cases.push([missing, async () => rm(join(missing, "profiles", "peer.md")), /peer\.md must exist/]);
+
+  const empty = await makeCopy();
+  cases.push([empty, async () => writeFile(join(empty, manifest.pi.skills[0]), "", "utf8"), /skill must be nonempty/]);
+
+  const nonRegular = await makeCopy();
+  cases.push([nonRegular, async () => { const file = join(nonRegular, manifest.pi.extensions[0]); await rm(file); await mkdir(file); }, /extension must be a regular file/]);
+
+  const symlinkEscape = await makeCopy();
+  const outside = join(tmpdir(), `ppo-outside-${Math.random().toString(36).slice(2)}.md`);
+  await writeFile(outside, "outside secret\n", "utf8");
+  cases.push([symlinkEscape, async () => { await rm(join(symlinkEscape, "profiles", "lead.md")); await symlink(outside, join(symlinkEscape, "profiles", "lead.md")); }, /lead\.md must be a direct descendant without symlink escape/]);
+
+  const twoExtensions = await makeCopy();
+  cases.push([twoExtensions, async () => writeManifest(twoExtensions, { pi: { ...JSON.parse(await readFile(join(twoExtensions, "package.json"), "utf8")).pi, extensions: ["./extensions/a.ts", "./extensions/b.ts"] } }), /exactly one extension/]);
+
+  const noSkill = await makeCopy();
+  cases.push([noSkill, async () => writeManifest(noSkill, { pi: { ...JSON.parse(await readFile(join(noSkill, "package.json"), "utf8")).pi, skills: [] } }), /exactly one skill/]);
+
+  const adapterDep = await makeCopy();
+  cases.push([adapterDep, () => writeManifest(adapterDep, { dependencies: { "pi-mcp-adapter": "2.22.0" } }), /adapter dependency/]);
+
+  const installScript = await makeCopy();
+  cases.push([installScript, () => writeManifest(installScript, { scripts: { install: "echo pwned" } }), /install lifecycle scripts/]);
+
+  const extraSurface = await makeCopy();
+  cases.push([extraSurface, async () => writeManifest(extraSurface, { pi: { ...JSON.parse(await readFile(join(extraSurface, "package.json"), "utf8")).pi, prompts: ["./prompts/x.md"] } }), /unsupported pi surfaces/]);
+
+  const traversal = await makeCopy();
+  cases.push([traversal, async () => writeManifest(traversal, { pi: { ...JSON.parse(await readFile(join(traversal, "package.json"), "utf8")).pi, extensions: ["../outside.ts"] } }), /direct descendant of the package root/]);
+
+  const absolutePath = await makeCopy();
+  cases.push([absolutePath, async () => writeManifest(absolutePath, { pi: { ...JSON.parse(await readFile(join(absolutePath, "package.json"), "utf8")).pi, extensions: [outside] } }), /absolute path/]);
+
+  const wrongModule = await makeCopy();
+  cases.push([wrongModule, async () => writeFile(join(wrongModule, "extensions", "other.ts"), "export default () => {};\n", "utf8"), pathToFileURL(join(wrongModule, "extensions", "other.ts")), /not the manifest-declared extension/]);
+
+  try {
+    for (const [copy, mutate, ...rest] of cases) {
+      const [url, expected] = rest.length === 1 ? [null, rest[0]] : rest;
+      await mutate();
+      const result = await resolvePackageResources(url ?? urlOf(copy));
+      assert.equal(result.ok, false, `${copy} must fail`);
+      assert.match(result.error, expected, `${copy} error must match ${expected}`);
+    }
+
+    // Non-file provenance and data-URL modules fail closed without cwd fallback.
+    const dataUrl = await resolvePackageResources("data:text/javascript;base64,ZXhwb3J0IGRlZmF1bHQgKCkgPT4ge307");
+    assert.equal(dataUrl.ok, false);
+    assert.match(dataUrl.error, /canonical file URL/);
+    const fresh = await freshExtension();
+    const noArg = await fresh.resolvePackageResources();
+    assert.equal(noArg.ok, false);
+    assert.match(noArg.error, /canonical file URL/);
+  } finally {
+    for (const [copy] of cases) await rm(copy, { recursive: true, force: true });
+    await rm(outside, { force: true });
+  }
+});
+
+const allReleaseFacts = () => ({
+  install_pinned: true,
+  relocation: true,
+  doctor_tui_rpc_equivalence: true,
+  settings_exact: true,
+  notebook_primitives: true,
+  hermetic_tests: true,
+  release_smoke: true,
+  mutation_boundaries: true,
+  capabilities: { pi_api: true, paseo_live: true, adapter_current_agent_observer: true },
+});
+
+test("releaseGate passes only when every required fact is exactly proven", () => {
+  assert.deepEqual(releaseGate(allReleaseFacts()), { ok: true });
+});
+
+test("releaseGate fails closed on every missing fact, the absent adapter observer, and unknown or non-boolean values", () => {
+  const empty = releaseGate({});
+  assert.equal(empty.ok, false);
+  assert.deepEqual(empty.blockers.map((blocker) => blocker.fact), [
+    "capabilities", "doctor_tui_rpc_equivalence", "hermetic_tests", "install_pinned",
+    "mutation_boundaries", "notebook_primitives", "release_smoke", "relocation", "settings_exact",
+  ]);
+  assert.equal(empty.blockers.every((blocker) => blocker.status === "missing"), true);
+  assert.equal(empty.blockers.every((blocker) => typeof blocker.owner === "string" && blocker.owner !== ""), true);
+
+  // The public current-agent observer is a REQUIRED capability: when the facts
+  // say it is absent the gate must list it as a blocker (the adapter is not
+  // implemented by this slice).
+  const withoutAdapter = releaseGate({ ...allReleaseFacts(), capabilities: { ...allReleaseFacts().capabilities, adapter_current_agent_observer: false } });
+  assert.equal(withoutAdapter.ok, false);
+  assert.deepEqual(withoutAdapter.blockers.map((blocker) => blocker.fact), ["capabilities.adapter_current_agent_observer"]);
+  const adapterBlocker = withoutAdapter.blockers[0];
+  assert.equal(adapterBlocker.status, "failed");
+  assert.equal(adapterBlocker.observed, false);
+  assert.equal(adapterBlocker.owner, "operator");
+  assert.match(adapterBlocker.condition, /current-agent observer/);
+  assert.match(adapterBlocker.action, /no fallback/);
+
+  // Unknown and non-boolean facts fail closed.
+  const unproven = releaseGate({ ...allReleaseFacts(), install_pinned: "pending" });
+  assert.equal(unproven.ok, false);
+  assert.equal(unproven.blockers.some((blocker) => blocker.fact === "install_pinned" && blocker.status === "unknown" && blocker.observed === "pending"), true);
+  const unknownFact = releaseGate({ ...allReleaseFacts(), mystery_fact: true });
+  assert.equal(unknownFact.blockers.some((blocker) => blocker.fact === "mystery_fact" && blocker.status === "unknown"), true);
+  const unknownCapability = releaseGate({ ...allReleaseFacts(), capabilities: { ...allReleaseFacts().capabilities, magic_observer: true } });
+  assert.equal(unknownCapability.blockers.some((blocker) => blocker.fact === "capabilities.magic_observer" && blocker.status === "unknown"), true);
+
+  for (const bad of [null, undefined, [], "facts"]) {
+    const result = releaseGate(bad);
+    assert.equal(result.ok, false);
+    assert.deepEqual(result.blockers.map((blocker) => blocker.fact), ["facts"]);
+  }
+
+  // Deterministic: repeated evaluations are byte-identical and sorted.
+  assert.deepEqual(releaseGate({}), releaseGate({}));
+  const adapterFacts = { ...allReleaseFacts(), capabilities: { ...allReleaseFacts().capabilities, adapter_current_agent_observer: false } };
+  assert.deepEqual(releaseGate(adapterFacts), releaseGate(adapterFacts));
+});
+
+test("release smoke script exists, is node-stdlib-only, runs, and reports the absent adapter as the release blocker", async () => {
+  assert.equal(manifest.scripts["release:smoke"], "node test/release-smoke.mjs");
+  const smokeSource = await readFile(join(root, "test", "release-smoke.mjs"), "utf8");
+  for (const match of smokeSource.matchAll(/from\s+"([^"]+)"/g)) {
+    assert.match(match[1], /^node:/, `smoke script must use node builtins only (${match[1]})`);
+  }
+
+  let code = 0;
+  let stdout = "";
+  try {
+    const result = await execFile("node", ["test/release-smoke.mjs"], { cwd: root, timeout: 120000 });
+    stdout = result.stdout;
+  } catch (err) {
+    code = err.code ?? 1;
+    stdout = err.stdout ?? "";
+  }
+  assert.notEqual(code, 0, "the smoke must exit non-zero while the adapter capability is absent");
+  assert.equal(code, 1);
+  assert.match(stdout, /RELEASE BLOCKER: capabilities\.adapter_current_agent_observer is absent/);
+  assert.match(stdout, /adapter observer not yet verified/);
+  assert.match(stdout, /relocation: resource set and digests are identical from the copy/);
+});
+
+test("mutation boundary: settings command, notebook init+append, and doctor touch only the expected config surfaces", async () => {
+  const config = await mkdtemp(join(tmpdir(), "ppo-mut-"));
+  const repo = await gitRepoFixture();
+  const profiles = await profileDirFixture();
+  const ext = await freshExtension();
+  try {
+    await writeSettings(config, validDoc);
+    const selectQueue = ["anthropic", "claude-sonnet-4-5", "high", "anthropic", "claude-sonnet-4-5", "medium", "openai", "gpt-5", "off"];
+    const fake = fakePi({
+      activeTools: ["read", "bash", "mcp"],
+      env: {
+        PI_CODING_AGENT_DIR: config,
+        PI_PASEO_ORCHESTRATION_ROLE: "supervisor",
+        PASEO_AGENT_ID: "agent-7",
+        PI_PASEO_ORCHESTRATION_PROFILES_DIR: profiles,
+        PASEO_PROJECT_ID: "paseo-project-1",
+        PASEO_WORKSPACE_ID: "workspace-1",
+        PASEO_LEAD_AGENT_ID: "absent",
+      },
+      ui: {
+        select: async () => selectQueue.shift() ?? null,
+        confirm: async () => true,
+        input: async () => "ppo-fixture",
+      },
+    });
+    fake.ctx.cwd = repo.dir;
+    ext.default(fake.pi);
+    await fake.handlers.get("session_start")({ reason: "startup" }, fake.ctx);
+
+    // Snapshot everything the exercise must not mutate.
+    const packageTree = await treeBytes(root);
+    const packageGit = await gitSnapshot(root);
+    const repoTree = await treeBytes(repo.dir);
+    const repoGit = await gitSnapshot(repo.dir);
+
+    // Full exercise through the real registered handlers.
+    await fake.commands.get("pi-paseo-orchestration:settings").handler("", fake.ctx);
+    const initResult = await fake.commands.get("pi-paseo-orchestration:notebook-init").handler("", fake.ctx);
+    assert.equal(initResult.ok, true, initResult.error);
+    const manifest = JSON.parse(await readFile(initResult.paths.manifestPath, "utf8"));
+    const entry = notebookEntryFixture(manifest, "ppo-fixture", repo.dir);
+    const appendResult = await fake.commands.get("pi-paseo-orchestration:notebook-append").handler({ project_id: "ppo-fixture", entry }, fake.ctx);
+    assert.equal(appendResult.ok, true, appendResult.error);
+    const doctorResult = await fake.commands.get("pi-paseo-orchestration:doctor").handler("", { ...fake.ctx, rpc: true });
+    assert.equal(doctorResult.ok, true, doctorResult.error);
+
+    // No project, package, Git, or Paseo mutation.
+    assert.deepEqual(await treeBytes(repo.dir), repoTree, "project files must be byte-identical");
+    assert.equal(await gitSnapshot(repo.dir), repoGit, "project Git state must be unchanged");
+    assert.deepEqual(await treeBytes(root), packageTree, "package files must be byte-identical");
+    assert.equal(await gitSnapshot(root), packageGit, "package Git state must be unchanged");
+    assert.equal("paseo" in fake.pi, false, "the fake pi has no Paseo surface to mutate");
+    assert.equal("observeCurrentAgent" in fake.ctx, false);
+
+    // The config root contains EXACTLY the expected files and nothing else.
+    const key = ext.deriveNotebookProjectKey("ppo-fixture");
+    const expectedFiles = [
+      join("pi-paseo-orchestration", "settings.json"),
+      join("pi-paseo-orchestration", "supervisor-notebooks", "v1", "projects", key, "manifest.json"),
+      join("pi-paseo-orchestration", "supervisor-notebooks", "v1", "projects", key, "entries", "entry-1.json"),
+    ].sort();
+    const actualFiles = (await treeBytes(config)).filter(([, value]) => value !== "dir").map(([rel]) => rel).sort();
+    assert.deepEqual(actualFiles, expectedFiles, "config root must contain exactly the settings document and the notebook manifest+entry");
+    assert.deepEqual(JSON.parse(await readFile(join(config, "pi-paseo-orchestration", "settings.json"), "utf8")), validDoc);
+    assert.deepEqual(await readdir(join(config, "pi-paseo-orchestration", "supervisor-notebooks", "v1", ".staging")), [], "private staging must have no residue");
+  } finally {
+    await rm(config, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+    await rm(profiles, { recursive: true, force: true });
   }
 });

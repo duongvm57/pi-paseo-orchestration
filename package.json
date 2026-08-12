@@ -6,7 +6,8 @@
     "pi-package"
   ],
   "scripts": {
-    "test": "node --test test/package.test.mjs"
+    "test": "node --test test/package.test.mjs",
+    "release:smoke": "node test/release-smoke.mjs"
   },
   "pi": {
     "extensions": [

@@ -1,6 +1,6 @@
 import { link, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, posix, relative } from "node:path";
+import { dirname, isAbsolute, join, posix, relative, sep } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -2874,7 +2874,7 @@ async function notebookContextFromPi(ctx, env) {
   let protocolPinValue = null;
   if (repoRoot) {
     const protocol = await readAndValidateProtocol(repoRoot);
-    if (protocol.ok) protocolPinValue = { version: protocol.protocol.meta.version, digest: protocol.protocol.digest };
+    if (protocol.ok) protocolPinValue = { version: protocol.protocol.meta.version, digest: `sha256:${protocol.protocol.digest}` };
   }
   return {
     paseoProjectId, workspaceId, leadId, repositoryRoot: repoRoot ?? "unknown", protocolPin: protocolPinValue,
@@ -3655,6 +3655,184 @@ export function getPendingAuthority() {
 
 export function getProtocolPin() {
   return protocolPin === null ? null : { ...protocolPin };
+}
+
+// ─── Lát 8: package verification and release gate ────────────────────────────
+
+// Canonical package resources: the manifest-declared extension and skill plus
+// the three private profile resources. Everything resolves from loaded-module/
+// package provenance (the module URL argument, defaulting to import.meta.url)
+// — never from cwd, repository root, Pi config root, Paseo workspace, or
+// parent-directory search. Expected resources must be regular, readable,
+// nonempty, direct descendants without symlink escape (the realpath-
+// containment pattern from validateProfileDir).
+const BUNDLED_PROFILE_FILES = ["supervisor.md", "lead.md", "peer.md"];
+const MANIFEST_DEPENDENCY_FIELDS = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"];
+const MANIFEST_INSTALL_SCRIPTS = ["preinstall", "install", "postinstall"];
+
+export async function resolvePackageResources(moduleUrl = import.meta.url) {
+  let url;
+  try {
+    url = new URL(moduleUrl);
+  } catch {
+    return { ok: false, error: "package module URL is not a valid URL" };
+  }
+  if (url.protocol !== "file:") {
+    return { ok: false, error: "package module must load from a canonical file URL (loaded-module provenance is unavailable)" };
+  }
+  const modulePath = fileURLToPath(url);
+  let realRoot;
+  try {
+    realRoot = await realpath(join(dirname(modulePath), ".."));
+    if (!(await stat(realRoot)).isDirectory()) return { ok: false, error: "package root is not a directory" };
+  } catch {
+    return { ok: false, error: "package root is not readable" };
+  }
+
+  let manifest;
+  try {
+    manifest = JSON.parse(await readFile(join(realRoot, "package.json"), "utf8"));
+  } catch (err) {
+    return { ok: false, error: `package manifest is not readable JSON: ${err.message}` };
+  }
+  if (!isRecord(manifest) || !isRecord(manifest.pi)) return { ok: false, error: "package manifest has no pi declaration" };
+  const extraSurfaces = Object.keys(manifest.pi).filter((key) => key !== "extensions" && key !== "skills");
+  if (extraSurfaces.length > 0) {
+    return { ok: false, error: `package manifest declares unsupported pi surfaces: ${extraSurfaces.join(", ")}` };
+  }
+  if (!Array.isArray(manifest.pi.extensions) || manifest.pi.extensions.length !== 1
+      || typeof manifest.pi.extensions[0] !== "string" || manifest.pi.extensions[0] === "") {
+    return { ok: false, error: "package manifest must declare exactly one extension" };
+  }
+  if (!Array.isArray(manifest.pi.skills) || manifest.pi.skills.length !== 1
+      || typeof manifest.pi.skills[0] !== "string" || manifest.pi.skills[0] === "") {
+    return { ok: false, error: "package manifest must declare exactly one skill" };
+  }
+  for (const field of MANIFEST_DEPENDENCY_FIELDS) {
+    const deps = manifest[field];
+    if (deps === undefined || deps === null) continue;
+    if (!isRecord(deps)) return { ok: false, error: `package manifest ${field} must be an object` };
+    if (Object.prototype.hasOwnProperty.call(deps, "pi-mcp-adapter")) {
+      return { ok: false, error: "package manifest must not declare an adapter dependency" };
+    }
+  }
+  if (isRecord(manifest.scripts)) {
+    const install = MANIFEST_INSTALL_SCRIPTS.filter((name) => typeof manifest.scripts[name] === "string");
+    if (install.length > 0) {
+      return { ok: false, error: `package manifest must not declare install lifecycle scripts (${install.join(", ")})` };
+    }
+  }
+
+  const declared = [
+    ["extension", manifest.pi.extensions[0]],
+    ["skill", manifest.pi.skills[0]],
+    ...BUNDLED_PROFILE_FILES.map((file) => [`profile ${file}`, join("profiles", file)]),
+  ];
+  const resources = { package_root: realRoot, profiles: {} };
+  for (const [label, rel] of declared) {
+    if (isAbsolute(rel)) return { ok: false, error: `${label} must be a direct descendant of the package root (absolute path)` };
+    const full = join(realRoot, rel);
+    const relPath = relative(realRoot, full);
+    if (relPath === "" || relPath === ".." || relPath.startsWith(`..${sep}`)) {
+      return { ok: false, error: `${label} must be a direct descendant of the package root (${rel})` };
+    }
+    let real;
+    try {
+      real = await realpath(full);
+    } catch (err) {
+      return { ok: false, error: err.code === "ENOENT" ? `${label} must exist (${rel})` : `${label} must be readable (${rel})` };
+    }
+    if (real !== join(realRoot, rel)) {
+      return { ok: false, error: `${label} must be a direct descendant without symlink escape (${rel})` };
+    }
+    if (!(await stat(real)).isFile()) return { ok: false, error: `${label} must be a regular file (${rel})` };
+    if ((await readFile(real, "utf8")).trim() === "") return { ok: false, error: `${label} must be nonempty (${rel})` };
+    if (label === "extension" || label === "skill") resources[label] = real;
+    else resources.profiles[label.slice("profile ".length).replace(/\.md$/, "")] = real;
+  }
+  // The loaded module must be the manifest-declared extension.
+  try {
+    if ((await realpath(modulePath)) !== resources.extension) {
+      return { ok: false, error: "loaded module is not the manifest-declared extension" };
+    }
+  } catch {
+    return { ok: false, error: "loaded module is not readable" };
+  }
+  return { ok: true, resources };
+}
+
+// Release gate: a pure fail-closed function over release facts. Every required
+// fact must be exactly proven; missing, failed, or unknown values become
+// concrete blockers naming the responsible party. The public current-agent
+// observer is a REQUIRED capability: this package does not implement or vendor
+// the adapter, so while pi-mcp-adapter does not expose it the gate must list it
+// as a blocker. There is no fallback.
+const RELEASE_FACTS = [
+  { fact: "install_pinned", condition: "fresh pinned full-commit install proven (configured source/ref, managed checkout HEAD, and extension digest)", owner: "operator", action: "Install the reviewed full commit ID with Pi's Git package support and verify source/ref/HEAD/digest in a fresh process." },
+  { fact: "relocation", condition: "package resources resolve identically from a fresh copied root", owner: "operator", action: "Copy the package to a fresh root and verify every declared resource resolves with identical bytes." },
+  { fact: "doctor_tui_rpc_equivalence", condition: "doctor produces equivalent non-persistent TUI and RPC output", owner: "maintainer", action: "Run doctor in TUI and RPC modes and confirm the canonical reports match." },
+  { fact: "settings_exact", condition: "role settings apply exactly (complete three-role document, exact model and thinking per role)", owner: "maintainer", action: "Confirm one complete settings document applies the exact model and thinking to every governed process." },
+  { fact: "notebook_primitives", condition: "Notebook publication primitives pass concurrency, crash, durability, and containment tests", owner: "maintainer", action: "Run the Notebook publication tests and fix any fail-closed violation." },
+  { fact: "hermetic_tests", condition: "hermetic package tests pass", owner: "maintainer", action: "Run npm test and fix every failure." },
+  { fact: "release_smoke", condition: "release smoke passes on the exact package commit", owner: "maintainer", action: "Run npm run release:smoke on the exact commit and resolve its printed blocker." },
+  { fact: "mutation_boundaries", condition: "mutation-boundary tests prove settings and Notebook writes stay inside their exact surfaces", owner: "maintainer", action: "Run the mutation-boundary tests and confirm no project, package, Git, or Paseo mutation." },
+];
+
+const RELEASE_CAPABILITIES = [
+  { capability: "pi_api", condition: "required Pi extension APIs (getActiveTools, setActiveTools, setModel, setThinkingLevel) are present", owner: "operator", action: "Use a Pi process exposing the required extension APIs." },
+  { capability: "paseo_live", condition: "live Paseo daemon/client identity, cwd, and typed workspace binding are observable", owner: "operator", action: "Start the Paseo daemon and client and rerun doctor until live facts are PASS." },
+  { capability: "adapter_current_agent_observer", condition: "the public current-agent observer proves exact current-agent observation through the independently installed pi-mcp-adapter", owner: "operator", action: "Install and verify the public pi-mcp-adapter current-agent observer; the release gate accepts no fallback." },
+];
+
+function releaseFactState(value) {
+  if (value === true) return "proven";
+  if (value === false) return "failed";
+  return "unknown"; // null, undefined, and non-boolean values are unproven
+}
+
+export function releaseGate(facts) {
+  if (!isRecord(facts)) {
+    return {
+      ok: false,
+      blockers: [{ fact: "facts", condition: "release facts must be a single object with every required fact proven", status: "missing", observed: facts === null || facts === undefined ? null : typeof facts, owner: "maintainer", action: "Pass one facts object with every required fact exactly proven." }],
+    };
+  }
+  const blockers = [];
+  const knownFacts = new Set(RELEASE_FACTS.map((spec) => spec.fact));
+  for (const key of Object.keys(facts)) {
+    if (key !== "capabilities" && !knownFacts.has(key)) {
+      blockers.push({ fact: key, condition: "unknown release fact", status: "unknown", observed: facts[key], owner: "maintainer", action: "Remove or prove the unrecognized release fact." });
+    }
+  }
+  for (const spec of RELEASE_FACTS) {
+    const present = Object.prototype.hasOwnProperty.call(facts, spec.fact);
+    const value = facts[spec.fact];
+    const state = !present || value === undefined || value === null ? "missing" : releaseFactState(value);
+    if (state !== "proven") {
+      blockers.push({ fact: spec.fact, condition: spec.condition, status: state, observed: present && value !== undefined && value !== null ? value : null, owner: spec.owner, action: spec.action });
+    }
+  }
+  const caps = facts.capabilities;
+  if (!isRecord(caps)) {
+    blockers.push({ fact: "capabilities", condition: "all required Pi/Paseo/adapter capabilities are proven", status: "missing", observed: caps === undefined || caps === null ? null : typeof caps, owner: "operator", action: "Prove each required capability; the adapter current-agent observer is mandatory." });
+  } else {
+    const knownCaps = new Set(RELEASE_CAPABILITIES.map((spec) => spec.capability));
+    for (const key of Object.keys(caps)) {
+      if (!knownCaps.has(key)) {
+        blockers.push({ fact: `capabilities.${key}`, condition: "unknown release capability", status: "unknown", observed: caps[key], owner: "operator", action: "Remove or prove the unrecognized release capability." });
+      }
+    }
+    for (const spec of RELEASE_CAPABILITIES) {
+      const present = Object.prototype.hasOwnProperty.call(caps, spec.capability);
+      const value = caps[spec.capability];
+      const state = !present || value === undefined || value === null ? "missing" : releaseFactState(value);
+      if (state !== "proven") {
+        blockers.push({ fact: `capabilities.${spec.capability}`, condition: spec.condition, status: state, observed: present && value !== undefined && value !== null ? value : null, owner: spec.owner, action: spec.action });
+      }
+    }
+  }
+  blockers.sort((left, right) => (left.fact < right.fact ? -1 : left.fact > right.fact ? 1 : 0));
+  return blockers.length === 0 ? { ok: true } : { ok: false, blockers };
 }
 
 const bundledDir = (() => {
