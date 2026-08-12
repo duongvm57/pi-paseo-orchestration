@@ -4216,7 +4216,13 @@ export default function (pi) {
     handler: (args, ctx) => runDoctor(args, ctx, pi),
   });
   if (typeof pi.registerTool === "function") {
-    pi.registerTool(NOTEBOOK_APPEND_TOOL, {
+    // Current Pi API: one definition object (name, label, description,
+    // parameters, execute). The old (name, definition) two-argument form is
+    // gone — it yields a tool whose .name is undefined and corrupts the
+    // provider payload.
+    pi.registerTool({
+      name: NOTEBOOK_APPEND_TOOL,
+      label: "Supervisor Notebook Append",
       description: "Supervisor-only typed append of one immutable causal Notebook entry; no filesystem path is accepted",
       parameters: {
         type: "object",
@@ -4232,7 +4238,17 @@ export default function (pi) {
         },
       },
       isEnabled: () => latch?.role === "supervisor" && blockedReason === null,
-      execute: async (input, ctx) => runNotebookAppend(input, ctx ?? {}),
+      execute: async (toolCallId, params, signal, onUpdate, ctx) => {
+        const result = await runNotebookAppend(params, ctx ?? {});
+        // Execute failure must throw (Pi reports the error); returning a result
+        // object with ok:false here would be surfaced as a successful tool
+        // call whose content is ignored.
+        if (result.ok !== true) {
+          const error = new Error("error" in result && typeof result.error === "string" ? result.error : "notebook append failed");
+          throw error;
+        }
+        return { content: [{ type: "text", text: "status" in result ? `Notebook entry ${result.status}.` : "Notebook entry appended." }], details: {} };
+      },
     });
   }
 

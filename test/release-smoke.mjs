@@ -240,7 +240,7 @@ async function main() {
   const tools = new Map();
   const pi = {
     registerCommand: (name, definition) => commands.set(name, definition),
-    registerTool: (name, definition) => tools.set(name, definition),
+    registerTool: (definition) => tools.set(definition.name, definition),
     on: (name, handler) => handlers.set(name, handler),
     setActiveTools: (tools) => { holder.activeTools = [...tools]; },
     getActiveTools: () => [...holder.activeTools],
@@ -284,14 +284,22 @@ async function main() {
   report("notebook-init writes the create-once manifest", initOk, initOk ? manifestPath : initResult.error ?? initResult.ok);
 
   let appendOk = false;
+  let appendError = "";
   if (initOk) {
     const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-    const appendResult = await tools.get("pi-paseo-orchestration:supervisor_notebook_append").execute(
-      { project_id: "smoke-project", entry: smokeEntry(extension, manifest, "smoke-project", project) }, ctx,
-    );
+    try {
+      const appendResult = await tools.get("pi-paseo-orchestration:supervisor_notebook_append").execute(
+        "smoke-append", { project_id: "smoke-project", entry: smokeEntry(extension, manifest, "smoke-project", project) },
+        undefined, undefined, ctx,
+      );
+      appendOk = Array.isArray(appendResult?.content) && String(appendResult.content[0]?.text ?? "").includes("Notebook entry");
+      appendError = appendOk ? "" : "execute resolved without a Notebook entry message";
+    } catch (err) {
+      appendError = err instanceof Error ? err.message : String(err);
+    }
     const entryPath = join(join(manifestPath, ".."), "entries", "entry-1.json");
-    appendOk = appendResult.ok === true && await fileExists(entryPath);
-    report("notebook-append writes one immutable entry", appendOk, appendOk ? entryPath : appendResult.error ?? appendResult.ok);
+    appendOk = appendOk && await fileExists(entryPath);
+    report("notebook-append writes one immutable entry", appendOk, appendOk ? entryPath : appendError);
   } else {
     report("notebook-append writes one immutable entry", false, "manifest unavailable");
   }

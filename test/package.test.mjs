@@ -65,7 +65,17 @@ const fakePi = (ctxOverrides = {}) => {
     holder,
     pi: {
       registerCommand: (name, definition) => commands.set(name, definition),
-      registerTool: (name, definition) => tools.set(name, definition),
+      // Current Pi API: registerTool accepts ONE definition object with name,
+      // label, description, parameters, execute. The old two-argument form is
+      // gone — passing a name string yields a tool whose .name is undefined,
+      // which breaks the provider payload ("missing field `name`"). The stub
+      // mirrors the real runtime: a string first argument is a fake failure.
+      registerTool: (definition) => {
+        if (typeof definition !== "object" || definition === null || typeof definition.name !== "string") {
+          throw new Error("registerTool must receive a definition object with a string name");
+        }
+        tools.set(definition.name, definition);
+      },
       on: (name, handler) => handlers.set(name, handler),
       setActiveTools: (tools) => { holder.activeTools = [...tools]; },
       getActiveTools: () => [...holder.activeTools],
@@ -3312,8 +3322,10 @@ test("mutation boundary: settings command, notebook init+append, and doctor touc
     assert.equal(initResult.ok, true, initResult.error);
     const manifest = JSON.parse(await readFile(initResult.paths.manifestPath, "utf8"));
     const entry = notebookEntryFixture(manifest, "ppo-fixture", repo.dir);
-    const appendResult = await fake.tools.get("pi-paseo-orchestration:supervisor_notebook_append").execute({ project_id: "ppo-fixture", entry }, fake.ctx);
-    assert.equal(appendResult.ok, true, appendResult.error);
+    const appendResult = await fake.tools.get("pi-paseo-orchestration:supervisor_notebook_append").execute(
+      "call-ppo-fixture", { project_id: "ppo-fixture", entry }, undefined, undefined, fake.ctx,
+    );
+    assert.equal(appendResult.content?.[0]?.text.includes("Notebook entry"), true, appendResult.content?.[0]?.text);
     const doctorResult = await fake.commands.get("pi-paseo-orchestration:doctor").handler("", { ...fake.ctx, rpc: true });
     assert.equal(doctorResult.ok, true, doctorResult.error);
 
