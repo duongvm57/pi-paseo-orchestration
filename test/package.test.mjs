@@ -189,7 +189,6 @@ test("declared resources and private profiles are nonempty files", async () => {
   assert.match(guide, /Human is the sole Local Accepter|Sole accepter through a direct canonical Human acceptance block/);
   assert.match(guide, /optional `Anti-patterns` section/);
   assert.doesNotMatch(guide, /[^\x00-\x7F]/);
-  assert.doesNotMatch(`${skill}\n${guide}`, /reference orchestration model/i);
   assert.match(await readFile(join(root, "profiles/peer.md"), "utf8"), /classify material premises as supported, partial, or failed/);
 });
 

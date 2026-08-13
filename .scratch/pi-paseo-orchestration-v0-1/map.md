@@ -4,11 +4,11 @@ Label: wayfinder:map
 
 ## Destination
 
-Produce `specs/pi-paseo-orchestration-v0.1.md`: an implementation-ready specification for an independent, git-installable Pi package whose orchestration model conforms to the reference orchestration model deep dive and ends at a locally accepted Git candidate.
+Produce `specs/pi-paseo-orchestration-v0.1.md`: an implementation-ready specification for an independent, git-installable Pi package whose orchestration model conforms to the reference orchestration deep dive and ends at a locally accepted Git candidate.
 
 ## Notes
 
-- Normative source of truth: [`ref-docs/reference orchestration model-agent-orchestration-deep-dive.md`](../../ref-docs/reference orchestration model-agent-orchestration-deep-dive.md).
+- Normative source of truth: [`ref-docs/agent-orchestration-deep-dive.md`](../../ref-docs/agent-orchestration-deep-dive.md).
 - Provisional input only: [`ref-docs/pi-paseo-orchestration-plan.md`](../../ref-docs/pi-paseo-orchestration-plan.md).
 - `Minnyat/paseo-pi-team` is not a dependency or compatibility target; its pinned source is implementation evidence only where a ticket explicitly asks for it.
 - Use current first-party Pi, Paseo, and `pi-mcp-adapter` contracts for runtime facts.

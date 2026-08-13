@@ -1,6 +1,6 @@
 # Pi Paseo Orchestration
 
-A native Pi package that applies reference orchestration model-inspired role governance while leaving lifecycle and workspace truth with Paseo.
+A native Pi package that applies reference role governance while leaving lifecycle and workspace truth with Paseo.
 
 ## Language
 

@@ -6,7 +6,7 @@ Blocked by: 05
 
 ## Question
 
-What exact durable location, ownership key, causal entry contract, lifecycle/retention rule, and path-guarded write surface lets a Supervisor preserve reference orchestration model notebook evidence across assigned projects without conflating it with a repository Workspace Protocol or gaining general project-write authority?
+What exact durable location, ownership key, causal entry contract, lifecycle/retention rule, and path-guarded write surface lets a Supervisor preserve reference orchestration notebook evidence across assigned projects without conflating it with a repository Workspace Protocol or gaining general project-write authority?
 
 ## Answer
 

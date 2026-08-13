@@ -4,7 +4,7 @@ Label: ready-for-agent
 
 ## Problem Statement
 
-Pi and Paseo provide agent execution, tools, sessions, workspaces, identity, parentage, and lifecycle control, but they do not provide the reference orchestration model-style separation between durable role conduct, repository workflow rules, current-run capability grants, evidence-bearing handoffs, independent candidate review, and direct Human acceptance.
+Pi and Paseo provide agent execution, tools, sessions, workspaces, identity, parentage, and lifecycle control, but they do not provide the reference role-governance separation between durable role conduct, repository workflow rules, current-run capability grants, evidence-bearing handoffs, independent candidate review, and direct Human acceptance.
 
 Without a small package enforcing those distinctions, orchestration can drift into unsafe or ambiguous behavior: role identity can be inferred from prose, tools disabled by the Human can be re-enabled, grants can leak between runs, multiple writers can collide, lifecycle status can be mistaken for acceptance, Peer reports can disrupt an active Lead, and Git work can be reviewed or accepted without one immutable candidate identity. Supervisor observations can also be lost across sessions or accidentally become a second task/control plane.
 
@@ -90,7 +90,7 @@ Supervisor observations persist in a Human-owned, append-only, project-scoped No
 
 - v0.1 is one independent Pi package. It runs only inside Pi and adds no executable, daemon, sidecar, scheduler, queue, mailbox, task ledger, candidate registry, acceptance service, second MCP client, second orchestration runtime, or second control plane.
 - Paseo remains the sole source of lifecycle, workspace, parentage, follow-up, and timeline truth.
-- The normative behavioral source is the reference orchestration model orchestration deep dive. The provisional implementation plan is non-normative. `Minnyat/paseo-pi-team` is neither a dependency nor a compatibility target.
+- The normative behavioral source is the reference orchestration deep dive. The provisional implementation plan is non-normative. `Minnyat/paseo-pi-team` is neither a dependency nor a compatibility target.
 - Publication is absent rather than sandboxed. Push, merge, amend, force-push, pull-request creation, deploy, and package-owned workspace cleanup are not implemented.
 - The package uses the domain separation between Role Profile, Workspace Protocol, Task Authority Envelope, Peer Report, Supervisor Notebook, Stable Candidate, Policy Guardrail, Authority Grant, Capability, and Local Acceptance Boundary. None of these substitutes for another.
 
@@ -287,7 +287,7 @@ Supervisor observations persist in a Human-owned, append-only, project-scoped No
 
 ## Further Notes
 
-- The reference orchestration model deep dive remains normative when prose in the provisional plan differs. The resolved map decisions represented here define the v0.1 implementation contract.
+- The reference orchestration deep dive remains normative when prose in the provisional plan differs. The resolved map decisions represented here define the v0.1 implementation contract.
 - Reference runtime versions observed during planning were Pi `0.84.1`, Paseo `0.3.1`, and `pi-mcp-adapter` `2.22.0`; implementation and doctor use proven capabilities and attested semantics rather than optimistic version gates.
 - Git object identity, stable porcelain status, committed-tree comparison, and possible garbage collection of unreachable objects justify repeated full-ID, cleanliness, diff, and retrievability checks. They do not create authority or acceptance.
 - Human routes, environment values, process snapshots, file digests, and Paseo facts are consistency evidence, not cryptographic identity.

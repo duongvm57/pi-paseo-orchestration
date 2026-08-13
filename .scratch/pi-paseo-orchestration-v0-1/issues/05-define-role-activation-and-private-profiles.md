@@ -10,7 +10,7 @@ What is the exact package-owned role environment contract, prompt-loading lifecy
 
 ## Answer
 
-The package activates one durable Role Profile from one closed environment contract, binds it to the Paseo-owned process, and narrows the current Pi session's existing tools without claiming a sandbox. The reference orchestration model deep dive is normative; Minnyat remains implementation evidence only.
+The package activates one durable Role Profile from one closed environment contract, binds it to the Paseo-owned process, and narrows the current Pi session's existing tools without claiming a sandbox. The reference orchestration deep dive is normative; Minnyat remains implementation evidence only.
 
 ### Activation contract
 
@@ -118,4 +118,4 @@ Loaded adapter provenance does not prove Paseo MCP connectivity/authentication; 
 
 This is still a cooperative Policy Guardrail. The extension cannot prove Human authorship cryptographically, decide whether work is truly tiny, semantically validate custom profiles or Workspace Protocol prose, isolate Bash/filesystem/network/process/Git behavior, guarantee that later extensions do not alter the final prompt/tool arguments, or make `send_agent_prompt` acknowledged/non-disruptive. OS/container/worktree permissions remain the real isolation boundary.
 
-This answer corrects ticket 04's overly strict sentence that Lead never writes: reference orchestration model permits tightly coupled tiny Lead self-work when protocol and Human authority permit it. Ticket 04's intersection, per-run reset, and non-sandbox conclusions remain unchanged. Ticket 06 must be widened from Peer-only authority to all three role-specific current-run grants. A separate ticket must define the Supervisor notebook contract; no tmux/Herdr follow-up is recorded.
+This answer corrects ticket 04's overly strict sentence that Lead never writes: the reference model permits tightly coupled tiny Lead self-work when protocol and Human authority permit it. Ticket 04's intersection, per-run reset, and non-sandbox conclusions remain unchanged. Ticket 06 must be widened from Peer-only authority to all three role-specific current-run grants. A separate ticket must define the Supervisor notebook contract; no tmux/Herdr follow-up is recorded.
