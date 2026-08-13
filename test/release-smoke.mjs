@@ -11,7 +11,7 @@
 //   - relocation: the same resources resolve identically from the fresh copy
 //   - fail-closed provenance: a module loaded without file provenance does not
 //     fall back to cwd/repo-root/config-root/parent search
-//   - the settings command writes one closed three-role document at a fresh
+//   - the settings command writes one closed model-routing document at a fresh
 //     PI_CODING_AGENT_DIR and a fresh supervisor process applies its exact
 //     model and thinking selection
 //   - notebook init + append through the real registered handlers write only
@@ -49,13 +49,20 @@ const report = (name, ok, detail) => {
   console.log(`${ok ? "PASS" : "FAIL"} ${name}${detail ? ` — ${detail}` : ""}`);
 };
 
-// Fixed closed three-role document the select queue produces.
+// Fixed closed model-routing document the select queue produces.
+const peerRoute = (description) => ({ description, provider: "openai", model: "gpt-5", thinking: "off" });
 const EXPECTED_SETTINGS = {
-  version: 1,
+  version: 2,
   roles: {
     supervisor: { provider: "anthropic", model: "claude-sonnet-4-5", thinking: "high" },
     lead: { provider: "anthropic", model: "claude-sonnet-4-5", thinking: "medium" },
-    peer: { provider: "openai", model: "gpt-5", thinking: "off" },
+  },
+  peer_routes: {
+    fast: peerRoute("Low-cost, low-latency bounded triage and simple read-only work."),
+    general: peerRoute("Balanced default for mixed repository work."),
+    reasoning: peerRoute("Deep analysis for ambiguous or high-complexity problems."),
+    coding: peerRoute("Implementation, debugging, and verification."),
+    architecture: peerRoute("Architecture, migration, lifecycle, and hard-to-reverse decisions."),
   },
 };
 const MODEL_REGISTRY = [
@@ -219,7 +226,7 @@ async function main() {
   // ── fake pi (same seam as the hermetic suite: registerCommand/on capture) ──
   const notifications = [];
   const holder = { activeTools: ["read", "bash", "mcp"], modelCalls: [] };
-  const selectQueue = ["anthropic", "claude-sonnet-4-5", "high", "anthropic", "claude-sonnet-4-5", "medium", "openai", "gpt-5", "off"];
+  const selectQueue = ["Role models", "anthropic", "claude-sonnet-4-5", "high", "anthropic", "claude-sonnet-4-5", "medium", ...Array.from({ length: 5 }, () => ["openai", "gpt-5", "off"]).flat(), "Finish"];
   const ui = {
     select: async () => selectQueue.shift() ?? null,
     confirm: async () => true,
@@ -253,6 +260,8 @@ async function main() {
     ui,
     env,
     cwd: project,
+    model: MODEL_REGISTRY[0],
+    thinkingLevel: "high",
     modelRegistry: {
       getAvailable: () => MODEL_REGISTRY,
       find: (provider, id) => MODEL_REGISTRY.find((m) => m.provider === provider && m.id === id),
@@ -267,7 +276,7 @@ async function main() {
     const written = JSON.parse(await readFile(join(config, "pi-paseo-orchestration", "settings.json"), "utf8"));
     settingsOk = extension.validateSettings(written).ok && JSON.stringify(written) === JSON.stringify(EXPECTED_SETTINGS);
   } catch { settingsOk = false; }
-  report("settings command writes one closed three-role document at the fresh config root", settingsOk,
+  report("settings command writes one closed model-routing document at the fresh config root", settingsOk,
     settingsOk ? "exact document at pi-paseo-orchestration/settings.json" : "document missing or not closed");
 
   await handlers.get("session_start")({ reason: "startup" }, ctx);

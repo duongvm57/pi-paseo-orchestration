@@ -21,3 +21,9 @@ Lead uses only the snapshotted `peer` selection for every new Peer. Supervisor u
 There are no task-specific model classes, automatic effort routing, per-project overrides, remote-host routes, resolver service, compatibility matrix, or model fallback in v0.1. This narrows ticket 07: model/effort hints are not operative Workspace Protocol content in v0.1. Add routing only after one fixed selection per role is shown to be inadequate.
 
 No glossary or ADR update is required. These are Human-owned runtime preferences and application rules, not a new domain concept or separate control plane.
+
+## Comments
+
+### 2026-08-13 — superseded model-routing decision
+
+Human evidence showed one fixed Peer selection inadequate. Settings v2 keeps fixed Supervisor/Lead selections and replaces the fixed Peer entry with Human-configured named routes: required `fast`, `general`, `reasoning`, `coding`, and `architecture`, plus optional custom routes. Lead selects one allowed route per assignment; disposition remains independently authored open vocabulary and grants no authority. Peer activation rejects model/thinking outside the allowlist rather than silently overriding it. The prior v1 decision above remains historical context and is superseded by the v2 spec.

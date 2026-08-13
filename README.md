@@ -69,11 +69,11 @@ Production installation uses Pi Git package support with a reviewed full commit 
 pi install git:<repository-url>@<full-commit-object-id>
 ```
 
-Update or rollback by reviewing and installing the exact full commit in a fresh Pi/Paseo process, then verifying package provenance and doctor output. Provider aliases are user-renamable; examples are:
+Update or rollback by reviewing and installing the exact full commit in a fresh Pi/Paseo process, then verifying package provenance and doctor output. Provider aliases are user-renamable; the installer and bootstrap defaults are:
 
-- `pi-paseo-orchestration-supervisor`
-- `pi-paseo-orchestration-lead`
-- `pi-paseo-orchestration-peer`
+- `ppo-supervisor`
+- `ppo-lead`
+- `ppo-peer`
 
 `pi-mcp-adapter` is installed independently. Configure the aliases in Paseo's
 `~/.paseo/config.json` (names are examples and may be changed consistently):
@@ -109,7 +109,7 @@ Update or rollback by reviewing and installing the exact full commit in a fresh 
 }
 ```
 
-Restart Paseo after changing aliases. Optional `PI_PASEO_ORCHESTRATION_SUPERVISOR_ALIAS` and `PI_PASEO_ORCHESTRATION_LEAD_ALIAS` override the bootstrap defaults `ppo-supervisor` and `ppo-lead`.
+Run `/ppo:settings`, choose **Paseo profiles**, and confirm to install or update these three entries without touching other providers. Restart Paseo afterward. Optional `PI_PASEO_ORCHESTRATION_SUPERVISOR_ALIAS` and `PI_PASEO_ORCHESTRATION_LEAD_ALIAS` override the bootstrap defaults `ppo-supervisor` and `ppo-lead`.
 
 From an ungoverned Pi session in the repository, start normal work with:
 
@@ -119,9 +119,12 @@ From an ungoverned Pi session in the repository, start normal work with:
 
 The command validates settings and the Workspace Protocol, then invokes the packaged orchestration skill. It creates sibling Supervisor and Lead roots in the same Paseo workspace; the Lead creates bounded Peer children. Launch individual governed roots manually only for diagnostics or recovery. A Lead
 may create a Peer only with the alias from
-`PI_PASEO_ORCHESTRATION_PEER_ALIAS`, its snapshotted Peer model/thinking,
-the inherited workspace, exact current Lead ID in `parent_lead_agent_id`, and
-native finish notification. Supervisor `paseo_create_agent` additionally requires the current Human recovery grant's exact
+`PI_PASEO_ORCHESTRATION_PEER_ALIAS`, one Human-configured Peer model route,
+the inherited workspace, exact route ID in `model_route`, exact current Lead ID
+in `parent_lead_agent_id`, and native finish notification. `/ppo:settings` provides
+five required routes—`fast`, `general`, `reasoning`, `coding`, and `architecture`—and
+allows Human-defined custom routes. A Lead selects a route per assignment;
+disposition remains open task vocabulary and does not select or grant authority. Supervisor `paseo_create_agent` additionally requires the current Human recovery grant's exact
 Lead alias, workspace, objective, and handoff label. The child must still pass
 Human-observed doctor evidence before handoff: an alias is convenience, not
 role proof.

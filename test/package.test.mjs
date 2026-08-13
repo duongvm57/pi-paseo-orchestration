@@ -99,14 +99,28 @@ const fakePi = (ctxOverrides = {}) => {
   };
 };
 
+const peerRoute = (description, over = {}) => ({ description, provider: "openai", model: "gpt-5", thinking: "off", ...over });
 const validDoc = {
-  version: 1,
+  version: 2,
   roles: {
     supervisor: { provider: "anthropic", model: "claude-sonnet-4-5", thinking: "high" },
     lead: { provider: "anthropic", model: "claude-sonnet-4-5", thinking: "medium" },
-    peer: { provider: "openai", model: "gpt-5", thinking: "off" },
+  },
+  peer_routes: {
+    fast: peerRoute("Low-cost, low-latency bounded triage and simple read-only work."),
+    general: peerRoute("Balanced default for mixed repository work."),
+    reasoning: peerRoute("Deep analysis for ambiguous or high-complexity problems."),
+    coding: peerRoute("Implementation, debugging, and verification."),
+    architecture: peerRoute("Architecture, migration, lifecycle, and hard-to-reverse decisions."),
   },
 };
+const modelSettingsQueue = () => [
+  "Role models",
+  "anthropic", "claude-sonnet-4-5", "high",
+  "anthropic", "claude-sonnet-4-5", "medium",
+  ...Array.from({ length: 5 }, () => ["openai", "gpt-5", "off"]).flat(),
+  "Finish",
+];
 
 test("manifest declares one Pi extension and the two packaged skills", () => {
   assert.deepEqual(manifest.pi, {
@@ -145,6 +159,15 @@ test("declared resources and private profiles are nonempty files", async () => {
   assert.match(orchestrationSkill, /^---\nname: ppo-orchestrate\ndescription: .+\ncompatibility: .+\n---/);
   assert.match(orchestrationSkill, /paseo_create_agent/);
   assert.match(orchestrationSkill, /paseo_send_agent_prompt/);
+  assert.match(orchestrationSkill, /"server":"paseo","tool":"paseo_<operation>","args":\{\.\.\.\}/);
+  assert.match(orchestrationSkill, /outer tool is a transport, not a discovery or status operation/);
+  assert.match(orchestrationSkill, /complete the Peer brief/);
+  assert.match(orchestrationSkill, /Copy the exact applicable terminal template/);
+  assert.match(orchestrationSkill, /After two follow-ups addressing the same symptom or an unchanged prerequisite/);
+  assert.match(orchestrationSkill, /pi-paseo-orchestration\.task-key/);
+  assert.match(orchestrationSkill, /one writer per moving scope/);
+  assert.match(orchestrationSkill, /direct-mode Supervisor is optional/);
+  assert.match(await readFile(join(root, "profiles/supervisor.md"), "utf8"), /binds one exact Lead agent ID and Human task/);
   assert.doesNotMatch(orchestrationSkill, /full-topology-test|scripts\/run\.mjs/);
   assert.match(guide, /^# Workspace Protocol Authoring Guide\n/);
   assert.deepEqual(guide.match(/^## \d+\..+$/gm), [
@@ -167,6 +190,7 @@ test("declared resources and private profiles are nonempty files", async () => {
   assert.match(guide, /optional `Anti-patterns` section/);
   assert.doesNotMatch(guide, /[^\x00-\x7F]/);
   assert.doesNotMatch(`${skill}\n${guide}`, /reference orchestration model/i);
+  assert.match(await readFile(join(root, "profiles/peer.md"), "utf8"), /classify material premises as supported, partial, or failed/);
 });
 
 test("bootstrap validates a real repository task and dispatches the orchestration skill contract", async () => {
@@ -183,6 +207,7 @@ test("bootstrap validates a real repository task and dispatches the orchestratio
     assert.match(fake.holder.sentUserMessage, /PPO_BOOTSTRAP_V1/);
     assert.match(fake.holder.sentUserMessage, /inspect the architecture/);
     assert.match(fake.holder.sentUserMessage, /"lead_alias":"ppo-lead"/);
+    assert.match(fake.holder.sentUserMessage, /"task_key":"[0-9a-f]{64}"/);
     assert.match(fake.holder.sentUserMessage, /"supervisor_alias":"ppo-supervisor"/);
   } finally {
     await rm(repo.dir, { recursive: true, force: true });
@@ -205,16 +230,18 @@ test("settings document is closed: valid doc passes, every drift fails", () => {
 
   const invalid = [
     ["missing version", { ...validDoc, version: undefined }],
-    ["wrong version", { ...validDoc, version: 2 }],
-    ["missing role", { version: 1, roles: { lead: validDoc.roles.lead, peer: validDoc.roles.peer } }],
-    ["extra role", { version: 1, roles: { ...validDoc.roles, intern: validDoc.roles.peer } }],
-    ["missing role key", { version: 1, roles: { ...validDoc.roles, lead: { provider: "x", model: "y" } } }],
-    ["extra role key", { version: 1, roles: { ...validDoc.roles, lead: { ...validDoc.roles.lead, effort: "high" } } }],
-    ["empty provider", { version: 1, roles: { ...validDoc.roles, lead: { ...validDoc.roles.lead, provider: "" } } }],
-    ["non-string model", { version: 1, roles: { ...validDoc.roles, lead: { ...validDoc.roles.lead, model: 5 } } }],
-    ["unknown thinking", { version: 1, roles: { ...validDoc.roles, lead: { ...validDoc.roles.lead, thinking: "turbo" } } }],
-    ["empty thinking", { version: 1, roles: { ...validDoc.roles, lead: { ...validDoc.roles.lead, thinking: "" } } }],
-    ["roles not object", { version: 1, roles: [] }],
+    ["wrong version", { ...validDoc, version: 1 }],
+    ["missing role", { ...validDoc, roles: { lead: validDoc.roles.lead } }],
+    ["extra role", { ...validDoc, roles: { ...validDoc.roles, peer: validDoc.peer_routes.general } }],
+    ["missing role key", { ...validDoc, roles: { ...validDoc.roles, lead: { provider: "x", model: "y" } } }],
+    ["extra role key", { ...validDoc, roles: { ...validDoc.roles, lead: { ...validDoc.roles.lead, effort: "high" } } }],
+    ["empty provider", { ...validDoc, roles: { ...validDoc.roles, lead: { ...validDoc.roles.lead, provider: "" } } }],
+    ["non-string model", { ...validDoc, roles: { ...validDoc.roles, lead: { ...validDoc.roles.lead, model: 5 } } }],
+    ["unknown thinking", { ...validDoc, roles: { ...validDoc.roles, lead: { ...validDoc.roles.lead, thinking: "turbo" } } }],
+    ["roles not object", { ...validDoc, roles: [] }],
+    ["missing default route", { ...validDoc, peer_routes: { ...validDoc.peer_routes, fast: undefined } }],
+    ["invalid custom route", { ...validDoc, peer_routes: { ...validDoc.peer_routes, "Bad Route": validDoc.peer_routes.fast } }],
+    ["route extra key", { ...validDoc, peer_routes: { ...validDoc.peer_routes, fast: { ...validDoc.peer_routes.fast, effort: "high" } } }],
   ];
 
   for (const [label, doc] of invalid) {
@@ -222,13 +249,21 @@ test("settings document is closed: valid doc passes, every drift fails", () => {
   }
 });
 
-test("readSettings: missing file is null, malformed or invalid state throws", async () => {
+test("readSettings: missing file is null, v1 migrates in memory, malformed or invalid state throws", async () => {
   const dir = await mkdtemp(join(tmpdir(), "ppo-read-"));
   try {
     assert.equal(await readSettings(dir), null);
 
+    const v1Dir = join(dir, "pi-paseo-orchestration");
+    await mkdir(v1Dir, { recursive: true });
+    const v1 = { version: 1, roles: { ...validDoc.roles, peer: { provider: "openai", model: "gpt-5", thinking: "off" } } };
+    await writeFile(join(v1Dir, "settings.json"), JSON.stringify(v1), "utf8");
+    const migrated = await readSettings(dir);
+    assert.equal(migrated.version, 2);
+    assert.deepEqual(migrated.peer_routes.fast, validDoc.peer_routes.fast);
+    assert.deepEqual(JSON.parse(await readFile(join(v1Dir, "settings.json"), "utf8")), v1, "migration must not mutate prior bytes");
+
     const bad = join(dir, "pi-paseo-orchestration");
-    await mkdir(bad, { recursive: true });
     await writeFile(join(bad, "settings.json"), "{nope", "utf8");
     await assert.rejects(() => readSettings(dir), /not valid JSON/);
 
@@ -249,7 +284,7 @@ test("writeSettings: writes exactly the closed document, atomically, at the conf
     assert.equal((await stat(path)).mode & 0o777, 0o600);
 
     // Overwrite replaces bytes without residue.
-    const next = { ...validDoc, roles: { ...validDoc.roles, peer: { ...validDoc.roles.peer, thinking: "low" } } };
+    const next = { ...validDoc, peer_routes: { ...validDoc.peer_routes, fast: { ...validDoc.peer_routes.fast, thinking: "low" } } };
     await writeSettings(dir, next);
     assert.deepEqual(JSON.parse(await readFile(path, "utf8")), next);
     assert.deepEqual(await readdir(join(dir, "pi-paseo-orchestration")), ["settings.json"]);
@@ -337,7 +372,7 @@ test("settings command: cancel anywhere preserves prior bytes and writes nothing
 test("settings command: declined confirmation writes nothing", async () => {
   const dir = await mkdtemp(join(tmpdir(), "ppo-cmd-decline-"));
   try {
-    const queue = ["anthropic", "claude-sonnet-4-5", "high", "anthropic", "claude-sonnet-4-5", "medium", "openai", "gpt-5", "off"];
+    const queue = modelSettingsQueue();
     const fake = fakePi({
       ui: { select: async () => queue.shift() ?? null, confirm: async () => false },
     });
@@ -350,10 +385,26 @@ test("settings command: declined confirmation writes nothing", async () => {
   }
 });
 
+test("settings command: Esc at custom-route menu preserves prior settings", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ppo-cmd-custom-cancel-"));
+  try {
+    await writeSettings(dir, validDoc);
+    const before = await readFile(settingsPath(dir), "utf8");
+    const queue = modelSettingsQueue();
+    queue[queue.length - 1] = null;
+    const fake = fakePi({ ui: { select: async () => queue.shift(), confirm: async () => true } });
+    await runSettingsWith(fake, { ...process.env, PI_CODING_AGENT_DIR: dir });
+    assert.equal(await readFile(settingsPath(dir), "utf8"), before);
+    assert.equal(fake.notifications.some(([message]) => /Cancelled/.test(message)), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("settings command: confirmed selection writes exactly one closed document", async () => {
   const dir = await mkdtemp(join(tmpdir(), "ppo-cmd-write-"));
   try {
-    const queue = ["anthropic", "claude-sonnet-4-5", "high", "anthropic", "claude-sonnet-4-5", "medium", "openai", "gpt-5", "off"];
+    const queue = modelSettingsQueue();
     const fake = fakePi({
       ui: { select: async () => queue.shift() ?? null, confirm: async () => true },
     });
@@ -378,13 +429,31 @@ test("settings command: malformed prior settings block with an explicit error, b
     await mkdir(priorDir, { recursive: true });
     await writeFile(join(priorDir, "settings.json"), "{broken", "utf8");
 
-    const fake = fakePi();
+    const fake = fakePi({ ui: { select: async () => "Role models" } });
     await runSettingsWith(fake, { ...process.env, PI_CODING_AGENT_DIR: dir });
 
     assert.equal(await readFile(join(priorDir, "settings.json"), "utf8"), "{broken");
     assert.equal(fake.notifications.some(([, level]) => level === "error"), true);
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("settings command: installs only three PPO Paseo profiles and preserves other config", async () => {
+  const home = await mkdtemp(join(tmpdir(), "ppo-paseo-home-"));
+  try {
+    const path = join(home, "config.json");
+    await writeFile(path, JSON.stringify({ version: 1, daemon: { port: 9 }, agents: { providers: { custom: { enabled: true }, "ppo-peer": { stale: true } } } }), "utf8");
+    const queue = ["Paseo profiles"];
+    const fake = fakePi({ ui: { select: async () => queue.shift() ?? null, confirm: async () => true } });
+    await runSettingsWith(fake, { ...process.env, PASEO_HOME: home });
+    const config = JSON.parse(await readFile(path, "utf8"));
+    assert.deepEqual(config.daemon, { port: 9 });
+    assert.deepEqual(config.agents.providers.custom, { enabled: true });
+    assert.equal(config.agents.providers["ppo-peer"].env.PI_PASEO_ORCHESTRATION_ROLE, "peer");
+    assert.match(fake.notifications.at(-1)[0], /Restart Paseo/);
+  } finally {
+    await rm(home, { recursive: true, force: true });
   }
 });
 
@@ -467,8 +536,15 @@ test("activate: governed role requires agent id, settings snapshot, profile, and
     assert.equal(noSettings.ok, false);
 
     await writeSettings(dir, validDoc);
-    const unknownModel = await ext.activate({ env: { ...baseEnv, PI_PASEO_ORCHESTRATION_ROLE: "peer" }, dir, profileDir: profiles, models: [{ provider: "nope", id: "nope" }], setModel: async () => true, setThinkingLevel: (l) => {}, getThinkingLevel: () => "off" });
-    assert.equal(unknownModel.ok, false);
+    const peerEnv = { ...baseEnv, PI_PASEO_ORCHESTRATION_ROLE: "peer" };
+    const approvedPeer = await ext.activate({ env: peerEnv, dir, profileDir: profiles, models: baseModels(), currentModel: baseModels()[1], currentThinking: "off", setModel: async () => true, setThinkingLevel: () => {}, getThinkingLevel: () => "off" });
+    assert.equal(approvedPeer.ok, true);
+    assert.equal(approvedPeer.latch.selectedPeerRoute, "fast");
+    const unapprovedPeer = await ext.activate({ env: peerEnv, dir, profileDir: profiles, models: baseModels(), currentModel: baseModels()[0], currentThinking: "high", setModel: async () => true, setThinkingLevel: () => {}, getThinkingLevel: () => "high" });
+    assert.equal(unapprovedPeer.ok, false);
+    assert.match(unapprovedPeer.error, /allowed Human-configured route/);
+    const wrongPeerThinking = await ext.activate({ env: peerEnv, dir, profileDir: profiles, models: baseModels(), currentModel: baseModels()[1], currentThinking: "high", setModel: async () => true, setThinkingLevel: () => {}, getThinkingLevel: () => "high" });
+    assert.equal(wrongPeerThinking.ok, false);
 
     // setThinkingLevel returns void in the real Pi API; the effective level
     // must be read back. A clamped level (read-back mismatch) blocks.
@@ -564,6 +640,10 @@ test("checkToolCall: closed per-role gates, outer MCP validation, git publicatio
   for (const cmd of ["git commit -m x", "git push origin main", "git push --force origin main", "git merge feature", "git commit --amend", "gh pr create", "git pull --rebase && git push"]) {
     assert.equal(extension.checkToolCall("bash", { command: cmd }, peerPolicy).block, true, `must block: ${cmd}`);
   }
+  const listPolicy = { role: "lead", allowed: ["mcp"], mcpTargets: { paseo: new Set(["paseo_list_agents"]) } };
+  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_list_agents", args: { statuses: ["idle", "running"], limit: 100 } }, listPolicy), undefined);
+  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_list_agents", args: { workspaceId: "guessed" } }, listPolicy).block, true);
+
   for (const cmd of ["git status", "git log --oneline", "git diff", "git branch -a", "git fetch origin", "ls -la", "npm test", "git checkout -b feature", "git stash list"]) {
     assert.equal(extension.checkToolCall("bash", { command: cmd }, peerPolicy), undefined, `must pass: ${cmd}`);
   }
@@ -575,14 +655,15 @@ test("checkToolCall: create_agent is role-bound to exact alias, model, thinking,
   const base = {
     allowed: ["read", "bash", "mcp"],
     mcpTargets: { paseo: new Set(["paseo_create_agent"]) },
-    roleSettings: { lead: leadSelection, peer: peerSelection },
+    roleSettings: { lead: leadSelection },
+    peerRoutes: { coding: { description: "Implementation", ...peerSelection } },
     currentAgentId: "lead-7",
   };
   const leadArgs = {
     title: "Read-only topology peer",
     provider: "ppo-peer/opencode-go/deepseek-v4-flash",
     settings: { thinkingOptionId: "max" },
-    initialPrompt: 'Run /ppo:doctor, inspect the bounded question, and return a terminal Peer Report with "parent_lead_agent_id": "lead-7".',
+    initialPrompt: 'Inspect the bounded question with "model_route":"coding" and return a terminal Peer Report with "parent_lead_agent_id": "lead-7".',
     notifyOnFinish: true,
   };
   const leadPolicy = { ...base, role: "lead", peerProviderAlias: "ppo-peer" };
@@ -596,8 +677,9 @@ test("checkToolCall: create_agent is role-bound to exact alias, model, thinking,
     ["wrong model", { ...leadArgs, provider: "ppo-peer/opencode-go/deepseek-v4-pro" }],
     ["wrong thinking", { ...leadArgs, settings: { thinkingOptionId: "high" } }],
     ["custom workspace", { ...leadArgs, workspaceId: "other-workspace" }],
-    ["wrong parent binding", { ...leadArgs, initialPrompt: 'Return a Peer Report with "parent_lead_agent_id":"lead-8".' }],
-    ["conflicting parent bindings", { ...leadArgs, initialPrompt: 'Use "parent_lead_agent_id":"lead-7" but report "parent_lead_agent_id":"lead-8".' }],
+    ["wrong parent binding", { ...leadArgs, initialPrompt: 'Use "model_route":"coding" and return a Peer Report with "parent_lead_agent_id":"lead-8".' }],
+    ["conflicting parent bindings", { ...leadArgs, initialPrompt: 'Use "model_route":"coding", "parent_lead_agent_id":"lead-7", but report "parent_lead_agent_id":"lead-8".' }],
+    ["unknown model route", { ...leadArgs, initialPrompt: 'Use "model_route":"unknown" with "parent_lead_agent_id":"lead-7".' }],
     ["no notification", { ...leadArgs, notifyOnFinish: false }],
     ["extra field", { ...leadArgs, background: true }],
   ]) {
@@ -699,6 +781,10 @@ test("wiring: passive env stays ungoverned; governed blocks input, injects profi
     assert.equal(passed, undefined);
     const mcpBlocked = await fake.handlers.get("tool_call")({ toolName: "mcp", input: { server: "paseo", tool: "x" } }, fake.ctx);
     assert.equal(mcpBlocked.block, true);
+    for (const tool of ["paseo_list_workspaces", "paseo_list_providers"]) {
+      assert.equal(await fake.handlers.get("tool_call")({ toolName: "mcp", input: { server: "paseo", tool, args: {} } }, fake.ctx), undefined);
+      assert.equal((await fake.handlers.get("tool_call")({ toolName: "mcp", input: { server: "paseo", tool, args: { unexpected: true } } }, fake.ctx)).block, true);
+    }
     const createPassed = await fake.handlers.get("tool_call")({
       toolName: "mcp",
       input: {
@@ -708,7 +794,7 @@ test("wiring: passive env stays ungoverned; governed blocks input, injects profi
           title: "Bounded peer",
           provider: "ppo-peer/openai/gpt-5",
           settings: { thinkingOptionId: "off" },
-          initialPrompt: 'Run /ppo:doctor and return the bounded read-only Peer Report with "parent_lead_agent_id":"agent-7".',
+          initialPrompt: 'Use "model_route":"fast" and return the bounded read-only Peer Report with "parent_lead_agent_id":"agent-7".',
           notifyOnFinish: true,
         },
       },
@@ -3672,9 +3758,9 @@ test("settings command: Back re-prompts the previous field; a wrong pick is reco
   try {
     // Wrong provider for supervisor, then Esc (undefined) back to fix it.
     const queue2 = [
-      "openai", undefined, "anthropic", "claude-sonnet-4-5", "high", // supervisor
+      "Role models", "openai", undefined, "anthropic", "claude-sonnet-4-5", "high", // supervisor
       "anthropic", "claude-sonnet-4-5", "medium", // lead
-      "openai", "gpt-5", "off", // peer
+      ...Array.from({ length: 5 }, () => ["openai", "gpt-5", "off"]).flat(), "Finish",
     ];
     const fake = fakePi({ ui: { select: async () => queue2.shift() ?? null, confirm: async () => true } });
     await runSettingsWith(fake, { ...process.env, PI_CODING_AGENT_DIR: dir });
@@ -3697,9 +3783,9 @@ test("settings command: thinking picker offers only the selected model's support
       { provider: "anthropic", id: "claude-sonnet-4-5", reasoning: true },
     ];
     const queue = [
-      "opencode", "deepseek-v4-flash", "max", // supervisor: only off/xhigh/max offered
-      "anthropic", "claude-sonnet-4-5", "high", // lead: no map → full closed set
-      "opencode", "deepseek-v4-flash", "xhigh", // peer
+      "Role models", "opencode", "deepseek-v4-flash", "max", // supervisor
+      "anthropic", "claude-sonnet-4-5", "high", // lead
+      ...Array.from({ length: 5 }, () => ["opencode", "deepseek-v4-flash", "xhigh"]).flat(), "Finish",
     ];
     const fake = fakePi({
       ui: {
@@ -3713,12 +3799,12 @@ test("settings command: thinking picker offers only the selected model's support
     assert.deepEqual(thinkingCalls.map(([, options]) => options), [
       ["off", "xhigh", "max"],
       [...extension.THINKING_LEVELS],
-      ["off", "xhigh", "max"],
+      ...Array.from({ length: 5 }, () => ["off", "xhigh", "max"]),
     ]);
     const doc = JSON.parse(await readFile(join(dir, "pi-paseo-orchestration", "settings.json"), "utf8"));
     assert.equal(doc.roles.supervisor.thinking, "max");
     assert.equal(doc.roles.lead.thinking, "high");
-    assert.equal(doc.roles.peer.thinking, "xhigh");
+    assert.equal(doc.peer_routes.fast.thinking, "xhigh");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -3729,9 +3815,9 @@ test("settings command: Esc mid-flow goes back instead of cancelling; Esc at the
   try {
     // Esc (undefined) at the model step of supervisor → back to provider, redo.
     const queue = [
-      "anthropic", undefined, "anthropic", "claude-sonnet-4-5", "high",
+      "Role models", "anthropic", undefined, "anthropic", "claude-sonnet-4-5", "high",
       "anthropic", "claude-sonnet-4-5", "medium",
-      "openai", "gpt-5", "off",
+      ...Array.from({ length: 5 }, () => ["openai", "gpt-5", "off"]).flat(), "Finish",
     ];
     const fake = fakePi({ ui: { select: async () => queue.shift() ?? null, confirm: async () => true } });
     await runSettingsWith(fake, { ...process.env, PI_CODING_AGENT_DIR: dir });
@@ -3743,7 +3829,7 @@ test("settings command: Esc mid-flow goes back instead of cancelling; Esc at the
     assert.equal(fake.notifications.some(([, level]) => level === "error"), false);
 
     // Esc at the very first field cancels and preserves prior bytes.
-    const prior = { ...validDoc, roles: { ...validDoc.roles, peer: { ...validDoc.roles.peer, thinking: "low" } } };
+    const prior = { ...validDoc, peer_routes: { ...validDoc.peer_routes, fast: { ...validDoc.peer_routes.fast, thinking: "low" } } };
     await writeSettings(dir, prior);
     const fakeCancel = fakePi({ ui: { select: async () => null, confirm: async () => true } });
     await runSettingsWith(fakeCancel, { ...process.env, PI_CODING_AGENT_DIR: dir });

@@ -10,6 +10,14 @@ const execFileAsync = promisify(execFile);
 
 export const ROLES = ["supervisor", "lead", "peer"];
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+export const DEFAULT_PEER_ROUTES = {
+  fast: "Low-cost, low-latency bounded triage and simple read-only work.",
+  general: "Balanced default for mixed repository work.",
+  reasoning: "Deep analysis for ambiguous or high-complexity problems.",
+  coding: "Implementation, debugging, and verification.",
+  architecture: "Architecture, migration, lifecycle, and hard-to-reverse decisions.",
+};
+const ROUTE_ID = /^[a-z][a-z0-9_-]{0,31}$/;
 
 export function configDir(env = process.env, home = homedir()) {
   return env.PI_CODING_AGENT_DIR || join(home, ".pi", "agent");
@@ -19,41 +27,68 @@ export function settingsPath(dir) {
   return join(dir, "pi-paseo-orchestration", "settings.json");
 }
 
-// Closed v1 document: exactly { version: 1, roles: { supervisor, lead, peer } },
-// each role exactly { provider, model, thinking } with thinking from the closed set.
+/** @returns {Array<[string, any]>} */
+function objectEntries(value) {
+  return Object.entries(value);
+}
+
+function validateModelSelection(entry, label, { description = false } = {}) {
+  if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+    return { ok: false, error: `${label} must be an object` };
+  }
+  const expected = description ? "description,model,provider,thinking" : "model,provider,thinking";
+  if (Object.keys(entry).sort().join(",") !== expected) {
+    return { ok: false, error: `${label} must contain exactly ${description ? "description, " : ""}provider, model, thinking` };
+  }
+  if (description && (typeof entry.description !== "string" || entry.description.trim() === "" || entry.description.length > 240)) {
+    return { ok: false, error: `${label}.description must be a nonempty string of at most 240 characters` };
+  }
+  if (typeof entry.provider !== "string" || entry.provider.trim() === "") return { ok: false, error: `${label}.provider must be a nonempty string` };
+  if (typeof entry.model !== "string" || entry.model.trim() === "") return { ok: false, error: `${label}.model must be a nonempty string` };
+  if (!THINKING_LEVELS.includes(entry.thinking)) return { ok: false, error: `${label}.thinking must be one of ${THINKING_LEVELS.join("|")}` };
+  return { ok: true };
+}
+
+// Closed v2 document: fixed Supervisor/Lead selections plus Human-owned Peer
+// model routes. The five default routes are required; custom route IDs are
+// allowed by the same closed route-entry schema.
 export function validateSettings(doc) {
-  if (doc === null || typeof doc !== "object" || Array.isArray(doc)) {
-    return { ok: false, error: "settings must be an object" };
-  }
-  if (doc.version !== 1) return { ok: false, error: "settings.version must be 1" };
+  if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return { ok: false, error: "settings must be an object" };
+  if (doc.version !== 2) return { ok: false, error: "settings.version must be 2" };
+  if (Object.keys(doc).sort().join(",") !== "peer_routes,roles,version") return { ok: false, error: "settings must contain exactly version, roles, peer_routes" };
   const roles = doc.roles;
-  if (roles === null || typeof roles !== "object" || Array.isArray(roles)) {
-    return { ok: false, error: "settings.roles must be an object" };
+  if (roles === null || typeof roles !== "object" || Array.isArray(roles) || Object.keys(roles).sort().join(",") !== "lead,supervisor") {
+    return { ok: false, error: "settings.roles must contain exactly supervisor and lead" };
   }
-  const keys = Object.keys(roles).sort();
-  if (keys.join(",") !== "lead,peer,supervisor") {
-    return { ok: false, error: `settings.roles must contain exactly supervisor, lead, peer (got: ${keys.join(", ") || "none"})` };
+  for (const role of ["supervisor", "lead"]) {
+    const check = validateModelSelection(roles[role], `settings.roles.${role}`);
+    if (!check.ok) return check;
   }
-  for (const role of ROLES) {
-    const entry = roles[role];
-    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
-      return { ok: false, error: `settings.roles.${role} must be an object` };
-    }
-    const fields = Object.keys(entry).sort();
-    if (fields.join(",") !== "model,provider,thinking") {
-      return { ok: false, error: `settings.roles.${role} must contain exactly provider, model, thinking` };
-    }
-    if (typeof entry.provider !== "string" || entry.provider.trim() === "") {
-      return { ok: false, error: `settings.roles.${role}.provider must be a nonempty string` };
-    }
-    if (typeof entry.model !== "string" || entry.model.trim() === "") {
-      return { ok: false, error: `settings.roles.${role}.model must be a nonempty string` };
-    }
-    if (!THINKING_LEVELS.includes(entry.thinking)) {
-      return { ok: false, error: `settings.roles.${role}.thinking must be one of ${THINKING_LEVELS.join("|")}` };
-    }
+  const routes = doc.peer_routes;
+  if (routes === null || typeof routes !== "object" || Array.isArray(routes)) return { ok: false, error: "settings.peer_routes must be an object" };
+  for (const route of Object.keys(DEFAULT_PEER_ROUTES)) {
+    if (!Object.prototype.hasOwnProperty.call(routes, route)) return { ok: false, error: `settings.peer_routes.${route} is required` };
+  }
+  for (const [route, entry] of Object.entries(routes)) {
+    if (!ROUTE_ID.test(route)) return { ok: false, error: `Peer route ID ${JSON.stringify(route)} is invalid` };
+    const check = validateModelSelection(entry, `settings.peer_routes.${route}`, { description: true });
+    if (!check.ok) return check;
   }
   return { ok: true };
+}
+
+function migrateSettingsV1(doc) {
+  if (doc?.version !== 1 || doc === null || typeof doc !== "object" || Array.isArray(doc)) return null;
+  const roles = doc.roles;
+  if (roles === null || typeof roles !== "object" || Array.isArray(roles) || Object.keys(roles).sort().join(",") !== "lead,peer,supervisor") return null;
+  for (const role of ROLES) {
+    if (!validateModelSelection(roles[role], `settings.roles.${role}`).ok) return null;
+  }
+  return {
+    version: 2,
+    roles: { supervisor: structuredClone(roles.supervisor), lead: structuredClone(roles.lead) },
+    peer_routes: Object.fromEntries(Object.entries(DEFAULT_PEER_ROUTES).map(([route, description]) => [route, { description, ...structuredClone(roles.peer) }])),
+  };
 }
 
 export async function readSettings(dir) {
@@ -71,6 +106,8 @@ export async function readSettings(dir) {
   } catch {
     throw new Error(`settings.json is not valid JSON; refusing to overwrite it`);
   }
+  const migrated = migrateSettingsV1(doc);
+  if (migrated !== null) return migrated;
   const check = validateSettings(doc);
   if (!check.ok) throw new Error(`settings.json invalid (${check.error}); refusing to overwrite it`);
   return doc;
@@ -112,7 +149,7 @@ export const CEILINGS = {
 // exact child IDs minted in this process; Paseo remains the control plane.
 export const MCP_TARGETS = {
   supervisor: { paseo: new Set(["paseo_create_agent", "paseo_list_agents", "paseo_get_agent_status", "paseo_get_agent_activity"]) },
-  lead: { paseo: new Set(["paseo_create_agent", "paseo_send_agent_prompt", "paseo_get_agent_status", "paseo_get_agent_activity", "paseo_cancel_agent", "paseo_archive_agent"]) },
+  lead: { paseo: new Set(["paseo_list_workspaces", "paseo_list_providers", "paseo_list_agents", "paseo_create_agent", "paseo_send_agent_prompt", "paseo_get_agent_status", "paseo_get_agent_activity", "paseo_cancel_agent", "paseo_archive_agent"]) },
   peer: {},
 };
 
@@ -217,7 +254,7 @@ async function findModel(models, provider, id) {
 // First successful activation latches role, agent identity, settings snapshot,
 // profile source, and profile digest. Everything later is drift-checked against
 // this latch; a fresh Paseo process is required to change the role.
-export async function activate({ env, dir, profileDir, models, setModel, setThinkingLevel, getThinkingLevel }) {
+export async function activate({ env, dir, profileDir, models, setModel, setThinkingLevel, getThinkingLevel, currentModel, currentThinking }) {
   const roleCheck = parseRole(env);
   if (!roleCheck.ok) return { ok: false, error: roleCheck.error };
   if (roleCheck.role === null) return { ok: true, latch: null };
@@ -247,9 +284,26 @@ export async function activate({ env, dir, profileDir, models, setModel, setThin
     return { ok: false, error: err.message };
   }
 
-  // Apply the snapshotted role selection through Pi's model APIs before any
-  // ordinary model work; unavailable, unauthenticated, or clamped states block.
-  const sel = settings.roles[roleCheck.role];
+  // Supervisor and Lead have one fixed selection. A Peer must already be
+  // launched with one exact Human-configured route; match the observed runtime
+  // tuple rather than silently replacing an unapproved requested model.
+  let selectedRoute = null;
+  let sel = settings.roles[roleCheck.role];
+  if (roleCheck.role === "peer") {
+    let matchedSelection = null;
+    for (const [routeId, route] of objectEntries(settings.peer_routes)) {
+      /** @type {any} */ const candidate = route;
+      if (currentModel?.provider === Reflect.get(Object(candidate), "provider")
+          && currentModel?.id === Reflect.get(Object(candidate), "model")
+          && currentThinking === Reflect.get(Object(candidate), "thinking")) {
+        selectedRoute = routeId;
+        matchedSelection = candidate;
+        break;
+      }
+    }
+    if (matchedSelection === null) return { ok: false, error: "Peer runtime model/thinking is not an allowed Human-configured route" };
+    sel = matchedSelection;
+  }
   const model = await findModel(models, sel.provider, sel.model);
   if (!model) return { ok: false, error: `model ${sel.provider}/${sel.model} is not in the current model registry` };
   if (typeof setModel !== "function") return { ok: false, error: "model selection API is unavailable" };
@@ -294,6 +348,7 @@ export async function activate({ env, dir, profileDir, models, setModel, setThin
     peerProviderAlias: env[PEER_ALIAS_ENV] ?? null,
     selectedModel: { provider: sel.provider, id: sel.model },
     selectedThinking: sel.thinking,
+    selectedPeerRoute: selectedRoute,
   };
   return { ok: true, latch };
 }
@@ -366,14 +421,17 @@ function validProviderAlias(value) {
 function createAgentPolicyPrompt(activeLatch, authority) {
   const envelope = authority?.envelope ?? null;
   if (activeLatch.role === "lead") {
-    const selection = activeLatch.settings.roles.peer;
     if (!validProviderAlias(activeLatch.peerProviderAlias)) {
       return `Paseo paseo_create_agent is blocked until ${PEER_ALIAS_ENV} names the Human-configured Peer provider alias.`;
     }
+    const routes = objectEntries(activeLatch.settings.peer_routes).map(([id, route]) => {
+      /** @type {any} */ const candidate = route;
+      return `- ${id}: ${Reflect.get(Object(candidate), "description")} => provider ${activeLatch.peerProviderAlias}/${Reflect.get(Object(candidate), "provider")}/${Reflect.get(Object(candidate), "model")}; settings {\"thinkingOptionId\":${JSON.stringify(Reflect.get(Object(candidate), "thinking"))}}`;
+    });
     return [
-      "Paseo paseo_create_agent policy (closed v1):",
-      `- provider must be ${activeLatch.peerProviderAlias}/${selection.provider}/${selection.model}`,
-      `- settings must be exactly {\"thinkingOptionId\":${JSON.stringify(selection.thinking)}}`,
+      "Paseo paseo_create_agent policy (closed v2): choose one Human-configured model route for this assignment:",
+      ...routes,
+      "- initialPrompt must bind the chosen route exactly once as \"model_route\":\"<route-id>\"",
       "- omit workspaceId and labels (the child inherits this exact workspace and Paseo supplies parentage)",
       `- initialPrompt must bind \"parent_lead_agent_id\" to ${activeLatch.agentId}`,
       "- notifyOnFinish must be true; title and initialPrompt must be nonempty",
@@ -395,9 +453,17 @@ function createAgentPolicyPrompt(activeLatch, authority) {
 
 function validateCreateAgentArgs(args, policy) {
   const block = (reason) => ({ block: true, reason });
-  const selection = policy.role === "supervisor"
-    ? policy.roleSettings?.lead
-    : policy.role === "lead" ? policy.roleSettings?.peer : null;
+  let selection = policy.role === "supervisor" ? policy.roleSettings?.lead : null;
+  let selectedRoute = null;
+  if (policy.role === "lead") {
+    if (!isRecord(policy.peerRoutes)) return block("Peer model routes are unavailable");
+    const bindings = typeof args?.initialPrompt === "string" ? [...args.initialPrompt.matchAll(/\"model_route\"\s*:\s*\"([^\"]*)\"/g)] : [];
+    if (bindings.length !== 1 || !Object.prototype.hasOwnProperty.call(policy.peerRoutes, bindings[0][1])) {
+      return block("Peer create_agent prompt must bind exactly one configured model_route");
+    }
+    selectedRoute = bindings[0][1];
+    selection = policy.peerRoutes[selectedRoute];
+  }
   if (!isRecord(selection)
       || typeof selection.provider !== "string" || selection.provider === ""
       || typeof selection.model !== "string" || selection.model === ""
@@ -509,8 +575,14 @@ export function checkToolCall(toolName, input, policy) {
       }
     }
     if (input.server === "paseo" && input.tool === "paseo_list_agents") {
-      if (policy.role !== "supervisor" || !closedKeys(input.args ?? {}, [], ["includeArchived", "cwd", "sinceHours", "statuses", "limit"])) {
-        return block("paseo_list_agents is restricted to bounded Supervisor observation");
+      if (!["supervisor", "lead"].includes(policy.role) || !closedKeys(input.args ?? {}, [], ["includeArchived", "cwd", "sinceHours", "statuses", "limit"])) {
+        return block("paseo_list_agents is restricted to bounded Supervisor observation or Lead duplicate/ownership checks");
+      }
+      return undefined;
+    }
+    if (input.server === "paseo" && (input.tool === "paseo_list_workspaces" || input.tool === "paseo_list_providers")) {
+      if (policy.role !== "lead" || !closedKeys(input.args ?? {}, [])) {
+        return block(`${input.tool} is restricted to argument-free Lead discovery`);
       }
       return undefined;
     }
@@ -3957,80 +4029,128 @@ async function selectWizard(ctx, title, options) {
   return { value };
 }
 
+async function pickModelSelection(ctx, models, providers, label, cancelAtStart = false) {
+  let provider = null;
+  let model = null;
+  while (true) {
+    if (provider === null) {
+      const res = await selectWizard(ctx, `Provider for ${label}:`, providers);
+      const choice = res.fallback ? await ctx.ui.select(`Provider for ${label}:`, providers) : res.value;
+      if (choice === null || choice === undefined) return cancelAtStart ? null : { back: true };
+      provider = choice;
+    }
+    if (model === null) {
+      const ids = models.filter((entry) => entry.provider === provider).map((entry) => entry.id).sort();
+      const res = await selectWizard(ctx, `Model for ${label}:`, ids);
+      const choice = res.fallback ? await ctx.ui.select(`Model for ${label}:`, ids) : res.value;
+      if (choice === null || choice === undefined) { provider = null; continue; }
+      model = choice;
+    }
+    const modelEntry = models.find((entry) => entry.provider === provider && entry.id === model);
+    const levels = thinkingLevelsFor(modelEntry);
+    const res = await selectWizard(ctx, `Thinking level for ${label}:`, levels);
+    const thinking = res.fallback ? await ctx.ui.select(`Thinking level for ${label}:`, levels) : res.value;
+    if (thinking === null || thinking === undefined) { model = null; continue; }
+    return { provider, model, thinking };
+  }
+}
+
+export function paseoConfigPath(env = process.env, home = homedir()) {
+  return join(env.PASEO_HOME || join(home, ".paseo"), "config.json");
+}
+
+export async function installPaseoProfiles(env = process.env) {
+  const target = paseoConfigPath(env);
+  let config;
+  try {
+    config = JSON.parse(await readFile(target, "utf8"));
+  } catch (err) {
+    throw new Error(`Paseo config read failed at ${target}: ${err.message}`);
+  }
+  if (!isRecord(config)) throw new Error("Paseo config must be a JSON object");
+  const providers = isRecord(config.agents?.providers) ? config.agents.providers : {};
+  const next = {
+    ...config,
+    agents: {
+      ...(isRecord(config.agents) ? config.agents : {}),
+      providers: {
+        ...providers,
+        "ppo-supervisor": { extends: "pi", label: "PPO Supervisor", enabled: true, env: { PI_PASEO_ORCHESTRATION_ROLE: "supervisor" } },
+        "ppo-lead": { extends: "pi", label: "PPO Lead", enabled: true, env: { PI_PASEO_ORCHESTRATION_ROLE: "lead", PI_PASEO_ORCHESTRATION_PEER_ALIAS: "ppo-peer" } },
+        "ppo-peer": { extends: "pi", label: "PPO Peer", enabled: true, env: { PI_PASEO_ORCHESTRATION_ROLE: "peer" } },
+      },
+    },
+  };
+  const tmp = `${target}.tmp`;
+  try {
+    await writeFile(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+    await rename(tmp, target);
+  } catch (err) {
+    await unlink(tmp).catch(() => {});
+    throw new Error(`Paseo config write failed: ${err.message}`);
+  }
+  return target;
+}
+
 async function runSettings(_args, ctx) {
   const notify = (message, level) => ctx.ui?.notify?.(message, level);
   const env = ctx.env ?? process.env;
+  const action = await ctx.ui.select("PPO settings:", ["Paseo profiles", "Role models"]);
+  if (action === null || action === undefined) { notify("Cancelled; settings unchanged.", "info"); return; }
+  if (action === "Paseo profiles") {
+    const confirmed = await ctx.ui.confirm("Install or update PPO Paseo profiles?", "Only agents.providers.ppo-supervisor, ppo-lead, and ppo-peer will be replaced.");
+    if (!confirmed) { notify("Not written; Paseo config unchanged.", "info"); return; }
+    try {
+      const path = await installPaseoProfiles(env);
+      notify(`PPO Paseo profiles written to ${path}. Restart Paseo before creating new agents.`, "info");
+    } catch (err) { notify(err.message, "error"); }
+    return;
+  }
+
   const dir = configDir(env);
-
   let prior;
-  try {
-    prior = await readSettings(dir);
-  } catch (err) {
-    notify(err.message, "error");
-    return;
-  }
-
+  try { prior = await readSettings(dir); } catch (err) { notify(err.message, "error"); return; }
   const models = ctx.modelRegistry?.getAvailable?.() ?? [];
-  const providers = [...new Set(models.map((m) => m.provider))].sort();
-  if (providers.length === 0) {
-    notify("No models available in the current model registry; settings unchanged.", "error");
-    return;
-  }
-
+  const providers = [...new Set(models.map((entry) => entry.provider))].sort();
+  if (providers.length === 0) { notify("No models available in the current model registry; settings unchanged.", "error"); return; }
   const cancelNote = prior ? "Cancelled; settings unchanged." : "Cancelled; no settings written.";
-  const chosen = {};
+
   const roles = {};
-  let roleIdx = 0;
-  let field = 0; // 0 = provider, 1 = model, 2 = thinking
-  while (roleIdx < ROLES.length) {
-    const role = ROLES[roleIdx];
-    if (field === 0) {
-      const res = await selectWizard(ctx, `Provider for ${role}:`, providers);
-      const choice = res.fallback ? await ctx.ui.select(`Provider for ${role}:`, providers) : res.value;
-      if (choice === null || choice === undefined) {
-        if (roleIdx === 0) { notify(cancelNote, "info"); return; } // first field: back = cancel
-        roleIdx -= 1;
-        field = 2;
-        continue;
-      }
-      chosen[role] = { provider: choice };
-      field = 1;
+  for (const role of ["supervisor", "lead"]) {
+    const selection = await pickModelSelection(ctx, models, providers, role, role === "supervisor");
+    if (selection === null) { notify(cancelNote, "info"); return; }
+    if (selection.back) { notify(cancelNote, "info"); return; }
+    roles[role] = selection;
+  }
+  const peerRoutes = {};
+  for (const [route, description] of Object.entries(DEFAULT_PEER_ROUTES)) {
+    const selection = await pickModelSelection(ctx, models, providers, `Peer route ${route}`);
+    if (selection?.back) { notify(cancelNote, "info"); return; }
+    peerRoutes[route] = { description, ...selection };
+  }
+  while (true) {
+    const next = await ctx.ui.select("Custom Peer routes:", ["Finish", "Add custom route"]);
+    if (next === null || next === undefined) { notify(cancelNote, "info"); return; }
+    if (next === "Finish") break;
+    const route = (await ctx.ui.input("Custom route ID (lowercase letters, numbers, _ or -):"))?.trim();
+    if (!ROUTE_ID.test(route ?? "") || Object.prototype.hasOwnProperty.call(peerRoutes, route)) {
+      notify("Custom route ID is invalid or already used.", "error");
       continue;
     }
-    if (field === 1) {
-      const ids = models.filter((m) => m.provider === chosen[role].provider).map((m) => m.id).sort();
-      const res = await selectWizard(ctx, `Model for ${role}:`, ids);
-      const choice = res.fallback ? await ctx.ui.select(`Model for ${role}:`, ids) : res.value;
-      if (choice === null || choice === undefined) { field = 0; continue; }
-      chosen[role].model = choice;
-      chosen[role].modelEntry = models.find(
-        (m) => m.provider === chosen[role].provider && m.id === choice,
-      );
-      field = 2;
-      continue;
-    }
-    const levels = thinkingLevelsFor(chosen[role].modelEntry);
-    const res = await selectWizard(ctx, `Thinking level for ${role}:`, levels);
-    const choice = res.fallback ? await ctx.ui.select(`Thinking level for ${role}:`, levels) : res.value;
-    if (choice === null || choice === undefined) { field = 1; continue; }
-    roles[role] = { provider: chosen[role].provider, model: chosen[role].model, thinking: choice };
-    roleIdx += 1;
-    field = 0;
+    const description = (await ctx.ui.input(`Description for ${route}:`))?.trim();
+    if (!description || description.length > 240) { notify("Description must be 1-240 characters.", "error"); continue; }
+    const selection = await pickModelSelection(ctx, models, providers, `Peer route ${route}`);
+    if (selection?.back) continue;
+    peerRoutes[route] = { description, ...selection };
   }
 
-  const doc = { version: 1, roles };
-  const confirmed = await ctx.ui.confirm("Apply this role-settings document?", JSON.stringify(doc, null, 2));
-  if (!confirmed) {
-    notify("Not written; settings unchanged.", "info");
-    return;
-  }
-
+  const doc = { version: 2, roles, peer_routes: peerRoutes };
+  const confirmed = await ctx.ui.confirm("Apply this PPO model-routing document?", JSON.stringify(doc, null, 2));
+  if (!confirmed) { notify("Not written; settings unchanged.", "info"); return; }
   try {
     await writeSettings(dir, doc);
-    notify(`Role settings written to ${settingsPath(dir)}`, "info");
-  } catch (err) {
-    notify(err.message, "error");
-  }
+    notify(`PPO model routes written to ${settingsPath(dir)}. Start fresh governed agents to apply them.`, "info");
+  } catch (err) { notify(err.message, "error"); }
 }
 
 // Process-latched governed state. Once set, blockedReason never clears in this
@@ -4203,7 +4323,7 @@ const RELEASE_FACTS = [
   { fact: "install_pinned", condition: "fresh pinned full-commit install proven (configured source/ref, managed checkout HEAD, and extension digest)", owner: "operator", action: "Install the reviewed full commit ID with Pi's Git package support and verify source/ref/HEAD/digest in a fresh process." },
   { fact: "relocation", condition: "package resources resolve identically from a fresh copied root", owner: "operator", action: "Copy the package to a fresh root and verify every declared resource resolves with identical bytes." },
   { fact: "doctor_tui_rpc_equivalence", condition: "doctor produces equivalent non-persistent TUI and RPC output", owner: "maintainer", action: "Run doctor in TUI and RPC modes and confirm the canonical reports match." },
-  { fact: "settings_exact", condition: "role settings apply exactly (complete three-role document, exact model and thinking per role)", owner: "maintainer", action: "Confirm one complete settings document applies the exact model and thinking to every governed process." },
+  { fact: "settings_exact", condition: "model-routing settings apply exactly (fixed Supervisor/Lead selections and an allowed Peer route)", owner: "maintainer", action: "Confirm one complete settings document applies fixed role selections and the exact chosen Peer route." },
   { fact: "notebook_primitives", condition: "Notebook publication primitives pass concurrency, crash, durability, and containment tests", owner: "maintainer", action: "Run the Notebook publication tests and fix any fail-closed violation." },
   { fact: "hermetic_tests", condition: "hermetic package tests pass", owner: "maintainer", action: "Run npm test and fix every failure." },
   { fact: "release_smoke", condition: "release smoke passes on the exact package commit", owner: "maintainer", action: "Run npm run release:smoke on the exact commit and resolve its printed blocker." },
@@ -4379,7 +4499,7 @@ function bootstrapPrompt(task, cwd, settings, env) {
   return [
     "Load the ppo-orchestrate skill and execute its Bootstrap coordinator workflow.",
     "PPO_BOOTSTRAP_V1",
-    JSON.stringify({ version: 1, cwd, task, supervisor_alias: supervisorAlias, lead_alias: leadAlias, supervisor: settings.roles.supervisor, lead: settings.roles.lead }),
+    JSON.stringify({ version: 1, task_key: createHash("sha256").update(`${cwd}\0${task}`).digest("hex"), cwd, task, supervisor_alias: supervisorAlias, lead_alias: leadAlias, supervisor: settings.roles.supervisor, lead: settings.roles.lead }),
     "Create the governed Lead and Supervisor now. Do not implement the task in this coordinator session.",
   ].join("\n");
 }
@@ -4549,6 +4669,8 @@ export default function (pi) {
       setModel: pi.setModel,
       setThinkingLevel: pi.setThinkingLevel,
       getThinkingLevel: pi.getThinkingLevel,
+      currentModel: ctx.model,
+      currentThinking: ctx.thinkingLevel,
     });
     if (!result.ok) {
       blockWith(ctx, result.error);
@@ -4762,6 +4884,7 @@ export default function (pi) {
       allowed,
       mcpTargets: MCP_TARGETS[latch.role] ?? {},
       roleSettings: latch.settings.roles,
+      peerRoutes: latch.settings.peer_routes,
       peerProviderAlias: latch.peerProviderAlias,
       currentAgentId: latch.agentId,
       envelope: currentAuthority?.envelope ?? null,
