@@ -16,7 +16,9 @@ export const DEFAULT_PEER_ROUTES = {
   reasoning: "Deep analysis for ambiguous or high-complexity problems.",
   coding: "Implementation, debugging, and verification.",
   architecture: "Architecture, migration, lifecycle, and hard-to-reverse decisions.",
+  reviewer: "Independent review of correctness, security, regressions, and maintainability.",
 };
+const REQUIRED_PEER_ROUTES = ["fast", "general", "reasoning", "coding", "architecture"];
 const ROUTE_ID = /^[a-z][a-z0-9_-]{0,31}$/;
 
 export function configDir(env = process.env, home = homedir()) {
@@ -50,8 +52,8 @@ function validateModelSelection(entry, label, { description = false } = {}) {
 }
 
 // Closed v2 document: fixed Supervisor/Lead selections plus Human-owned Peer
-// model routes. The five default routes are required; custom route IDs are
-// allowed by the same closed route-entry schema.
+// model routes. The original five routes remain required for v2 compatibility;
+// settings newly written by the wizard also include reviewer.
 export function validateSettings(doc) {
   if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return { ok: false, error: "settings must be an object" };
   if (doc.version !== 2) return { ok: false, error: "settings.version must be 2" };
@@ -66,7 +68,7 @@ export function validateSettings(doc) {
   }
   const routes = doc.peer_routes;
   if (routes === null || typeof routes !== "object" || Array.isArray(routes)) return { ok: false, error: "settings.peer_routes must be an object" };
-  for (const route of Object.keys(DEFAULT_PEER_ROUTES)) {
+  for (const route of REQUIRED_PEER_ROUTES) {
     if (!Object.prototype.hasOwnProperty.call(routes, route)) return { ok: false, error: `settings.peer_routes.${route} is required` };
   }
   for (const [route, entry] of Object.entries(routes)) {
@@ -3979,80 +3981,162 @@ async function runSupervisorRecovery(_args, ctx) {
 // without a map the full closed set is offered and activation fails closed if
 // the runtime clamps.
 export function thinkingLevelsFor(model) {
-  if (!model) return [...THINKING_LEVELS];
-  if (model.reasoning === false) return ["off"];
-  const map = model.thinkingLevelMap;
-  if (!map || typeof map !== "object") return [...THINKING_LEVELS];
-  const supported = THINKING_LEVELS.filter((level) => level === "off" || (map[level] !== null && map[level] !== undefined));
-  return supported.length > 0 ? supported : ["off"];
+  if (!model?.reasoning) return ["off"];
+  return THINKING_LEVELS.filter((level) => {
+    const mapped = model.thinkingLevelMap?.[level];
+    if (mapped === null) return false;
+    return level !== "xhigh" && level !== "max" || mapped !== undefined;
+  });
 }
 
-// Wizard picker: a custom selector with truthful help text — Esc goes back one
-// step (the whole flow cancels only at its first field). The built-in select
-// dialog hard-codes "escape/ctrl+c cancel", which would lie about that
-// behavior, so when a TUI is available we render our own list with an honest
-// footer. pi-tui is loaded lazily (it is a Pi-internal package, not a package
-// dependency) and any resolution failure falls back to the built-in select,
-// which still maps Esc to back at the runSettings layer.
-async function selectWizard(ctx, title, options) {
+// ctx.ui.custom exposes raw terminal input but this local package cannot resolve
+// pi-tui from its source directory. These are the standard sequences needed by
+// the small settings controls; tests without custom UI retain the built-in
+// select fallback.
+function key(data, name, keybindings) {
+  const action = {
+    up: "tui.select.up",
+    down: "tui.select.down",
+    left: "tui.editor.cursorLeft",
+    right: "tui.editor.cursorRight",
+    tab: "tui.input.tab",
+    enter: "tui.select.confirm",
+    escape: "tui.select.cancel",
+    ctrlC: "tui.select.cancel",
+  }[name];
+  if (typeof keybindings?.matches === "function" && keybindings.matches(data, action)) return true;
+  return ({ up: "\u001b[A", down: "\u001b[B", right: "\u001b[C", left: "\u001b[D", tab: "\t", enter: "\r", escape: "\u001b", ctrlC: "\u0003" })[name] === data
+    || (name === "enter" && data === "\n");
+}
+
+async function selectWizard(ctx, title, options, initial = null) {
   if (typeof ctx.ui?.custom !== "function") return { fallback: true };
-  let tuiModule = null;
-  try {
-    tuiModule = await import("@earendil-works/pi-tui");
-  } catch {
-    tuiModule = null;
-  }
-  if (!tuiModule?.matchesKey || !tuiModule.Key) return { fallback: true };
-  const { matchesKey, Key } = tuiModule;
-  let index = 0;
-  const value = await ctx.ui.custom((tui, _theme, _keybindings, done) => ({
-    render: () => {
+  let index = Math.max(0, options.indexOf(initial));
+  const value = await ctx.ui.custom((tui, _theme, keybindings, done) => ({
+    render: (width) => {
       const lines = [title, ""];
       options.forEach((option, i) => lines.push(`${i === index ? "→ " : "  "}${option}`));
       lines.push("", "↑↓ navigate · enter select · esc back (esc at the start cancels)");
-      return lines;
+      return lines.map((line) => line.slice(0, width));
     },
+    invalidate: () => {},
     handleInput: (data) => {
-      if (matchesKey(data, Key.up)) {
-        index = (index - 1 + options.length) % options.length;
-        tui.requestRender();
-      } else if (matchesKey(data, Key.down)) {
-        index = (index + 1) % options.length;
-        tui.requestRender();
-      } else if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
-        done(options[index]);
-      } else if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
-        done(null); // null = back one step at the runSettings layer
-      }
+      if (key(data, "up", keybindings)) { index = (index - 1 + options.length) % options.length; tui.requestRender(); }
+      else if (key(data, "down", keybindings)) { index = (index + 1) % options.length; tui.requestRender(); }
+      else if (key(data, "enter", keybindings)) done(options[index]);
+      else if (key(data, "escape", keybindings) || key(data, "ctrlC", keybindings)) done(null);
     },
   }));
   return { value };
 }
 
-async function pickModelSelection(ctx, models, providers, label, cancelAtStart = false) {
-  let provider = null;
-  let model = null;
+export async function confirmSettings(ctx, title, body) {
+  if (typeof ctx.ui?.custom !== "function") return ctx.ui.confirm(title, body);
+  const lines = body.split("\n");
+  let offset = 0;
+  const pageSize = 14;
+  return ctx.ui.custom((tui, _theme, keybindings, done) => ({
+    render: (width) => [
+      title,
+      `showing lines ${offset + 1}-${Math.min(offset + pageSize, lines.length)} of ${lines.length}`,
+      "",
+      ...lines.slice(offset, offset + pageSize),
+      "",
+      "↑↓ scroll · enter confirm · esc cancel",
+    ].map((line) => line.slice(0, width)),
+    invalidate: () => {},
+    handleInput: (data) => {
+      if (key(data, "up", keybindings)) { offset = Math.max(0, offset - 1); tui.requestRender(); }
+      else if (key(data, "down", keybindings)) { offset = Math.min(Math.max(0, lines.length - pageSize), offset + 1); tui.requestRender(); }
+      else if (key(data, "enter", keybindings)) done(true);
+      else if (key(data, "escape", keybindings) || key(data, "ctrlC", keybindings)) done(false);
+    },
+  }));
+}
+
+async function pickModelSelection(ctx, models, providers, label, cancelAtStart = false, includeThinking = true, initial = null, restart = false) {
+  const known = models.some((entry) => entry.provider === initial?.provider && entry.id === initial?.model);
+  let provider = known && !restart ? initial.provider : null;
+  let model = provider ? initial.model : null;
   while (true) {
     if (provider === null) {
-      const res = await selectWizard(ctx, `Provider for ${label}:`, providers);
-      const choice = res.fallback ? await ctx.ui.select(`Provider for ${label}:`, providers) : res.value;
+      const providerOptions = providers;
+      const res = await selectWizard(ctx, `Provider for ${label}:`, providerOptions, known ? initial.provider : null);
+      const choice = res.fallback ? await ctx.ui.select(`Provider for ${label}:`, providerOptions) : res.value;
       if (choice === null || choice === undefined) return cancelAtStart ? null : { back: true };
       provider = choice;
     }
     if (model === null) {
       const ids = models.filter((entry) => entry.provider === provider).map((entry) => entry.id).sort();
-      const res = await selectWizard(ctx, `Model for ${label}:`, ids);
+      const res = await selectWizard(ctx, `Model for ${label}:`, ids, provider === initial?.provider ? initial.model : null);
       const choice = res.fallback ? await ctx.ui.select(`Model for ${label}:`, ids) : res.value;
       if (choice === null || choice === undefined) { provider = null; continue; }
       model = choice;
     }
     const modelEntry = models.find((entry) => entry.provider === provider && entry.id === model);
+    if (!includeThinking) return { provider, model };
     const levels = thinkingLevelsFor(modelEntry);
-    const res = await selectWizard(ctx, `Thinking level for ${label}:`, levels);
+    const res = await selectWizard(ctx, `Thinking level for ${label}:`, levels, initial?.thinking);
     const thinking = res.fallback ? await ctx.ui.select(`Thinking level for ${label}:`, levels) : res.value;
     if (thinking === null || thinking === undefined) { model = null; continue; }
     return { provider, model, thinking };
   }
+}
+
+export async function pickPeerRouteSelections(ctx, models, providers, initialRoutes = {}) {
+  const routeNames = [...new Set([...Object.keys(DEFAULT_PEER_ROUTES), ...Object.keys(initialRoutes)])];
+  if (typeof ctx.ui?.custom !== "function") {
+    const result = [];
+    for (const route of routeNames) {
+      const selection = await pickModelSelection(ctx, models, providers, `Peer route ${route}`, false, true, initialRoutes[route]);
+      if (selection?.back) return null;
+      result.push({ route, ...selection });
+    }
+    return result;
+  }
+  const rows = routeNames.map((route) => {
+    const initial = initialRoutes[route];
+    const known = models.some((entry) => entry.provider === initial?.provider && entry.id === initial?.model);
+    const provider = known ? initial.provider : providers[0];
+    const model = known ? initial.model : models.filter((entry) => entry.provider === provider).map((entry) => entry.id).sort()[0];
+    const levels = thinkingLevelsFor(models.find((entry) => entry.provider === provider && entry.id === model));
+    return { route, provider, model, thinking: levels.includes(initial?.thinking) ? initial.thinking : levels[0] };
+  });
+  const fields = ["provider", "model", "thinking"];
+  let rowIndex = 0;
+  let fieldIndex = 0;
+  const values = (row, field) => field === "provider"
+    ? providers
+    : field === "model"
+      ? models.filter((entry) => entry.provider === row.provider).map((entry) => entry.id).sort()
+      : thinkingLevelsFor(models.find((entry) => entry.provider === row.provider && entry.id === row.model));
+  return ctx.ui.custom((tui, _theme, keybindings, done) => ({
+    render: (width) => {
+      const lines = ["Peer route models", "↑↓ route · tab field · ←→ value · enter apply all · esc back", ""];
+      for (const [i, row] of rows.entries()) {
+        const cells = fields.map((field, j) => j === fieldIndex && i === rowIndex ? `[${row[field]}]` : row[field]);
+        lines.push(`${i === rowIndex ? "→ " : "  "}${row.route.padEnd(13)} ${cells.join("  ")}`);
+      }
+      return lines.map((line) => line.slice(0, width));
+    },
+    invalidate: () => {},
+    handleInput: (data) => {
+      if (key(data, "up", keybindings)) rowIndex = (rowIndex - 1 + rows.length) % rows.length;
+      else if (key(data, "down", keybindings)) rowIndex = (rowIndex + 1) % rows.length;
+      else if (key(data, "tab", keybindings)) fieldIndex = (fieldIndex + 1) % fields.length;
+      else if (key(data, "left", keybindings) || key(data, "right", keybindings)) {
+        const row = rows[rowIndex];
+        const field = fields[fieldIndex];
+        const options = values(row, field);
+        const step = key(data, "left", keybindings) ? -1 : 1;
+        row[field] = options[(options.indexOf(row[field]) + step + options.length) % options.length];
+        if (field === "provider") row.model = values(row, "model")[0];
+        if (field !== "thinking") row.thinking = values(row, "thinking")[0];
+      } else if (key(data, "enter", keybindings)) { done(rows); return; }
+      else if (key(data, "escape", keybindings) || key(data, "ctrlC", keybindings)) { done(null); return; }
+      tui.requestRender();
+    },
+  }));
 }
 
 export function paseoConfigPath(env = process.env, home = homedir()) {
@@ -4115,42 +4199,101 @@ async function runSettings(_args, ctx) {
   if (providers.length === 0) { notify("No models available in the current model registry; settings unchanged.", "error"); return; }
   const cancelNote = prior ? "Cancelled; settings unchanged." : "Cancelled; no settings written.";
 
-  const roles = {};
-  for (const role of ["supervisor", "lead"]) {
-    const selection = await pickModelSelection(ctx, models, providers, role, role === "supervisor");
-    if (selection === null) { notify(cancelNote, "info"); return; }
-    if (selection.back) { notify(cancelNote, "info"); return; }
-    roles[role] = selection;
-  }
-  const peerRoutes = {};
-  for (const [route, description] of Object.entries(DEFAULT_PEER_ROUTES)) {
-    const selection = await pickModelSelection(ctx, models, providers, `Peer route ${route}`);
-    if (selection?.back) { notify(cancelNote, "info"); return; }
-    peerRoutes[route] = { description, ...selection };
-  }
-  while (true) {
-    const next = await ctx.ui.select("Custom Peer routes:", ["Finish", "Add custom route"]);
-    if (next === null || next === undefined) { notify(cancelNote, "info"); return; }
-    if (next === "Finish") break;
-    const route = (await ctx.ui.input("Custom route ID (lowercase letters, numbers, _ or -):"))?.trim();
-    if (!ROUTE_ID.test(route ?? "") || Object.prototype.hasOwnProperty.call(peerRoutes, route)) {
-      notify("Custom route ID is invalid or already used.", "error");
-      continue;
+  let roles;
+  let peerRoutes;
+  if (prior) {
+    roles = structuredClone(prior.roles);
+    peerRoutes = structuredClone(prior.peer_routes);
+    if (!peerRoutes.reviewer) peerRoutes.reviewer = { ...structuredClone(peerRoutes.general ?? peerRoutes.fast), description: DEFAULT_PEER_ROUTES.reviewer };
+    const target = await ctx.ui.select("Edit saved model settings:", ["Configure all settings", "Supervisor", "Lead", "Peer routes", "Add custom route", "Review without changes"]);
+    if (target === null || target === undefined) { notify(cancelNote, "info"); return; }
+    if (target === "Configure all settings") {
+      roles = {};
+      for (const role of ["supervisor", "lead"]) {
+        const selection = await pickModelSelection(ctx, models, providers, role, role === "supervisor", true, prior.roles[role], true);
+        if (!selection || selection.back) { notify(cancelNote, "info"); return; }
+        roles[role] = selection;
+      }
+      const peerMode = await ctx.ui.select("Peer routes:", ["Use one model for all built-in routes", "Edit routes in one table"]);
+      if (peerMode === null || peerMode === undefined) { notify(cancelNote, "info"); return; }
+      if (peerMode === "Use one model for all built-in routes") {
+        const selection = await pickModelSelection(ctx, models, providers, "all built-in Peer routes", true, true, peerRoutes.fast, true);
+        if (!selection || selection.back) { notify(cancelNote, "info"); return; }
+        for (const [route, description] of Object.entries(DEFAULT_PEER_ROUTES)) peerRoutes[route] = { description, ...selection };
+      } else {
+        const selections = await pickPeerRouteSelections(ctx, models, providers, peerRoutes);
+        if (!selections) { notify(cancelNote, "info"); return; }
+        for (const { route, provider, model, thinking } of selections) peerRoutes[route] = { description: peerRoutes[route]?.description ?? DEFAULT_PEER_ROUTES[route], provider, model, thinking };
+      }
+    } else if (target === "Supervisor" || target === "Lead") {
+      const role = target.toLowerCase();
+      const selection = await pickModelSelection(ctx, models, providers, role, true, true, roles[role], true);
+      if (!selection || selection.back) { notify(cancelNote, "info"); return; }
+      roles[role] = selection;
+    } else if (target === "Peer routes") {
+      const peerMode = await ctx.ui.select("Peer routes:", ["Use one model for all built-in routes", "Edit routes in one table"]);
+      if (peerMode === null || peerMode === undefined) { notify(cancelNote, "info"); return; }
+      if (peerMode === "Use one model for all built-in routes") {
+        const selection = await pickModelSelection(ctx, models, providers, "all built-in Peer routes", true, true, peerRoutes.fast, true);
+        if (!selection || selection.back) { notify(cancelNote, "info"); return; }
+        for (const [route, description] of Object.entries(DEFAULT_PEER_ROUTES)) peerRoutes[route] = { description, ...selection };
+      } else {
+        const selections = await pickPeerRouteSelections(ctx, models, providers, peerRoutes);
+        if (!selections) { notify(cancelNote, "info"); return; }
+        for (const { route, provider, model, thinking } of selections) {
+          peerRoutes[route] = { description: peerRoutes[route]?.description ?? DEFAULT_PEER_ROUTES[route], provider, model, thinking };
+        }
+      }
+    } else if (target === "Add custom route") {
+      const route = (await ctx.ui.input("Custom route ID (lowercase letters, numbers, _ or -):"))?.trim();
+      if (!ROUTE_ID.test(route ?? "") || Object.prototype.hasOwnProperty.call(peerRoutes, route)) { notify("Custom route ID is invalid or already used.", "error"); return; }
+      const description = (await ctx.ui.input(`Description for ${route}:`))?.trim();
+      if (!description || description.length > 240) { notify("Description must be 1-240 characters.", "error"); return; }
+      const selection = await pickModelSelection(ctx, models, providers, `Peer route ${route}`, true);
+      if (!selection || selection.back) { notify(cancelNote, "info"); return; }
+      peerRoutes[route] = { description, ...selection };
     }
-    const description = (await ctx.ui.input(`Description for ${route}:`))?.trim();
-    if (!description || description.length > 240) { notify("Description must be 1-240 characters.", "error"); continue; }
-    const selection = await pickModelSelection(ctx, models, providers, `Peer route ${route}`);
-    if (selection?.back) continue;
-    peerRoutes[route] = { description, ...selection };
+  } else {
+    roles = {};
+    for (const role of ["supervisor", "lead"]) {
+      const selection = await pickModelSelection(ctx, models, providers, role, role === "supervisor");
+      if (!selection || selection.back) { notify(cancelNote, "info"); return; }
+      roles[role] = selection;
+    }
+    peerRoutes = {};
+    const peerMode = await ctx.ui.select("Peer routes:", ["Use one model for all routes", "Configure each route individually"]);
+    if (peerMode === null || peerMode === undefined) { notify(cancelNote, "info"); return; }
+    if (peerMode === "Use one model for all routes") {
+      const selection = await pickModelSelection(ctx, models, providers, "all default Peer routes");
+      if (!selection || selection.back) { notify(cancelNote, "info"); return; }
+      for (const [route, description] of Object.entries(DEFAULT_PEER_ROUTES)) peerRoutes[route] = { description, ...selection };
+    } else {
+      const selections = await pickPeerRouteSelections(ctx, models, providers);
+      if (!selections) { notify(cancelNote, "info"); return; }
+      for (const { route, provider, model, thinking } of selections) peerRoutes[route] = { description: DEFAULT_PEER_ROUTES[route], provider, model, thinking };
+    }
+    while (true) {
+      const next = await ctx.ui.select("Custom Peer routes:", ["Finish", "Add custom route"]);
+      if (next === null || next === undefined) { notify(cancelNote, "info"); return; }
+      if (next === "Finish") break;
+      const route = (await ctx.ui.input("Custom route ID (lowercase letters, numbers, _ or -):"))?.trim();
+      if (!ROUTE_ID.test(route ?? "") || Object.prototype.hasOwnProperty.call(peerRoutes, route)) { notify("Custom route ID is invalid or already used.", "error"); continue; }
+      const description = (await ctx.ui.input(`Description for ${route}:`))?.trim();
+      if (!description || description.length > 240) { notify("Description must be 1-240 characters.", "error"); continue; }
+      const selection = await pickModelSelection(ctx, models, providers, `Peer route ${route}`);
+      if (selection?.back) continue;
+      peerRoutes[route] = { description, ...selection };
+    }
   }
 
   const doc = { version: 2, roles, peer_routes: peerRoutes };
-  const confirmed = await ctx.ui.confirm("Apply this PPO model-routing document?", JSON.stringify(doc, null, 2));
-  if (!confirmed) { notify("Not written; settings unchanged.", "info"); return; }
+  const path = settingsPath(dir);
+  const confirmed = await confirmSettings(ctx, "Apply PPO model-routing document?", `${path}\n\n${JSON.stringify(doc, null, 2)}`);
+  if (!confirmed) { notify(`Not written; settings unchanged. Path: ${path}`, "info"); return; }
   try {
     await writeSettings(dir, doc);
-    notify(`PPO model routes written to ${settingsPath(dir)}. Start fresh governed agents to apply them.`, "info");
-  } catch (err) { notify(err.message, "error"); }
+    notify(`Success: PPO model routes written to ${path}. Start fresh governed agents to apply them.`, "info");
+  } catch (err) { notify(`Failed to write PPO model routes at ${path}: ${err.message}`, "error"); }
 }
 
 // Process-latched governed state. Once set, blockedReason never clears in this

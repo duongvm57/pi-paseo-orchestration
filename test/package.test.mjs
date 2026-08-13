@@ -38,8 +38,8 @@ const profileDirFixture = async () => {
 };
 
 const baseModels = () => [
-  { provider: "anthropic", id: "claude-sonnet-4-5", name: "Sonnet" },
-  { provider: "openai", id: "gpt-5", name: "GPT-5" },
+  { provider: "anthropic", id: "claude-sonnet-4-5", name: "Sonnet", reasoning: true },
+  { provider: "openai", id: "gpt-5", name: "GPT-5", reasoning: true },
 ];
 
 const fakePi = (ctxOverrides = {}) => {
@@ -112,14 +112,14 @@ const validDoc = {
     reasoning: peerRoute("Deep analysis for ambiguous or high-complexity problems."),
     coding: peerRoute("Implementation, debugging, and verification."),
     architecture: peerRoute("Architecture, migration, lifecycle, and hard-to-reverse decisions."),
+    reviewer: peerRoute("Independent review of correctness, security, regressions, and maintainability."),
   },
 };
 const modelSettingsQueue = () => [
   "Role models",
   "anthropic", "claude-sonnet-4-5", "high",
   "anthropic", "claude-sonnet-4-5", "medium",
-  ...Array.from({ length: 5 }, () => ["openai", "gpt-5", "off"]).flat(),
-  "Finish",
+  "Use one model for all routes", "openai", "gpt-5", "off", "Finish",
 ];
 
 test("manifest declares one Pi extension and the two packaged skills", () => {
@@ -384,17 +384,57 @@ test("settings command: declined confirmation writes nothing", async () => {
   }
 });
 
-test("settings command: Esc at custom-route menu preserves prior settings", async () => {
+test("settings command: Esc at saved-settings edit menu preserves prior settings", async () => {
   const dir = await mkdtemp(join(tmpdir(), "ppo-cmd-custom-cancel-"));
   try {
     await writeSettings(dir, validDoc);
     const before = await readFile(settingsPath(dir), "utf8");
-    const queue = modelSettingsQueue();
-    queue[queue.length - 1] = null;
+    const queue = ["Role models", null];
     const fake = fakePi({ ui: { select: async () => queue.shift(), confirm: async () => true } });
     await runSettingsWith(fake, { ...process.env, PI_CODING_AGENT_DIR: dir });
     assert.equal(await readFile(settingsPath(dir), "utf8"), before);
     assert.equal(fake.notifications.some(([message]) => /Cancelled/.test(message)), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("settings command: saved settings ask what to edit before model fields", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ppo-cmd-edit-target-"));
+  try {
+    await writeSettings(dir, validDoc);
+    const calls = [];
+    const queue = ["Role models", "Supervisor", "anthropic", "claude-sonnet-4-5", "high"];
+    const fake = fakePi({ ui: {
+      select: async (title) => { calls.push(title); return queue.shift() ?? null; },
+      confirm: async () => false,
+    } });
+    await runSettingsWith(fake, { ...process.env, PI_CODING_AGENT_DIR: dir });
+    assert.deepEqual(calls.slice(0, 3), ["PPO settings:", "Edit saved model settings:", "Provider for supervisor:"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("settings command: saved settings can be configured end-to-end again", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ppo-cmd-reconfigure-all-"));
+  try {
+    await writeSettings(dir, validDoc);
+    const calls = [];
+    const queue = [
+      "Role models", "Configure all settings",
+      "anthropic", "claude-sonnet-4-5", "high",
+      "anthropic", "claude-sonnet-4-5", "medium",
+      "Use one model for all built-in routes", "openai", "gpt-5", "off",
+    ];
+    const fake = fakePi({ ui: {
+      select: async (title) => { calls.push(title); return queue.shift() ?? null; },
+      confirm: async () => false,
+    } });
+    await runSettingsWith(fake, { ...process.env, PI_CODING_AGENT_DIR: dir });
+    assert.equal(calls.includes("Provider for supervisor:"), true);
+    assert.equal(calls.includes("Provider for lead:"), true);
+    assert.equal(calls.includes("Provider for all built-in Peer routes:"), true);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -3742,14 +3782,14 @@ test("Doctor: paseo CLI observer proves identity/model/thinking; attestation sta
   }
 });
 
-test("thinkingLevelsFor: filters by the selected model's thinkingLevelMap, off-only without reasoning", () => {
-  assert.deepEqual(extension.thinkingLevelsFor(undefined), extension.THINKING_LEVELS);
+test("thinkingLevelsFor matches Pi Shift+Tab availability", () => {
+  assert.deepEqual(extension.thinkingLevelsFor(undefined), ["off"]);
   assert.deepEqual(extension.thinkingLevelsFor({ reasoning: false }), ["off"]);
   assert.deepEqual(
-    extension.thinkingLevelsFor({ reasoning: true, thinkingLevelMap: { off: null, high: "high", max: "max" } }),
-    ["off", "high", "max"],
+    extension.thinkingLevelsFor({ reasoning: true, thinkingLevelMap: { off: null, minimal: null, low: null, medium: null, high: "high", max: "max" } }),
+    ["high", "max"],
   );
-  assert.deepEqual(extension.thinkingLevelsFor({ reasoning: true, thinkingLevelMap: {} }), ["off"]);
+  assert.deepEqual(extension.thinkingLevelsFor({ reasoning: true, thinkingLevelMap: {} }), ["off", "minimal", "low", "medium", "high"]);
 });
 
 test("settings command: Back re-prompts the previous field; a wrong pick is recoverable", async () => {
@@ -3759,7 +3799,7 @@ test("settings command: Back re-prompts the previous field; a wrong pick is reco
     const queue2 = [
       "Role models", "openai", undefined, "anthropic", "claude-sonnet-4-5", "high", // supervisor
       "anthropic", "claude-sonnet-4-5", "medium", // lead
-      ...Array.from({ length: 5 }, () => ["openai", "gpt-5", "off"]).flat(), "Finish",
+      "Use one model for all routes", "openai", "gpt-5", "off", "Finish",
     ];
     const fake = fakePi({ ui: { select: async () => queue2.shift() ?? null, confirm: async () => true } });
     await runSettingsWith(fake, { ...process.env, PI_CODING_AGENT_DIR: dir });
@@ -3773,6 +3813,53 @@ test("settings command: Back re-prompts the previous field; a wrong pick is reco
   }
 });
 
+test("settings confirmation renders multiline content as scrollable lines", async () => {
+  let rendered;
+  const confirmed = await extension.confirmSettings({ ui: { custom: async (factory) => new Promise((resolve) => {
+    const component = factory({ requestRender() {} }, {}, { matches: (data, action) => data === "cancel" && action === "tui.select.cancel" }, resolve);
+    rendered = component.render(80);
+    component.handleInput("cancel");
+  }) } }, "Confirm", "path\n\n{\n  key: value\n}");
+  assert.equal(confirmed, false);
+  assert.equal(rendered.includes("showing lines 1-5 of 5"), true);
+  assert.equal(rendered.includes("  key: value"), true);
+});
+
+test("Peer route table configures all built-in routes in one custom screen and honors Pi keybindings", async () => {
+  let rendered;
+  let selectCalls = 0;
+  const actions = { "kitty-down": "tui.select.down", "kitty-right": "tui.editor.cursorRight", "kitty-enter": "tui.select.confirm" };
+  const result = await extension.pickPeerRouteSelections({ ui: {
+    select: async () => { selectCalls += 1; return null; },
+    custom: async (factory) => new Promise((resolve) => {
+      const component = factory({ requestRender() {} }, {}, { matches: (data, action) => actions[data] === action }, resolve);
+      rendered = component.render(200).join("\n");
+      component.handleInput("kitty-down");
+      component.handleInput("kitty-right");
+      component.handleInput("kitty-enter");
+    }),
+  } }, baseModels(), ["anthropic", "openai"]);
+  assert.equal(selectCalls, 0);
+  for (const route of Object.keys(extension.DEFAULT_PEER_ROUTES)) assert.match(rendered, new RegExp(route));
+  assert.deepEqual(result.map(({ route }) => route), Object.keys(extension.DEFAULT_PEER_ROUTES));
+  assert.equal(result[0].provider, "anthropic");
+  assert.equal(result[1].provider, "openai", "down/right must edit the second row through Pi keybindings");
+});
+
+test("Peer route table preloads saved model and thinking selections", async () => {
+  let rendered;
+  const initial = {
+    fast: peerRoute("saved", { provider: "openai", model: "gpt-5", thinking: "high" }),
+  };
+  const result = await extension.pickPeerRouteSelections({ ui: { custom: async (factory) => new Promise((resolve) => {
+    const component = factory({ requestRender() {} }, {}, { matches: (data, action) => data === "enter" && action === "tui.select.confirm" }, resolve);
+    rendered = component.render(200).join("\n");
+    component.handleInput("enter");
+  }) } }, baseModels(), ["anthropic", "openai"], initial);
+  assert.match(rendered, /fast\s+\[openai\]\s+gpt-5\s+high/);
+  assert.deepEqual(result.find(({ route }) => route === "fast"), { route: "fast", provider: "openai", model: "gpt-5", thinking: "high" });
+});
+
 test("settings command: thinking picker offers only the selected model's supported levels", async () => {
   const dir = await mkdtemp(join(tmpdir(), "ppo-cmd-levels-"));
   try {
@@ -3784,7 +3871,8 @@ test("settings command: thinking picker offers only the selected model's support
     const queue = [
       "Role models", "opencode", "deepseek-v4-flash", "max", // supervisor
       "anthropic", "claude-sonnet-4-5", "high", // lead
-      ...Array.from({ length: 5 }, () => ["opencode", "deepseek-v4-flash", "xhigh"]).flat(), "Finish",
+      "Configure each route individually",
+      ...Array.from({ length: 6 }, () => ["opencode", "deepseek-v4-flash", "xhigh"]).flat(), "Finish",
     ];
     const fake = fakePi({
       ui: {
@@ -3796,9 +3884,9 @@ test("settings command: thinking picker offers only the selected model's support
     await runSettingsWith(fake, { ...process.env, PI_CODING_AGENT_DIR: dir });
     const thinkingCalls = selectCalls.filter(([title]) => /Thinking level/.test(title));
     assert.deepEqual(thinkingCalls.map(([, options]) => options), [
-      ["off", "xhigh", "max"],
-      [...extension.THINKING_LEVELS],
-      ...Array.from({ length: 5 }, () => ["off", "xhigh", "max"]),
+      ["minimal", "low", "medium", "high", "xhigh", "max"],
+      ["off", "minimal", "low", "medium", "high"],
+      ...Array.from({ length: 6 }, () => ["minimal", "low", "medium", "high", "xhigh", "max"]),
     ]);
     const doc = JSON.parse(await readFile(join(dir, "pi-paseo-orchestration", "settings.json"), "utf8"));
     assert.equal(doc.roles.supervisor.thinking, "max");
@@ -3816,7 +3904,7 @@ test("settings command: Esc mid-flow goes back instead of cancelling; Esc at the
     const queue = [
       "Role models", "anthropic", undefined, "anthropic", "claude-sonnet-4-5", "high",
       "anthropic", "claude-sonnet-4-5", "medium",
-      ...Array.from({ length: 5 }, () => ["openai", "gpt-5", "off"]).flat(), "Finish",
+      "Use one model for all routes", "openai", "gpt-5", "off", "Finish",
     ];
     const fake = fakePi({ ui: { select: async () => queue.shift() ?? null, confirm: async () => true } });
     await runSettingsWith(fake, { ...process.env, PI_CODING_AGENT_DIR: dir });

@@ -63,6 +63,7 @@ const EXPECTED_SETTINGS = {
     reasoning: peerRoute("Deep analysis for ambiguous or high-complexity problems."),
     coding: peerRoute("Implementation, debugging, and verification."),
     architecture: peerRoute("Architecture, migration, lifecycle, and hard-to-reverse decisions."),
+    reviewer: peerRoute("Independent review of correctness, security, regressions, and maintainability."),
   },
 };
 const MODEL_REGISTRY = [
@@ -226,7 +227,7 @@ async function main() {
   // ── fake pi (same seam as the hermetic suite: registerCommand/on capture) ──
   const notifications = [];
   const holder = { activeTools: ["read", "bash", "mcp"], modelCalls: [] };
-  const selectQueue = ["Role models", "anthropic", "claude-sonnet-4-5", "high", "anthropic", "claude-sonnet-4-5", "medium", ...Array.from({ length: 5 }, () => ["openai", "gpt-5", "off"]).flat(), "Finish"];
+  const selectQueue = ["Role models", "anthropic", "claude-sonnet-4-5", "high", "anthropic", "claude-sonnet-4-5", "medium", "Use one model for all routes", "openai", "gpt-5", "off", "Finish"];
   const ui = {
     select: async () => selectQueue.shift() ?? null,
     confirm: async () => true,

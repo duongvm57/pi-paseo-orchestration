@@ -122,8 +122,9 @@ may create a Peer only with the alias from
 `PI_PASEO_ORCHESTRATION_PEER_ALIAS`, one Human-configured Peer model route,
 the inherited workspace, exact route ID in `model_route`, exact current Lead ID
 in `parent_lead_agent_id`, and native finish notification. `/ppo:settings` provides
-five required routes—`fast`, `general`, `reasoning`, `coding`, and `architecture`—and
-allows Human-defined custom routes. A Lead selects a route per assignment;
+six built-in routes—`fast`, `general`, `reasoning`, `coding`, `architecture`, and
+`reviewer`—and allows Human-defined custom routes. The original five remain the
+minimum accepted v2 document for compatibility; newly saved settings include all six. A Lead selects a route per assignment;
 disposition remains open task vocabulary and does not select or grant authority. Supervisor `paseo_create_agent` additionally requires the current Human recovery grant's exact
 Lead alias, workspace, objective, and handoff label. The child must still pass
 Human-observed doctor evidence before handoff: an alias is convenience, not
