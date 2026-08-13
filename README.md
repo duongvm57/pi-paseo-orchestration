@@ -162,6 +162,20 @@ From an idle, ungoverned Pi session in the repository:
 
 Bootstrap validates settings and the Workspace Protocol, then creates sibling Supervisor and Lead agents in the current Paseo workspace. The Lead delegates bounded assignments to Peer children and returns the final candidate to the Human for local acceptance.
 
+### Supervisor Notebook
+
+The Supervisor Notebook is an optional, project-scoped history of **why** the Supervisor made an observation or recommendation. It is useful for preserving causal evidence across runs—for example, a blocked dependency, a recurring failure, or a question that needs Human attention.
+
+It is **not** a task queue, chat channel, source of authority, current status, or automatic decision-maker. Notebook entries never grant permissions or change the project. The Notebook lives under Pi's config directory, not in the repository.
+
+Initialize it explicitly when you want this history:
+
+```text
+/ppo:notebook-init
+```
+
+After initialization, an activated Supervisor can append entries through the narrow `supervisor_notebook_append` tool. Most users can ignore this feature until they need durable governance evidence across runs.
+
 ## Commands
 
 | Command | Purpose |
