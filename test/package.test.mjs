@@ -3169,13 +3169,14 @@ async function notebookFixture() {
   return { config, repo, env, projectId, initialized };
 }
 
-test("Notebook init is available from a Human session", async () => {
+test("Notebook init discovers the current Paseo workspace from a Human session", async () => {
   const config = await mkdtemp(join(tmpdir(), "ppo-human-notebook-config-"));
   const repo = await gitRepoFixture();
+  const bin = await fakePaseoBin({ workspaceCwd: repo.dir });
   const ext = await freshExtension();
   try {
     const fake = fakePi({
-      env: { PI_CODING_AGENT_DIR: config, PASEO_PROJECT_ID: "paseo-project-1" },
+      env: { PI_CODING_AGENT_DIR: config, PATH: bin },
       ui: { input: async () => "ppo-fixture", confirm: async () => true }
     });
     fake.ctx.cwd = repo.dir;
@@ -3183,10 +3184,13 @@ test("Notebook init is available from a Human session", async () => {
     await fake.handlers.get("session_start")({ reason: "startup" }, fake.ctx);
     const result = await fake.commands.get("ppo:notebook-init").handler("", fake.ctx);
     assert.equal(result.ok, true, result.error);
-    assert.equal(JSON.parse(await readFile(result.paths.manifestPath, "utf8")).created_by.supervisor_agent_id, "human");
+    const manifest = JSON.parse(await readFile(result.paths.manifestPath, "utf8"));
+    assert.equal(manifest.created_by.supervisor_agent_id, "human");
+    assert.equal(manifest.paseo_project_id_at_creation, "paseo-project-1");
   } finally {
     await rm(config, { recursive: true, force: true });
     await rm(repo.dir, { recursive: true, force: true });
+    await rm(bin, { recursive: true, force: true });
   }
 });
 
@@ -3752,11 +3756,12 @@ test("mutation boundary: settings command, notebook init+append, and doctor touc
 // agent tuple with the fixed identity "agent-42", so requesting any other id
 // is an identity mismatch; `--version` prints a version. The fail variant
 // exits 1 like a daemon-down CLI.
-async function fakePaseoBin({ fail = false } = {}) {
+async function fakePaseoBin({ fail = false, workspaceCwd = null } = {}) {
   const bin = await mkdtemp(join(tmpdir(), "ppo-paseo-bin-"));
+  const workspace = JSON.stringify([{ workspaceId: "workspace-1", project: "paseo-project-1", cwd: workspaceCwd }]);
   const script = fail
     ? `#!/bin/sh\necho "daemon unreachable" >&2\nexit 1\n`
-    : `#!/bin/sh\nif [ "$1" = "--version" ] || [ "$1" = "-v" ]; then echo "0.3.1-test"; exit 0; fi\nif [ "$1" = "inspect" ]; then\n  [ -z "$2" ] && { echo "agent id required" >&2; exit 2; }\n  printf '{"Id":"agent-42","Provider":"pi","Model":"claude-sonnet-4-5","Thinking":"medium","Status":"running","Cwd":"/tmp/repo","ParentAgentId":"lead-9"}'\n  exit 0\nfi\necho "unknown command" >&2\nexit 1\n`;
+    : `#!/bin/sh\nif [ "$1" = "--version" ] || [ "$1" = "-v" ]; then echo "0.3.1-test"; exit 0; fi\nif [ "$1" = "workspace" ] && [ "$2" = "ls" ]; then printf '%s' '${workspace}'; exit 0; fi\nif [ "$1" = "inspect" ]; then\n  [ -z "$2" ] && { echo "agent id required" >&2; exit 2; }\n  printf '{"Id":"agent-42","Provider":"pi","Model":"claude-sonnet-4-5","Thinking":"medium","Status":"running","Cwd":"/tmp/repo","ParentAgentId":"lead-9"}'\n  exit 0\nfi\necho "unknown command" >&2\nexit 1\n`;
   await writeFile(join(bin, "paseo"), script, { mode: 0o755 });
   return bin;
 }

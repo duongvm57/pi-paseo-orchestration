@@ -3180,8 +3180,21 @@ export async function snapshotNotebook(options = {}) {
 async function notebookContextFromPi(ctx, env) {
   const cwd = ctx?.cwd ?? process.cwd();
   const repoRoot = await findRepoRoot(cwd);
-  const paseoProjectId = ctx?.paseoProjectId ?? ctx?.paseo_project_id ?? ctx?.workspace?.projectId ?? env.PASEO_PROJECT_ID ?? "unknown";
-  const workspaceId = ctx?.workspaceId ?? ctx?.paseoWorkspaceId ?? ctx?.paseo_workspace_id ?? env.PASEO_WORKSPACE_ID ?? "unknown";
+  let paseoProjectId = ctx?.paseoProjectId ?? ctx?.paseo_project_id ?? ctx?.workspace?.projectId ?? env.PASEO_PROJECT_ID ?? "unknown";
+  let workspaceId = ctx?.workspaceId ?? ctx?.paseoWorkspaceId ?? ctx?.paseo_workspace_id ?? env.PASEO_WORKSPACE_ID ?? "unknown";
+  if (repoRoot && (paseoProjectId === "unknown" || workspaceId === "unknown")) {
+    const output = await execFileAsync("paseo", ["workspace", "ls", "--json"], { env, timeout: 15000 }).catch(() => null);
+    if (output !== null) {
+      try {
+        const workspaces = JSON.parse(output.stdout);
+        const matches = Array.isArray(workspaces) ? workspaces.filter((item) => isRecord(item) && item.cwd === repoRoot) : [];
+        if (matches.length === 1) {
+          if (paseoProjectId === "unknown" && typeof matches[0].project === "string" && matches[0].project !== "") paseoProjectId = matches[0].project;
+          if (workspaceId === "unknown" && typeof matches[0].workspaceId === "string" && matches[0].workspaceId !== "") workspaceId = matches[0].workspaceId;
+        }
+      } catch { /* unavailable or malformed CLI output stays unknown */ }
+    }
+  }
   const leadId = ctx?.leadAgentId ?? ctx?.lead_agent_id ?? env.PASEO_LEAD_AGENT_ID ?? "unknown";
   let protocolPinValue = null;
   if (repoRoot) {
@@ -3198,7 +3211,6 @@ async function runNotebookInit(_args, ctx) {
   const notify = (message, level) => ctx.ui?.notify?.(message, level);
   const env = envOf(ctx);
   const role = parseRole(env).role;
-  if (role !== null && role !== "supervisor") { notify("pi-paseo-orchestration: notebook-init is available only to a Human session or active supervisor process", "error"); return { ok: false, error: "Human session or supervisor role required" }; }
   if (role === "supervisor") {
     if (latch === null || latch.role !== "supervisor") { notify("pi-paseo-orchestration: notebook-init is available only to an active supervisor process", "error"); return { ok: false, error: "supervisor role required" }; }
     if (blockedReason !== null) { notify(`pi-paseo-orchestration blocked: ${blockedReason}`, "error"); return { ok: false, error: blockedReason }; }
@@ -3210,9 +3222,15 @@ async function runNotebookInit(_args, ctx) {
     notify(error, "error");
     return { ok: false, error };
   }
+  const facts = await notebookContextFromPi(ctx, env);
+  const paseoProjectId = facts.paseoProjectId;
+  if (paseoProjectId === "unknown") {
+    const error = "Paseo project_id is unavailable; connect this Pi session to a Paseo workspace before initializing the Notebook";
+    notify(error, "error");
+    return { ok: false, error };
+  }
   const projectId = await ui.input("Protocol project_id for the Supervisor Notebook:", "");
   if (!projectId) { notify("Cancelled; no notebook manifest written.", "info"); return { ok: false, error: "cancelled" }; }
-  const facts = await notebookContextFromPi(ctx, envOf(ctx));
   if (facts.repositoryRoot !== "unknown") {
     const protocol = await readAndValidateProtocol(facts.repositoryRoot);
     if (!protocol.ok) { notify(`Notebook initialization blocked: ${protocol.error}`, "error"); return { ok: false, error: protocol.error }; }
@@ -3222,12 +3240,12 @@ async function runNotebookInit(_args, ctx) {
       return { ok: false, error };
     }
   }
-  const draft = { protocol_project_id: projectId, paseo_project_id_at_creation: facts.paseoProjectId, repository_root_at_creation: facts.repositoryRoot, supervisor_agent_id: latch?.agentId ?? "human", pi_session_id: facts.piSessionId };
+  const draft = { protocol_project_id: projectId, paseo_project_id_at_creation: paseoProjectId, repository_root_at_creation: facts.repositoryRoot, supervisor_agent_id: latch?.role === "supervisor" ? latch.agentId : "human", pi_session_id: facts.piSessionId };
   const confirmed = await ui.confirm("Create this immutable Supervisor Notebook manifest?", JSON.stringify(draft, null, 2));
   if (!confirmed) { notify("Not written; notebook manifest unchanged.", "info"); return { ok: false, error: "cancelled" }; }
   const result = await initializeNotebook({
-    env: envOf(ctx), projectId, paseoProjectId: facts.paseoProjectId, repositoryRoot: facts.repositoryRoot,
-    supervisorAgentId: latch?.agentId ?? "human", piSessionId: facts.piSessionId,
+    env, projectId, paseoProjectId, repositoryRoot: facts.repositoryRoot,
+    supervisorAgentId: latch?.role === "supervisor" ? latch.agentId : "human", piSessionId: facts.piSessionId,
   });
   notify(result.ok ? `Supervisor Notebook initialized at ${result.paths.manifestPath}` : `Notebook initialization failed: ${result.error}`, result.ok ? "info" : "error");
   return result;
