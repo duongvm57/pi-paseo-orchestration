@@ -1,6 +1,6 @@
 {
   "name": "pi-paseo-orchestration",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Governed Supervisor-Lead-Peer orchestration for Pi and Paseo.",
   "type": "module",
   "keywords": [

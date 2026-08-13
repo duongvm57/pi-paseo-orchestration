@@ -3169,6 +3169,27 @@ async function notebookFixture() {
   return { config, repo, env, projectId, initialized };
 }
 
+test("Notebook init is available from a Human session", async () => {
+  const config = await mkdtemp(join(tmpdir(), "ppo-human-notebook-config-"));
+  const repo = await gitRepoFixture();
+  const ext = await freshExtension();
+  try {
+    const fake = fakePi({
+      env: { PI_CODING_AGENT_DIR: config, PASEO_PROJECT_ID: "paseo-project-1" },
+      ui: { input: async () => "ppo-fixture", confirm: async () => true }
+    });
+    fake.ctx.cwd = repo.dir;
+    ext.default(fake.pi);
+    await fake.handlers.get("session_start")({ reason: "startup" }, fake.ctx);
+    const result = await fake.commands.get("ppo:notebook-init").handler("", fake.ctx);
+    assert.equal(result.ok, true, result.error);
+    assert.equal(JSON.parse(await readFile(result.paths.manifestPath, "utf8")).created_by.supervisor_agent_id, "human");
+  } finally {
+    await rm(config, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+  }
+});
+
 test("Notebook: exact project key, create-once manifest, immutable append, idempotency, conflict, and staging cleanup", async () => {
   const fixture = await notebookFixture();
   try {

@@ -168,7 +168,7 @@ The Supervisor Notebook is an optional, project-scoped history of **why** the Su
 
 It is **not** a task queue, chat channel, source of authority, current status, or automatic decision-maker. Notebook entries never grant permissions or change the project. The Notebook lives under Pi's config directory, not in the repository.
 
-Initialize it explicitly when you want this history:
+Initialize it explicitly from an ordinary Human session (or an active Supervisor) when you want this history:
 
 ```text
 /ppo:notebook-init
