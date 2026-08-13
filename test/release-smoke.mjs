@@ -2,13 +2,13 @@
 // Release smoke for pi-paseo-orchestration (Slice 8). One bounded one-shot
 // script, node stdlib only. Run: npm run release:smoke
 //
-// Against a fresh temporary copy of the package it proves:
+// Against a fresh install of the candidate npm tarball it proves:
 //   - the manifest declares exactly one extension and two skills, no adapter
 //     dependency, and no install lifecycle scripts
 //   - every required resource (extension, skills, companion guide, three
 //     private profiles) resolves from canonical loaded-module provenance and is regular,
 //     readable, nonempty, and a direct descendant without symlink escape
-//   - relocation: the same resources resolve identically from the fresh copy
+//   - relocation: the same resources resolve identically from the npm install
 //   - fail-closed provenance: a module loaded without file provenance does not
 //     fall back to cwd/repo-root/config-root/parent search
 //   - the settings command writes one closed model-routing document at a fresh
@@ -25,7 +25,7 @@
 // adapter), so the doctor ADAPTER_OBSERVER check is expected BLOCKED: the
 // smoke reports it as the exact release blocker and exits 1. A passing smoke
 // is evidence for the Human to release — never a release.
-import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -179,17 +179,24 @@ function smokeEntry(extension, manifest, projectId, projectRoot) {
 async function main() {
   console.log(`pi-paseo-orchestration release smoke\npackage root: ${packageRoot}`);
 
-  // ── fresh copy of the package (relocation target) ──
-  const copy = await mkdtemp(join(tmpdir(), "ppo-release-smoke-"));
-  for (const entry of await readdir(packageRoot)) {
-    if (entry === ".git" || entry === ".scratch" || entry === ".pi-glla" || entry === ".pi-subagents" || entry === "node_modules") continue;
-    await cp(join(packageRoot, entry), join(copy, entry), { recursive: true, force: true });
-  }
+  // ── fresh npm-tarball install (relocation target) ──
+  const packRoot = await mkdtemp(join(tmpdir(), "ppo-release-pack-"));
+  const installRoot = await mkdtemp(join(tmpdir(), "ppo-release-install-"));
+  const sourceManifest = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
+  const { stdout: packJson } = await execFileP("npm", ["pack", "--json", "--ignore-scripts", "--pack-destination", packRoot], { cwd: packageRoot });
+  const [packed] = JSON.parse(packJson);
+  const tarball = join(packRoot, packed.filename);
+  await execFileP("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--prefix", installRoot, tarball], { cwd: installRoot });
+  const copy = join(installRoot, "node_modules", sourceManifest.name);
   const copyManifest = JSON.parse(await readFile(join(copy, "package.json"), "utf8"));
+  const npmInstallOk = packed.name === sourceManifest.name && packed.version === sourceManifest.version
+    && copyManifest.name === sourceManifest.name && copyManifest.version === sourceManifest.version;
+  report("candidate npm tarball installs in a fresh root", npmInstallOk,
+    npmInstallOk ? `${copyManifest.name}@${copyManifest.version}` : "packed or installed identity mismatch");
 
-  // Load the extension from the COPY through the same data-URL seam as the
-  // hermetic suite; provenance is passed explicitly as the copy's canonical
-  // module file URL.
+  // Load the extension from the npm install through the same data-URL seam as
+  // the hermetic suite; provenance is passed explicitly as the installed
+  // module's canonical file URL.
   const extensionSource = await readFile(join(copy, copyManifest.pi.extensions[0]), "utf8");
   const extension = await import(`data:text/javascript;base64,${Buffer.from(extensionSource).toString("base64")}#release-smoke`);
   const realUrl = pathToFileURL(join(packageRoot, copyManifest.pi.extensions[0]));
@@ -198,14 +205,14 @@ async function main() {
   const realRes = await extension.resolvePackageResources(realUrl);
   report("manifest and resources resolve from the package root", realRes.ok, realRes.ok ? realRes.resources.package_root : realRes.error);
   const copyRes = await extension.resolvePackageResources(copyUrl);
-  report("resources resolve from the fresh copied root", copyRes.ok, copyRes.ok ? copyRes.resources.package_root : copyRes.error);
+  report("resources resolve from the fresh npm install", copyRes.ok, copyRes.ok ? copyRes.resources.package_root : copyRes.error);
   let relocationOk = false;
   if (realRes.ok && copyRes.ok) {
     const realDigests = await resourceDigests(realRes.resources);
     const copyDigests = await resourceDigests(copyRes.resources);
     relocationOk = realRes.resources.package_root !== copyRes.resources.package_root
       && Object.values(realDigests).join(",") === Object.values(copyDigests).join(",");
-    report("relocation: resource set and digests are identical from the copy", relocationOk,
+    report("relocation: resource set and digests are identical from the npm install", relocationOk,
       relocationOk ? `${Object.keys(realDigests).length} resources, same bytes` : "resource bytes differ between roots");
   }
   const noProvenance = await extension.resolvePackageResources();
@@ -380,13 +387,14 @@ async function main() {
     console.log(`\nRESULT: FAIL — ${failed.map((result) => result.name).join("; ")}`);
   } else if (!gate.ok) {
     const observerBlocker = gate.blockers.find((blocker) => blocker.fact === "adapter_current_agent_observer");
-    console.log(`\nRESULT: FAIL — RELEASE BLOCKER: ${observerBlocker?.condition ?? "current-agent observation is not proven"} — owner: ${observerBlocker?.owner ?? "operator"}; no fallback is accepted. Start the Paseo daemon, run the smoke with PASEO_AGENT_ID set to the exact governed agent, and re-run on the exact commit. (Missing facts install_pinned, hermetic_tests, and paseo_live are proven by the release flow's install and hermetic steps outside this script.)`);
+    console.log(`\nRESULT: FAIL — RELEASE BLOCKER: ${observerBlocker?.condition ?? "current-agent observation is not proven"} — owner: ${observerBlocker?.owner ?? "operator"}; no fallback is accepted. Start the Paseo daemon, run the smoke with PASEO_AGENT_ID set to the exact governed agent, and re-run on the exact npm package candidate. (Missing facts install_pinned, hermetic_tests, and paseo_live are proven by the release flow's Pi install and hermetic steps outside this script.)`);
   } else {
     console.log("\nRESULT: PASS — all smoke checks passed.");
   }
   process.exitCode = failed.length > 0 || !gate.ok ? 1 : 0;
 
-  await rm(copy, { recursive: true, force: true });
+  await rm(packRoot, { recursive: true, force: true });
+  await rm(installRoot, { recursive: true, force: true });
   await rm(config, { recursive: true, force: true });
   await rm(project, { recursive: true, force: true });
 }

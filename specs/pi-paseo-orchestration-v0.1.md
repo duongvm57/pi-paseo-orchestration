@@ -8,11 +8,11 @@ Pi and Paseo provide agent execution, tools, sessions, workspaces, identity, par
 
 Without a small package enforcing those distinctions, orchestration can drift into unsafe or ambiguous behavior: role identity can be inferred from prose, tools disabled by the Human can be re-enabled, grants can leak between runs, multiple writers can collide, lifecycle status can be mistaken for acceptance, Peer reports can disrupt an active Lead, and Git work can be reviewed or accepted without one immutable candidate identity. Supervisor observations can also be lost across sessions or accidentally become a second task/control plane.
 
-The package must provide practical governance without replacing Paseo, claiming sandbox-grade isolation, adding publication workflows, or importing compatibility obligations from another orchestration package. The v0.1 workflow must end at a locally accepted, exactly identified Git candidate.
+The package must provide practical governance without replacing Paseo, claiming sandbox-grade isolation, adding project-result publication workflows, or importing compatibility obligations from another orchestration package. The v0.1 workflow must end at a locally accepted, exactly identified Git candidate.
 
 ## Solution
 
-Ship one independent, full-commit-pinned, Git-installable Pi package containing one policy extension, three private Role Profiles, one Workspace Protocol authoring skill, one Human-owned role-settings command, an observation-only doctor command, and the narrow Supervisor Notebook initialization/append surfaces.
+Ship one independent, versioned public npm Pi package, installable as `npm:pi-paseo-orchestration`, containing one policy extension, three private Role Profiles, two skills, one Human-owned role-settings command, an observation-only doctor command, and the narrow Supervisor Notebook initialization/append surfaces.
 
 The Human selects exact Supervisor and Lead model/thinking tuples plus a closed allowlist of named Peer routes through the settings command. The extension activates exactly one process-latched `supervisor`, `lead`, or `peer` Role Profile from an explicit environment value. Supervisor and Lead apply their fixed tuple; Peer accepts only the exact tuple of a configured route selected per assignment, without package model defaults or automatic routing. For each run it intersects the Human's existing Pi tool baseline with the role ceiling and the current-run Task Authority Envelope, then applies the same policy at tool-call time. Missing authority leaves the role at its base capabilities; malformed, stale, mismatched, or drifted governed state fails closed. Bash remains available under a cooperative Policy Guardrail, so the package explicitly makes no filesystem, process, network, Git, identity, authentication, or sandbox guarantee.
 
@@ -39,7 +39,7 @@ Supervisor observations persist in a Human-owned, append-only, project-scoped No
 15. As a Human, I want the smallest topology appropriate to task risk, so that tiny work is not forced through ceremonial councils or mandatory review without a trigger.
 16. As a Human, I want every accepted result bound to full Git commit identities and a direct acceptance block, so that status, tests, or agent prose cannot be mistaken for acceptance.
 17. As a Human, I want dirty or unrelated checkout changes preserved untouched, so that orchestration never stashes, resets, cleans, commits, overwrites, or relocates my work.
-18. As a Human, I want package installation, update, and rollback pinned to reviewed full commit IDs, so that the loaded package bytes are reproducible.
+18. As a Human, I want package installation, update, and rollback pinned to reviewed exact npm versions with registry integrity and loaded-resource evidence, so that the loaded package bytes are reproducible.
 19. As a Human, I want `pi-mcp-adapter` installed and verified independently, so that the orchestration package does not vendor, mutate, or privately couple to the adapter.
 20. As a Human, I want doctor remediation to be advisory and manual, so that diagnosis never mutates configuration, Git, Pi, Paseo, or workspace state.
 21. As a Supervisor, I want a private Role Profile focused on observation, evidence, Human decision relay, protocol authoring, and bounded recovery, so that I do not become a project implementer or accepter.
@@ -91,15 +91,16 @@ Supervisor observations persist in a Human-owned, append-only, project-scoped No
 - v0.1 is one independent Pi package. It runs only inside Pi and adds no executable, daemon, sidecar, scheduler, queue, mailbox, task ledger, candidate registry, acceptance service, second MCP client, second orchestration runtime, or second control plane.
 - Paseo remains the sole source of lifecycle, workspace, parentage, follow-up, and timeline truth.
 - The normative behavioral source is the reference orchestration deep dive. The provisional implementation plan is non-normative. `Minnyat/paseo-pi-team` is neither a dependency nor a compatibility target.
-- Publication is absent rather than sandboxed. Push, merge, amend, force-push, pull-request creation, deploy, and package-owned workspace cleanup are not implemented.
+- Project-result publication is absent rather than sandboxed. Push, merge, amend, force-push, pull-request creation, deploy, and package-owned workspace cleanup are not implemented.
 - The package uses the domain separation between Role Profile, Workspace Protocol, Task Authority Envelope, Peer Report, Supervisor Notebook, Stable Candidate, Policy Guardrail, Authority Grant, Capability, and Local Acceptance Boundary. None of these substitutes for another.
 
 ### Installed surface
 
-- The package manifest declares exactly one extension, one Workspace Protocol authoring skill, one PPO orchestration skill, and a standard-library test script. It declares no prompts, themes, examples, install lifecycle scripts, or adapter dependency.
+- The package manifest names and versions the public `pi-paseo-orchestration` npm package, declares exactly one extension, one Workspace Protocol authoring skill, one PPO orchestration skill, a closed runtime `files` allowlist, and a standard-library test script. It declares no prompts, themes, examples, install lifecycle scripts, runtime dependency, or adapter dependency.
+- The published tarball contains only `package.json`, `README.md`, the extension, both skill resources and the Workspace Protocol guide, and the three private profiles. Tests, specs, references, scratch state, TypeScript declarations, lockfiles, and development dependencies remain source-only.
 - The extension owns role settings, activation, prompt injection, capability shaping, call-time guardrails, strict contract parsing, doctor, candidate/verdict/acceptance validation, reporting constraints, and Supervisor Notebook surfaces. No speculative extension split is introduced.
 - Three nonempty private profile resources are package data for Supervisor, Lead, and Peer. They are not discoverable Pi prompts or skills and contain no secrets.
-- README documentation covers full-commit Git installation, update, rollback, three user-renamable Paseo provider aliases, role settings, independent adapter setup, doctor invocation, the cooperative non-sandbox boundary, and release smoke verification.
+- README documentation covers npm installation with latest and exact-version forms, update, rollback, three user-renamable Paseo provider aliases, role settings, independent adapter setup, doctor invocation, the cooperative non-sandbox boundary, and release smoke verification.
 - Package resources resolve from canonical loaded-module/package provenance, never from cwd, repository root, Pi config root, Paseo workspace, or parent-directory search. Expected resources must be regular, readable, nonempty, direct descendants without symlink escape.
 
 ### Human-owned role model settings
@@ -228,11 +229,11 @@ Supervisor observations persist in a Human-owned, append-only, project-scoped No
 
 ### Installation, update, rollback, and release gate
 
-- Production installation uses Pi's Git package support with the repository URL and a reviewed full immutable commit ID. Branches, tags, abbreviated IDs, and unpinned sources are development inputs and produce provenance warnings.
-- Update means review a new full commit ID, reinstall that exact pin, start a fresh Pi/Paseo process, verify configured source/ref, managed checkout `HEAD`, extension digest, package provenance, doctor, and release smoke. Rollback repeats the flow with the prior accepted pin and changes package bytes only.
+- The public install form is `pi install npm:pi-paseo-orchestration`; reproducible governed use pins `npm:pi-paseo-orchestration@<exact-version>`. The exact version, registry integrity, installed manifest, resource digests, and loaded extension digest identify the package candidate. Unversioned npm and local/Git sources remain convenience or development inputs, not release-pin evidence.
+- A versioned npm source remains pinned during Pi package updates. Update means review and install a new exact version, start a fresh Pi/Paseo process, and verify installed name/version/integrity, extension digest, package provenance, doctor, and release smoke. Rollback repeats the flow with the prior accepted exact version and changes package bytes only.
 - `pi-mcp-adapter` is separately installed and never bundled, vendored, installed, updated, imported through private modules, or declared as a dependency. The release requires a public provenance-checkable current-agent observation capability; private-state scraping or silent downgrade is forbidden.
-- No compatibility shim, updater, release channel, migration registry, OS support matrix, standalone doctor, repair command, example workspace, or generated runtime state is added.
-- Release is blocked until fresh pinned installation and relocation succeed, all required Pi/Paseo/adapter capabilities are proven, doctor produces equivalent non-persistent TUI/RPC output, role settings apply exactly, the Notebook publication primitive passes concurrency/crash/durability/containment tests, hermetic tests pass, release smoke passes on the exact package commit, and mutation-boundary tests prove settings write only their one config file and Notebook writes only its narrow storage surface, with no project/package/Git/Paseo mutation.
+- No compatibility shim, package-owned updater, release channel, migration registry, OS support matrix, standalone doctor, repair command, example workspace, or generated runtime state is added.
+- Release is blocked until `npm pack` produces the closed tarball, a fresh tarball install resolves identical runtime resources, a fresh exact-version Pi install is proven, all required Pi/Paseo/adapter capabilities are proven, doctor produces equivalent non-persistent TUI/RPC output, role settings apply exactly, the Notebook publication primitive passes concurrency/crash/durability/containment tests, hermetic tests pass, release smoke passes on the exact npm package candidate, and mutation-boundary tests prove settings write only their one config file and Notebook writes only its narrow storage surface, with no project/package/Git/Paseo mutation.
 
 ## Testing Decisions
 
@@ -245,7 +246,7 @@ Supervisor observations persist in a Human-owned, append-only, project-scoped No
 
 ### Mandatory hermetic coverage
 
-1. **Package and relocation:** exactly one extension and two skills (Workspace Protocol authoring plus model-invoked PPO orchestration); profiles remain private; no prompt/theme/example; no adapter dependency or install script; fresh config roots, copied development roots, and unrelated cwd resolve resources; missing/empty/non-regular/symlink-escaped resources block.
+1. **Package and relocation:** public name and valid exact version; closed npm `files` allowlist; `npm pack --dry-run` contains only the manifest, README, one extension, two skills, guide, and private profiles; no prompt/theme/example, adapter dependency, runtime dependency, or install script; fresh npm-tarball installs, copied development roots, and unrelated cwd resolve identical resources; missing/empty/non-regular/symlink-escaped resources block.
 2. **Settings, activation, and policy:** settings is available without a model in passive/governed/blocked states; cancel and invalid input preserve the prior file; one confirmed complete replacement is stored only at the effective Pi config path; all three roles resolve/apply exact model and thinking; missing/unavailable/clamped or file/runtime-drifted settings block. Also cover passive/invalid role, process-latched identity/profile snapshot, complete profile override, session reset, baseline intersection, required and forbidden surfaces, no tool re-enablement, guarded outer MCP targets/arguments, unauthorized edit/write/commit, and blocked publication/deployment routes.
 3. **Strict contracts:** valid and adversarial fixtures for Task Authority Envelope, Workspace Protocol, Peer Report, Lead verdict, Local Acceptance, Notebook manifest, and Notebook entry. Unknown, duplicate, mistyped, misplaced, stale, mismatched, malformed, or unsupported-version data fails closed.
 4. **Authority lifetime and scope:** no-envelope base, run-to-run revocation, route-bound Peer/Lead/recovery grants, tool unavailable behavior, protocol mismatch, candidate-base mismatch, normalized exact scope/exclusions, traversal/absolute/glob/ambiguous/symlink rejection, and no prose-based widening.
@@ -260,12 +261,12 @@ Supervisor observations persist in a Human-owned, append-only, project-scoped No
 
 ### Release smoke
 
-- Run against the exact package commit proposed for release using fresh temporary Pi config and project directories and a clean Git repository containing a valid Workspace Protocol.
-- Install the package by full commit ID and the adapter independently; prove configured source/ref, managed checkout `HEAD`, resource paths, clean package resources, extension digest, and provenance all identify that pin.
+- Run against the exact npm package candidate proposed for release using fresh temporary Pi config and project directories and a clean Git repository containing a valid Workspace Protocol.
+- Pack and install the candidate tarball into a fresh root; prove its name/version, closed file set, registry-compatible integrity, resource paths, and extension digest. Install the exact published npm version through Pi and install the adapter independently; prove configured source, installed name/version/integrity, loaded digest, and provenance identify that pin.
 - Use the settings command to confirm one complete model-routing document, then create exact Paseo project/workspace bindings and fresh Supervisor, Lead, and Peer sessions; Peer has the exact live Lead parent, binds one configured route, and every process reports the configured effective model/thinking.
 - Invoke doctor over RPC without a model invocation in all roles and require canonical non-persistent PASS reports for repository/protocol, live agent/workspace/parent, model settings, MCP-configuration, package/adapter provenance, and effective tool facts.
 - Prove Supervisor alone exposes Notebook append, Peer lacks outer MCP, all roles lack `mcp_script`, and doctor changes no project, package, Git, session/transcript, or Paseo state.
-- When a prior accepted pin exists, verify update and rollback through fresh processes and exact source/ref/HEAD/digest/doctor checks. Retain exact commands and bounded output as release evidence outside package and Paseo runtime state.
+- When a prior accepted version exists, verify update and rollback through fresh processes and exact npm source/version/integrity/digest/doctor checks. Retain exact commands and bounded output as release evidence outside package and Paseo runtime state.
 - Notebook append behavior itself is exercised hermetically through the real registered handler; release smoke does not add a model call or test-only tool/command.
 
 ## Out of Scope
@@ -273,7 +274,7 @@ Supervisor observations persist in a Human-owned, append-only, project-scoped No
 - Compatibility, migration, or shared schemas with `Minnyat/paseo-pi-team`.
 - Multi-host routing, cross-host candidate transport, or multi-host Notebook synchronization.
 - Workspace-snapshot candidates; v0.1 accepts Git commit candidates only.
-- Push, pull-request creation, merge, deploy, package publication, or external side-effect workflows.
+- Push, pull-request creation, merge, deploy, or other project-result external side-effect workflows.
 - Browser automation, OCR, watchdogs, heartbeats, polling loops, automatic model routing, active-process model hot switching, or legacy-install cleanup.
 - A second task/session/candidate/acceptance database, scheduler, queue, daemon, mailbox, delivery receipt, report registry, or orchestration runtime.
 - A standalone doctor executable, print/JSON doctor support, persisted doctor reports, repair mode, or doctor exit-code wrapper.
@@ -283,7 +284,6 @@ Supervisor observations persist in a Human-owned, append-only, project-scoped No
 - Cryptographic Human, role, environment, provider, profile, protocol, or agent authentication.
 - Filesystem, process, network, Git, identity, or hostile-TOCTOU isolation. Those require OS/container/worktree controls outside this package.
 - Semantic proof that a Human-authored profile conforms to reference orchestration model, that protocol prose is wise, that a Lead task is truly tiny, or that objective relevance and subjective residual risk are correct.
-- npm publication in v0.1.
 
 ## Further Notes
 

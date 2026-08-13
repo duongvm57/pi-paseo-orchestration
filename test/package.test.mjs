@@ -134,6 +134,36 @@ test("manifest declares one Pi extension and the two packaged skills", () => {
   }
 });
 
+test("npm tarball is public, versioned, and contains only runtime package resources", async () => {
+  assert.equal(manifest.name, "pi-paseo-orchestration");
+  assert.match(manifest.version, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/);
+  assert.notEqual(manifest.private, true);
+  assert.deepEqual(manifest.publishConfig, { access: "public" });
+  assert.deepEqual(manifest.files, [
+    "extensions/pi-paseo-orchestration.ts",
+    "profiles/*.md",
+    "skills/ppo-orchestrate/SKILL.md",
+    "skills/workspace-protocol/SKILL.md",
+    "skills/workspace-protocol/AUTHORING-GUIDE.md",
+  ]);
+
+  const { stdout } = await execFile("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], { cwd: root });
+  const [packed] = JSON.parse(stdout);
+  assert.equal(packed.name, manifest.name);
+  assert.equal(packed.version, manifest.version);
+  assert.deepEqual(packed.files.map(({ path }) => path).sort(), [
+    "README.md",
+    "extensions/pi-paseo-orchestration.ts",
+    "package.json",
+    "profiles/lead.md",
+    "profiles/peer.md",
+    "profiles/supervisor.md",
+    "skills/ppo-orchestrate/SKILL.md",
+    "skills/workspace-protocol/AUTHORING-GUIDE.md",
+    "skills/workspace-protocol/SKILL.md",
+  ]);
+});
+
 test("declared resources and private profiles are nonempty files", async () => {
   const paths = [
     manifest.pi.extensions[0],
@@ -3574,7 +3604,7 @@ test("releaseGate fails closed on every missing fact, the absent adapter observe
   assert.equal(adapterBlocker.observed, false);
   assert.equal(adapterBlocker.owner, "operator");
   assert.match(adapterBlocker.condition, /current-agent observer/);
-  assert.match(adapterBlocker.action, /rerun the release smoke on the exact commit/);
+  assert.match(adapterBlocker.action, /rerun the release smoke on the exact npm package candidate/);
 
   // Unknown and non-boolean facts fail closed.
   const unproven = releaseGate({ ...allReleaseFacts(), install_pinned: "pending" });
@@ -3617,7 +3647,8 @@ test("release smoke script exists, is node-stdlib-only, runs, and reports the ab
   assert.equal(code, 1);
   assert.match(stdout, /RELEASE BLOCKER/);
   assert.match(stdout, /release observer probe proves current-agent observation or reports the exact blocker/);
-  assert.match(stdout, /relocation: resource set and digests are identical from the copy/);
+  assert.match(stdout, /candidate npm tarball installs in a fresh root/);
+  assert.match(stdout, /relocation: resource set and digests are identical from the npm install/);
 });
 
 test("mutation boundary: settings command, notebook init+append, and doctor touch only the expected config surfaces", async () => {

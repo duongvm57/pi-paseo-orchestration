@@ -4,7 +4,7 @@ Label: wayfinder:map
 
 ## Destination
 
-Produce `specs/pi-paseo-orchestration-v0.1.md`: an implementation-ready specification for an independent, git-installable Pi package whose orchestration model conforms to the reference orchestration deep dive and ends at a locally accepted Git candidate.
+Produce `specs/pi-paseo-orchestration-v0.1.md`: an implementation-ready specification for an independent, npm-installable Pi package whose orchestration model conforms to the reference orchestration deep dive and ends at a locally accepted Git candidate.
 
 ## Notes
 
@@ -16,7 +16,8 @@ Produce `specs/pi-paseo-orchestration-v0.1.md`: an implementation-ready specific
 - v0.1 uses Supervisor, Lead, and Peer. Paseo remains the sole lifecycle/workspace control plane.
 - Lead is read-only by default. When the Workspace Protocol permits, the Human may grant one current-run tiny-task edit/local-commit exception; difficult implementation remains Peer-owned.
 - `.orchestration/workspace-protocol.md` is mandatory; a Supervisor skill helps the Human author it.
-- Publication is absent rather than sandboxed: no push/PR/merge/deploy workflow is built.
+- Project-result publication is absent rather than sandboxed: no push/PR/merge/deploy workflow is built.
+- Public npm package distribution is supported; reproducible governed installs pin an exact reviewed version.
 - Planning only: tickets resolve decisions. Package implementation is outside this map.
 
 ## Decisions so far
@@ -33,7 +34,7 @@ Produce `specs/pi-paseo-orchestration-v0.1.md`: an implementation-ready specific
 - [Define Git candidate review and local acceptance](issues/09-define-git-candidate-review-and-local-acceptance.md) — Bind clean local Git candidates, evidence, review, Lead readiness, and direct Human acceptance to exact full commit identities; candidate drift fails closed without publication or another control plane.
 - [Define the doctor contract](issues/10-define-the-doctor-contract.md) — Probe the exact current cwd/repository/Pi/Paseo context with capability-first, role-aware readiness checks and emit closed v1 evidence plus manual-only remediation without mutation, acceptance, or security claims.
 - [Define the Supervisor notebook contract](issues/13-define-the-supervisor-notebook-contract.md) — Keep one Human-owned per-project causal notebook under Pi config, using immutable concurrent entries and exact identity/path guards without authority, acceptance, project-write, or control-plane effects.
-- [Define package distribution and verification](issues/11-define-package-distribution-and-verification.md) — Ship one full-commit-pinned Git package with one extension, three private profiles, one protocol-authoring skill, an independently installed adapter, capability-based TUI/RPC doctor checks, narrow Notebook writes, and the smallest hermetic plus release-smoke verification surface.
+- [Define package distribution and verification](issues/11-define-package-distribution-and-verification.md) — Ship one public versioned npm package with a closed runtime tarball, one extension, three private profiles, two skills, an independently installed adapter, capability-based TUI/RPC doctor checks, narrow Notebook writes, and hermetic plus release-smoke verification.
 - [Define user-owned role model settings](issues/14-define-user-owned-role-model-settings.md) — Store one complete Human-owned Supervisor/Lead/Peer model-and-thinking selection under the Pi config directory; apply and verify it fail-closed in fresh governed processes and exact child creation, with no defaults, hot switching, task-class router, or fallback.
 
 ## Not yet specified
@@ -47,5 +48,4 @@ Produce `specs/pi-paseo-orchestration-v0.1.md`: an implementation-ready specific
 - Workspace-snapshot candidates in v0.1.
 - OCR, browser automation, watchdog loops, custom model-routing classes, and legacy-install cleanup.
 - A second task/session/candidate database or orchestration runtime.
-- npm publication in v0.1.
 - Push, PR creation, merge, or deploy workflows.

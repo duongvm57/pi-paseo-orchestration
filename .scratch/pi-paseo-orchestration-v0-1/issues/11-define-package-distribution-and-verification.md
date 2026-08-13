@@ -165,3 +165,13 @@ Distribution is ready only when:
 - tests prove doctor/Notebook operations do not write project, package, Git, or Paseo state.
 
 No glossary or ADR update is required. Package layout, installation mechanics, and verification evidence are implementation/distribution terms; they add no domain concept or unresolved architecture choice beyond the existing contracts.
+
+## Comments
+
+### 2026-08-13 — superseded Git-only distribution decision
+
+The Human selected public npm distribution so installation matches other Pi packages. `pi-paseo-orchestration` is now a versioned public npm package with a closed runtime `files` allowlist. The public convenience form is `pi install npm:pi-paseo-orchestration`; governed reproducible use pins `npm:pi-paseo-orchestration@<exact-version>`. Versioned sources remain pinned during Pi package updates; update and rollback install another reviewed exact version in a fresh process.
+
+Release evidence now binds the npm package name/version, packed file set, tarball integrity, installed manifest/resource digests, and loaded extension digest. Hermetic verification runs `npm pack --dry-run`; release smoke packs and installs the candidate tarball in a fresh root; final release still requires a fresh exact-version Pi install plus the existing live Paseo/adapter evidence. The Git-only answer above remains historical context and is superseded by the npm distribution contract in the v0.1 spec.
+
+Publishing this Pi package does not add project-result publication: push, pull request, merge, and deploy remain absent.

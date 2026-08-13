@@ -4463,20 +4463,20 @@ export async function resolvePackageResources(moduleUrl = import.meta.url) {
 // the adapter, so while pi-mcp-adapter does not expose it the gate must list it
 // as a blocker. There is no fallback.
 const RELEASE_FACTS = [
-  { fact: "install_pinned", condition: "fresh pinned full-commit install proven (configured source/ref, managed checkout HEAD, and extension digest)", owner: "operator", action: "Install the reviewed full commit ID with Pi's Git package support and verify source/ref/HEAD/digest in a fresh process." },
-  { fact: "relocation", condition: "package resources resolve identically from a fresh copied root", owner: "operator", action: "Copy the package to a fresh root and verify every declared resource resolves with identical bytes." },
+  { fact: "install_pinned", condition: "fresh pinned npm-version install proven (configured npm source, installed name/version/integrity, and extension digest)", owner: "operator", action: "Install npm:pi-paseo-orchestration@<exact-version> with Pi and verify the installed package identity, registry integrity, and loaded extension digest in a fresh process." },
+  { fact: "relocation", condition: "package resources resolve identically from a fresh npm-tarball install", owner: "operator", action: "Pack and install the candidate npm tarball in a fresh root, then verify every declared resource resolves with identical bytes." },
   { fact: "doctor_tui_rpc_equivalence", condition: "doctor produces equivalent non-persistent TUI and RPC output", owner: "maintainer", action: "Run doctor in TUI and RPC modes and confirm the canonical reports match." },
   { fact: "settings_exact", condition: "model-routing settings apply exactly (fixed Supervisor/Lead selections and an allowed Peer route)", owner: "maintainer", action: "Confirm one complete settings document applies fixed role selections and the exact chosen Peer route." },
   { fact: "notebook_primitives", condition: "Notebook publication primitives pass concurrency, crash, durability, and containment tests", owner: "maintainer", action: "Run the Notebook publication tests and fix any fail-closed violation." },
   { fact: "hermetic_tests", condition: "hermetic package tests pass", owner: "maintainer", action: "Run npm test and fix every failure." },
-  { fact: "release_smoke", condition: "release smoke passes on the exact package commit", owner: "maintainer", action: "Run npm run release:smoke on the exact commit and resolve its printed blocker." },
+  { fact: "release_smoke", condition: "release smoke passes on the exact npm package candidate", owner: "maintainer", action: "Run npm run release:smoke on the exact npm package candidate and resolve its printed blocker." },
   { fact: "mutation_boundaries", condition: "mutation-boundary tests prove settings and Notebook writes stay inside their exact surfaces", owner: "maintainer", action: "Run the mutation-boundary tests and confirm no project, package, Git, or Paseo mutation." },
 ];
 
 const RELEASE_CAPABILITIES = [
   { capability: "pi_api", condition: "required Pi extension APIs (getActiveTools, setActiveTools, setModel, setThinkingLevel, getThinkingLevel) are present", owner: "operator", action: "Use a Pi process exposing the required extension APIs." },
   { capability: "paseo_live", condition: "live Paseo daemon/client identity, cwd, and typed workspace binding are observable", owner: "operator", action: "Start the Paseo daemon and client and rerun doctor until live facts are PASS." },
-  { capability: "adapter_current_agent_observer", condition: "the public current-agent observer (adapter-provided or the independently installed Paseo CLI) proves exact current-agent identity, model, thinking, parent, and cwd", owner: "operator", action: "Start the Paseo daemon, verify the exact agent identity through the installed observer, and rerun the release smoke on the exact commit." },
+  { capability: "adapter_current_agent_observer", condition: "the public current-agent observer (adapter-provided or the independently installed Paseo CLI) proves exact current-agent identity, model, thinking, parent, and cwd", owner: "operator", action: "Start the Paseo daemon, verify the exact agent identity through the installed observer, and rerun the release smoke on the exact npm package candidate." },
 ];
 
 function releaseFactState(value) {

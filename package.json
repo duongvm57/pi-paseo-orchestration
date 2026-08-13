@@ -1,10 +1,33 @@
 {
   "name": "pi-paseo-orchestration",
-  "private": true,
+  "version": "0.1.0",
+  "description": "Governed Supervisor-Lead-Peer orchestration for Pi and Paseo.",
   "type": "module",
   "keywords": [
-    "pi-package"
+    "pi-package",
+    "pi",
+    "paseo",
+    "multi-agent",
+    "orchestration"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/duongvm57/pi-paseo-orchestration.git"
+  },
+  "homepage": "https://github.com/duongvm57/pi-paseo-orchestration#readme",
+  "bugs": {
+    "url": "https://github.com/duongvm57/pi-paseo-orchestration/issues"
+  },
+  "files": [
+    "extensions/pi-paseo-orchestration.ts",
+    "profiles/*.md",
+    "skills/ppo-orchestrate/SKILL.md",
+    "skills/workspace-protocol/SKILL.md",
+    "skills/workspace-protocol/AUTHORING-GUIDE.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "test": "node --test test/package.test.mjs",
     "typecheck": "tsc --noEmit",
