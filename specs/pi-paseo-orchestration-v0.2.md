@@ -33,6 +33,10 @@ The initial Human root task and the exact Lead assignment authorize ordinary loc
 - Supervisor → Lead: evidence-backed observation only to the verified bound Lead.
 - One bounded versioned event envelope; duplicate `event_id` is idempotently ignored; receipt is an attention signal, not acceptance, and carries no authority.
 
+## Cooperative task/assignment label contract
+
+When a Lead adds cooperative task/assignment correlation labels to a new `create_agent` call, the `labels` object is closed and namespaced under `pi-paseo-orchestration.`. The only recognized keys are `pi-paseo-orchestration.task-key` and `pi-paseo-orchestration.assignment-key`; any other key is rejected drift. Labels are correlation metadata only (never authentication), and the child still inherits the exact workspace and Paseo-supplied parentage — `labels` never carries or overwrites `workspaceId`/parentage. Rejecting an unknown label key leaves the session unscathed (block the call, reuse the old closed `create_agent` shape which omits `labels`). The reconciliation side reads these labels from live inspection only when the observer supplies them; caller-supplied task/assignment values are never accepted as validation.
+
 ## MCP operation normalization
 
 Canonical and adapter-prefixed operation names route through one explicit alias map (e.g. `create_agent` and `paseo_create_agent`) and produce identical policy decisions. Server identity must be exactly Paseo; unknown prefixes/suffixes remain blocked; normalization never broadens a role allowlist.
@@ -48,6 +52,16 @@ Adds checks for `PASEO_MCP_CONNECTED`, `PASEO_REQUIRED_OPERATIONS`, `PASEO_AGENT
 ## Reconciliation and restart
 
 `createdPeerIds` is not the authoritative ownership source; Lead reconciliation selects agents whose actual Paseo parent is the current Lead and validates provider/role/task before lifecycle operations. Process-local sets are caches; restart recovery rederives from Paseo facts.
+
+A Lead lifecycle call toward a child is allowed only when live Paseo inspection proves:
+
+- `ParentAgentId` equals the current Lead;
+- provider equals the configured Peer provider (derived from the Human-configured `PI_PASEO_ORCHESTRATION_PEER_ALIAS`/Peer settings, never echoed from the child-operation caller);
+- observed `cwd` is applicable to the exact repository, and the supplied typed workspace identity reconciles when the observer provides it.
+
+Task/assignment labels are cooperative correlation metadata, not authentication credentials. The child task label is compared with the bound Lead task only when both are independently observable from live inspection; a mismatch blocks. Missing task/assignment labels on legacy children are reported as explicit bounded warnings, never a lifecycle deadlock. Assignment ID remains mandatory in Peer report and handoff correlation. Caller-supplied task/assignment values are never treated as independent validation; the closed child-operation shapes carry only `agentId` (+ `prompt` for send).
+
+Typed workspace identity is checked when the observer supplies it. When the public runtime cannot expose typed workspace identity inside the lifecycle gate, Doctor reports an exact environment ceiling and the gate never claims workspace PASS; absence alone does not block a child whose exact parent, provider and repository applicability are proven. An otherwise missing/ambiguous observation, a parent other than the current Lead, a provider mismatch, a repository mismatch, or a supplied workspace mismatch fails closed (BLOCKED).
 
 ## Acceptance
 

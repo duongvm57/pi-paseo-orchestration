@@ -808,8 +808,9 @@ test("handler: a normal Lead child lifecycle op reconciles through the integrate
   // Regression (ppo-v02-dogfood-001): dfd2ce1 wired expectedTaskId/expectedAssignmentId
   // from the closed child-operation args (which never carry them), so every normal
   // Lead follow-up/status/cancel/archive call blocked before reconciliation. The
-  // fake `paseo inspect` proves live parent/provider/repository match while the op
-  // carries only { agentId } — the closed public child-operation shape.
+  // revised contract derives the mandatory expected provider from the configured
+  // Peer alias (ppo-peer), not the op caller; the fake `paseo inspect` proves live
+  // parent/provider/repository match while the op carries only { agentId }.
   const ext = await freshExtension();
   const profiles = await profileDirFixture();
   const dir = await mkdtemp(join(tmpdir(), "ppo-recon-"));
@@ -819,7 +820,12 @@ test("handler: a normal Lead child lifecycle op reconciles through the integrate
   const previous = process.cwd();
   process.chdir(repo.dir);
   try {
-    const script = `#!/bin/sh\nif [ "$1" = "inspect" ]; then\n  printf '{"Id":"agent-42","Provider":"pi","Status":"running","Cwd":"${repo.dir}","ParentAgentId":"lead-9"}'\n  exit 0\nfi\necho "unknown command" >&2\nexit 1\n`;
+    // The child and the Lead observe identically through the fake CLI: echo the
+    // requested id so the bound-Lead task-label observation also resolves, report
+    // the configured Peer provider (ppo-peer), and omit workspaceId (unobservable
+    // at the CLI lifecycle seam → an explicit environment-ceiling warning, not a
+    // PASS and not a deadlock).
+    const script = `#!/bin/sh\nif [ "$1" = "inspect" ]; then\n  printf '{"Id":"%s","Provider":"ppo-peer","Status":"running","Cwd":"${repo.dir}","ParentAgentId":"lead-9"}' "$2"\n  exit 0\nfi\necho "unknown command" >&2\nexit 1\n`;
     await writeFile(join(bin, "paseo"), script, { mode: 0o755 });
 
     const fake = fakePi({
@@ -850,11 +856,14 @@ test("handler: a normal Lead child lifecycle op reconciles through the integrate
     for (const op of opShapes) {
       const res = await fake.handlers.get("tool_call")({ toolName: "mcp", input: op }, fake.ctx);
       assert.equal(res, undefined, `${op.tool} must pass the integrated gate (got ${JSON.stringify(res)})`);
+      // The unobservable typed workspace at the CLI seam surfaces as an explicit
+      // environment-ceiling warning (info), never a silent PASS.
+      assert.equal(fake.notifications.some(([msg, level]) => level === "info" && /typed workspace identity.*not observable/.test(msg)), true, `${op.tool} must surface the workspace environment ceiling`);
     }
 
     // A child whose live parent is NOT the current Lead still fails closed.
     const rogueBin = await mkdtemp(join(tmpdir(), "ppo-recon-rogue-"));
-    const rogue = `#!/bin/sh\nif [ "$1" = "inspect" ]; then\n  printf '{"Id":"agent-99","Provider":"pi","Status":"running","Cwd":"${repo.dir}","ParentAgentId":"someone-else"}'\n  exit 0\nfi\nexit 1\n`;
+    const rogue = `#!/bin/sh\nif [ "$1" = "inspect" ]; then\n  printf '{"Id":"agent-99","Provider":"ppo-peer","Status":"running","Cwd":"${repo.dir}","ParentAgentId":"someone-else"}'\n  exit 0\nfi\nexit 1\n`;
     await writeFile(join(rogueBin, "paseo"), rogue, { mode: 0o755 });
     try {
       const blocked = await fake.handlers.get("tool_call")({
@@ -865,6 +874,21 @@ test("handler: a normal Lead child lifecycle op reconciles through the integrate
       assert.match(blocked.reason, /does not equal the current Lead/);
     } finally {
       await rm(rogueBin, { recursive: true, force: true });
+    }
+
+    // Configured Peer provider mismatch blocks (derived from alias, not caller).
+    const otherAliasBin = await mkdtemp(join(tmpdir(), "ppo-recon-alias-"));
+    const otherAlias = `#!/bin/sh\nif [ "$1" = "inspect" ]; then\n  printf '{"Id":"agent-42","Provider":"other-peer","Status":"running","Cwd":"${repo.dir}","ParentAgentId":"lead-9"}'\n  exit 0\nfi\nexit 1\n`;
+    await writeFile(join(otherAliasBin, "paseo"), otherAlias, { mode: 0o755 });
+    try {
+      const blocked = await fake.handlers.get("tool_call")({
+        toolName: "mcp",
+        input: { server: "paseo", tool: "cancel_agent", args: { agentId: "agent-42" } },
+      }, { ...fake.ctx, env: { ...fake.ctx.env, PATH: `${otherAliasBin}:${process.env.PATH ?? ""}` } });
+      assert.equal(blocked.block, true);
+      assert.match(blocked.reason, /does not match the configured Peer provider/);
+    } finally {
+      await rm(otherAliasBin, { recursive: true, force: true });
     }
   } finally {
     process.chdir(previous);
@@ -3025,13 +3049,20 @@ test("mutation boundary: settings command, notebook init+append, and doctor touc
 // agent tuple with the fixed identity "agent-42", so requesting any other id
 // is an identity mismatch; `--version` prints a version. The fail variant
 // exits 1 like a daemon-down CLI.
-async function fakePaseoBin({ fail = false, workspaceCwd = null, rootAgent = false } = {}) {
+async function fakePaseoBin({ fail = false, workspaceCwd = null, rootAgent = false, provider = "pi", labels = null, workspaceId = null, idEcho = false } = {}) {
   const bin = await mkdtemp(join(tmpdir(), "ppo-paseo-bin-"));
   const workspace = JSON.stringify([{ workspaceId: "workspace-1", project: "paseo-project-1", cwd: workspaceCwd }]);
   const parentLiteral = rootAgent ? '"ParentAgentId":""' : '"ParentAgentId":"lead-9"';
+  const workspaceLiteral = workspaceId === null ? "" : `,"WorkspaceId":${JSON.stringify(String(workspaceId))}`;
+  const labelsLiteral = labels === null ? "" : `,"Labels":${JSON.stringify(labels)}`;
+  // The inspect payload is a literal JSON object. idEcho substitutes the
+  // requested agent id via a printf %s so a lead self-observation (reconcile)
+  // resolves to a matching identity instead of failing the observer check.
+  const idField = idEcho ? '"Id":"%s"' : '"Id":"agent-42"';
+  const trailingArg = idEcho ? ' "$2"' : "";
   const script = fail
     ? `#!/bin/sh\necho "daemon unreachable" >&2\nexit 1\n`
-    : `#!/bin/sh\nif [ "$1" = "--version" ] || [ "$1" = "-v" ]; then echo "0.3.1-test"; exit 0; fi\nif [ "$1" = "workspace" ] && [ "$2" = "ls" ]; then printf '%s' '${workspace}'; exit 0; fi\nif [ "$1" = "inspect" ]; then\n  [ -z "$2" ] && { echo "agent id required" >&2; exit 2; }\n  printf '{"Id":"agent-42","Provider":"pi","Model":"claude-sonnet-4-5","Thinking":"medium","Status":"running","Cwd":"/tmp/repo",${parentLiteral}}'\n  exit 0\nfi\necho "unknown command" >&2\nexit 1\n`;
+    : `#!/bin/sh\nif [ "$1" = "--version" ] || [ "$1" = "-v" ]; then echo "0.3.1-test"; exit 0; fi\nif [ "$1" = "workspace" ] && [ "$2" = "ls" ]; then printf '%s' '${workspace}'; exit 0; fi\nif [ "$1" = "inspect" ]; then\n  [ -z "$2" ] && { echo "agent id required" >&2; exit 2; }\n  printf '{${idField},"Provider":"${provider}","Model":"claude-sonnet-4-5","Thinking":"medium","Status":"running","Cwd":"/tmp/repo",${parentLiteral}${workspaceLiteral}${labelsLiteral}}'${trailingArg}\n  exit 0\nfi\necho "unknown command" >&2\nexit 1\n`;
   await writeFile(join(bin, "paseo"), script, { mode: 0o755 });
   return bin;
 }
@@ -3297,42 +3328,90 @@ test("activate: live root/child topology fails closed during governed activation
   }
 });
 
-test("reconcilePeerChild: a child is owned only when live Paseo parentage, provider, and repository facts match; asserted task/assignment are bound", async () => {
-  const bin = await fakePaseoBin();
+test("reconcilePeerChild: ownership requires live parent, configured provider, and repo; labels/workspace reconcile only when independently observed", async () => {
+  // Configured Peer provider `ppo-peer` with a task label on the child AND the
+  // bound Lead so the cooperative task comparison resolves and agrees.
+  const matchingLabels = { "pi-paseo-orchestration.task-key": "task-1" };
+  const okBin = await fakePaseoBin({ provider: "ppo-peer", idEcho: true, labels: matchingLabels });
+  const base = { leadAgentId: "lead-9", env: { ...process.env, PATH: okBin }, expectedRepoRoot: "/tmp/repo", expectedProvider: "ppo-peer" };
   try {
-    const env = { ...process.env, PATH: bin };
-    const base = { leadAgentId: "lead-9", env, expectedTaskId: "task-1", expectedAssignmentId: "assign-1", expectedRepoRoot: "/tmp/repo", expectedProvider: "pi" };
     const ok = await reconcilePeerChild("agent-42", base);
     assert.equal(ok.ok, true, ok.error);
-    assert.equal(ok.bound.taskId, "task-1");
+    // No caller echo: caller-supplied task/assignment never becomes a bound value.
+    assert.equal("taskId" in (ok.bound ?? {}), false);
+    assert.equal("assignmentId" in (ok.bound ?? {}), false);
+    // Typed workspace is not observable through the fake CLI seam → explicit
+    // environment-ceiling warning, not a silent PASS and not a deadlock.
+    assert.equal(ok.warnings.some((w) => /typed workspace identity.*not observable/.test(w)), true);
+    assert.equal(ok.warnings.some((w) => /task-key/.test(w)), false, "agreed task-key must not warn");
+    // Missing provider is a mandatory-fact failure (derived from config, not caller).
+    assert.equal((await reconcilePeerChild("agent-42", { ...base, expectedProvider: "" })).ok, false);
     // Wrong parent fails closed.
     const wrongLead = await reconcilePeerChild("agent-42", { ...base, leadAgentId: "lead-other" });
     assert.equal(wrongLead.ok, false);
     assert.match(wrongLead.error, /does not equal the current Lead/);
-    // Wrong provider fails closed.
+    // Configured provider mismatch fails closed.
     const wrongProvider = await reconcilePeerChild("agent-42", { ...base, expectedProvider: "openai" });
     assert.equal(wrongProvider.ok, false);
-    assert.match(wrongProvider.error, /provider .* does not match/);
+    assert.match(wrongProvider.error, /does not match the configured Peer provider/);
     // Repository mismatch fails closed.
     const wrongRepo = await reconcilePeerChild("agent-42", { ...base, expectedRepoRoot: "/other/repo" });
     assert.equal(wrongRepo.ok, false);
-    // Task/assignment are Lead-asserted workflow binding facts, not Paseo
-    // child attributes and not members of the closed child-operation shapes.
-    // When absent they are not required: the live parent/provider/repository
-    // reconciliation (mandatory) still passes, and `bound` omits them.
-    const noTask = await reconcilePeerChild("agent-42", { ...base, expectedTaskId: "" });
-    assert.equal(noTask.ok, true, noTask.error);
-    assert.equal("taskId" in noTask.bound, false);
-    assert.equal(noTask.bound.assignmentId, "assign-1");
-    const noAssign = await reconcilePeerChild("agent-42", { ...base, expectedAssignmentId: "" });
-    assert.equal(noAssign.ok, true, noAssign.error);
-    assert.equal("assignmentId" in noAssign.bound, false);
-    // When asserted, they are bound exactly as before.
-    const bothAbsent = await reconcilePeerChild("agent-42", { leadAgentId: "lead-9", env, expectedRepoRoot: "/tmp/repo" });
-    assert.equal(bothAbsent.ok, true, bothAbsent.error);
-    assert.deepEqual(bothAbsent.bound, {});
   } finally {
-    await rm(bin, { recursive: true, force: true });
+    await rm(okBin, { recursive: true, force: true });
+  }
+
+  // Missing optional correlation/workspace facts warn but never deadlock.
+  const legacyBin = await fakePaseoBin({ provider: "ppo-peer", idEcho: true });
+  try {
+    const legacy = await reconcilePeerChild("agent-42", { leadAgentId: "lead-9", env: { ...process.env, PATH: legacyBin }, expectedRepoRoot: "/tmp/repo", expectedProvider: "ppo-peer" });
+    assert.equal(legacy.ok, true, legacy.error);
+    assert.equal(legacy.warnings.some((w) => /no cooperative.*task-key/.test(w)), true, "missing legacy child task label must warn");
+    assert.equal(legacy.warnings.some((w) => /typed workspace identity.*not observable/.test(w)), true);
+  } finally {
+    await rm(legacyBin, { recursive: true, force: true });
+  }
+
+  // Supplied typed workspace mismatch blocks; no caller value is treated as validation.
+  const wsBin = await fakePaseoBin({ provider: "ppo-peer", idEcho: true, workspaceId: "wks-real" });
+  try {
+    const wsMismatch = await reconcilePeerChild("agent-42", {
+      leadAgentId: "lead-9", env: { ...process.env, PATH: wsBin }, expectedRepoRoot: "/tmp/repo", expectedProvider: "ppo-peer", expectedWorkspaceId: "wks-expected",
+    });
+    assert.equal(wsMismatch.ok, false);
+    assert.match(wsMismatch.error, /workspace .* does not match the expected workspace/);
+    const wsMatch = await reconcilePeerChild("agent-42", {
+      leadAgentId: "lead-9", env: { ...process.env, PATH: wsBin }, expectedRepoRoot: "/tmp/repo", expectedProvider: "ppo-peer", expectedWorkspaceId: "wks-real",
+    });
+    assert.equal(wsMatch.ok, true, wsMatch.error);
+    assert.equal(wsMatch.warnings.some((w) => /typed workspace identity.*not observable/.test(w)), false, "supplied observed workspace must not be warned as unobservable");
+  } finally {
+    await rm(wsBin, { recursive: true, force: true });
+  }
+
+  // Observable child task label contradicts the independently observed bound
+  // Lead task → blocks. Requires idEcho so the lead self-observation resolves.
+  const childOther = { "pi-paseo-orchestration.task-key": "task-B" };
+  const leadTaskA = { "pi-paseo-orchestration.task-key": "task-A" };
+  const mismatchBin = await fakePaseoBin({ provider: "ppo-peer", idEcho: true, labels: childOther });
+  try {
+    // With a shared fake, both child and lead report `task-B` (identical), so
+    // craft a lead-specific fake that reports `task-A` for the lead id and
+    // `task-B` for any other id.
+    const scriptOver = `#!/bin/sh\nif [ "$1" = "inspect" ]; then\n  if [ "$2" = "lead-9" ]; then printf '{"Id":"%s","Provider":"ppo-peer","Model":"claude-sonnet-4-5","Thinking":"medium","Status":"running","Cwd":"/tmp/repo","ParentAgentId":"lead-9","Labels":${JSON.stringify(leadTaskA)}}' "$2"; else printf '{"Id":"%s","Provider":"ppo-peer","Model":"claude-sonnet-4-5","Thinking":"medium","Status":"running","Cwd":"/tmp/repo","ParentAgentId":"lead-9","Labels":${JSON.stringify(childOther)}}' "$2"; fi\n  exit 0\nfi\necho "unknown command" >&2\nexit 1\n`;
+    const leadMismatchBin = await mkdtemp(join(tmpdir(), "ppo-recon-labelbin-"));
+    await writeFile(join(leadMismatchBin, "paseo"), scriptOver, { mode: 0o755 });
+    try {
+      const mismatch = await reconcilePeerChild("agent-X", {
+        leadAgentId: "lead-9", env: { ...process.env, PATH: leadMismatchBin }, expectedRepoRoot: "/tmp/repo", expectedProvider: "ppo-peer",
+      });
+      assert.equal(mismatch.ok, false);
+      assert.match(mismatch.error, /task label .* does not match the bound Lead task/);
+    } finally {
+      await rm(leadMismatchBin, { recursive: true, force: true });
+    }
+  } finally {
+    await rm(mismatchBin, { recursive: true, force: true });
   }
 });
 

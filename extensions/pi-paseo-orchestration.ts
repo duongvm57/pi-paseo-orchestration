@@ -3374,6 +3374,14 @@ export async function observePaseoCurrentAgent(agentId, { env = process.env, tim
   }
   if (!isRecord(raw)) return { ok: false, error: "paseo inspect returned a non-object payload" };
   if (raw.Id !== id) return { ok: false, error: `paseo inspect returned identity ${JSON.stringify(raw.Id)} instead of the requested agent ${JSON.stringify(id)}` };
+  // Typed workspace identity and cooperative correlation labels are consumed
+  // from the live observation when the observer supplies them. The Paseo CLI
+  // `inspect` seam does not expose either, so both remain null/absent there;
+  // reconciliation treats that exact absence as an environment ceiling (WARN),
+  // never as a verified PASS and never as a lifecycle deadlock.
+  const rawWorkspaceId = typeof raw.WorkspaceId === "string" ? raw.WorkspaceId
+    : (typeof raw.workspace_id === "string" ? raw.workspace_id : null);
+  const labels = isRecord(raw.Labels) ? raw.Labels : (isRecord(raw.labels) ? raw.labels : null);
   const observation = {
     agent_id: raw.Id,
     provider: typeof raw.Provider === "string" ? raw.Provider : null,
@@ -3384,7 +3392,8 @@ export async function observePaseoCurrentAgent(agentId, { env = process.env, tim
       model: typeof raw.Model === "string" ? raw.Model : null,
       thinkingOptionId: typeof raw.Thinking === "string" ? raw.Thinking : null,
     },
-    workspace_id: null,
+    workspace_id: rawWorkspaceId === null ? null : (rawWorkspaceId.trim() === "" ? null : rawWorkspaceId),
+    labels,
     mcp_configuration_attested: false,
     source: "paseo-cli",
   };
@@ -3421,41 +3430,60 @@ function topologyFromParentage(role, observedParentId, boundLeadId = null) {
 // adapter/config investigation.
 const REQUIRED_REMOTE_OPERATIONS = ["create_agent", "list_agents", "get_agent_status", "get_agent_activity", "send_agent_prompt"];
 
+// Cooperative correlation metadata is namespaced under one closed prefix so a
+// peer can carry a task/assignment label without claiming authentication. Only
+// task-key is reconciled against the independently observed bound Lead task;
+// assignment-key is never validated as auth here (Peer report/handoff keeps
+// its own mandatory assignment correlation).
+const COOPERATIVE_LABEL_PREFIX = "pi-paseo-orchestration.";
+const PPO_TASK_KEY = `${COOPERATIVE_LABEL_PREFIX}task-key`;
+const PPO_ASSIGNMENT_KEY = `${COOPERATIVE_LABEL_PREFIX}assignment-key`;
+
+function labelKeyOf(labels, key) {
+  return isRecord(labels) && typeof labels[key] === "string" && labels[key].trim() !== "" ? labels[key].trim() : null;
+}
+
 // Reconciles a claimed Peer child against live Paseo facts before any lifecycle
 // call (send/inspect/cancel/archive). Ownership is the actual Paseo parentage
-// of the child equal to the current Lead, plus live provider/role, task and
-// assignment binding, and workspace/repository applicability. Returns a pass
-// only when live inspection proves the exact parent chain and the mandatory
-// Peer binding facts; a missing or ambiguous observation, a parent other than
-// the current Lead, a provider/role mismatch, or a workspace/repository
-// mismatch fails closed (BLOCKED).
+// of the child equal to the current Lead, plus the configured Peer provider,
+// workspace/repository applicability, and (only when independently observable)
+// the cooperative task label. Every mandatory live fact must be proven or the
+// call fails closed (BLOCKED): a parent other than the current Lead, a
+// provider different from the configured Peer provider, a repository outside
+// applicability, a supplied typed workspace that mismatches, or a child task
+// label that contradicts the independently observed bound Lead task. Missing
+// optional facts — legacy task/assignment labels, or typed workspace the
+// observer cannot expose at this lifecycle seam — become explicit bounded
+// warnings (environment ceilings), never a silent PASS and never a global
+// lifecycle deadlock. Caller-supplied task/assignment values are NOT accepted
+// as validation: the closed child-operation shapes carry only agentId (+ prompt)
+// and the handler reconciles labels from live observation, never from op args.
 export async function reconcilePeerChild(agentId, opts) {
   const {
     leadAgentId, env = process.env,
-    expectedProvider, expectedWorkspaceId, expectedRepoRoot, expectedTaskId, expectedAssignmentId,
+    expectedProvider, expectedWorkspaceId, expectedRepoRoot,
   } = (opts ?? {});
+  const warnings = [];
   const id = (agentId ?? "").trim();
   if (id === "") return { ok: false, error: "no Peer child id to reconcile" };
   if (typeof leadAgentId !== "string" || leadAgentId.trim() === "") return { ok: false, error: "the current Lead id is required to reconcile a child" };
-  // (MANDATORY) live Paseo facts reproduced after Lead restart: repository root
-  // applicability, and below the exact parent/provider/workspace of the child.
+  // (MANDATORY) live Paseo facts reproduced after Lead restart: the configured
+  // Peer provider (derived from config, not the child-op caller), the
+  // repository-root applicability, and the exact parent of the child.
   if (typeof expectedRepoRoot !== "string" || expectedRepoRoot === "") return { ok: false, error: "the exact repository root is required to reconcile a Peer child" };
-  // task/assignment are Lead-asserted workflow binding facts, not Paseo
-  // child-agent attributes and not members of the closed public child-operation
-  // shapes (agentId [+ prompt]). The normal follow-up/status/cancel/archive path
-  // therefore cannot assert them, so they must not be mandatory inputs here.
-  // When asserted they are validated (returned bound) exactly as before.
+  if (typeof expectedProvider !== "string" || expectedProvider.trim() === "") return { ok: false, error: "the configured Peer provider is required to reconcile a Peer child" };
+  const expectedProviderNorm = expectedProvider.trim();
   const observed = await observePaseoCurrentAgent(id, { env });
   if (!observed.ok) return { ok: false, error: `child reconciliation inspection failed: ${observed.error}` };
   const obs = observed.observation;
   const parent = obs.parent_agent_id ?? null;
   if (parent === null || parent === "") return { ok: false, error: `child ${id} is not a Peer; live inspection observes no parent` };
   if (parent !== leadAgentId) return { ok: false, error: `child ${id} parent ${parent} does not equal the current Lead ${leadAgentId}` };
-  if (typeof expectedProvider === "string" && expectedProvider !== "" && obs.provider !== expectedProvider) {
-    return { ok: false, error: `child ${id} provider ${obs.provider} does not match the expected Peer provider ${expectedProvider}` };
+  if (obs.provider !== expectedProviderNorm) {
+    return { ok: false, error: `child ${id} provider ${obs.provider} does not match the configured Peer provider ${expectedProviderNorm}` };
   }
-  if (typeof expectedWorkspaceId === "string" && expectedWorkspaceId !== ""
-      && obs.workspace_id !== null && obs.workspace_id !== expectedWorkspaceId) {
+  if (obs.workspace_id !== null && typeof expectedWorkspaceId === "string" && expectedWorkspaceId !== ""
+      && obs.workspace_id !== expectedWorkspaceId) {
     return { ok: false, error: `child ${id} workspace ${obs.workspace_id} does not match the expected workspace ${expectedWorkspaceId}` };
   }
   if (typeof obs.cwd === "string" && obs.cwd !== "") {
@@ -3466,14 +3494,28 @@ export async function reconcilePeerChild(agentId, opts) {
   } else {
     return { ok: false, error: `child ${id} repository applicability is not observable from live inspection` };
   }
-  return {
-    ok: true,
-    child: obs,
-    bound: {
-      ...(typeof expectedTaskId === "string" && expectedTaskId !== "" ? { taskId: expectedTaskId } : {}),
-      ...(typeof expectedAssignmentId === "string" && expectedAssignmentId !== "" ? { assignmentId: expectedAssignmentId } : {}),
-    },
-  };
+  // Typed workspace that cannot be exposed at this lifecycle seam is an exact
+  // environment ceiling: never claimed as PASS and recorded as a warning. It
+  // does not block an otherwise proven parent/provider/repository child.
+  if (obs.workspace_id === null) {
+    warnings.push(`typed workspace identity of child ${id} is not observable through the ${obs.source ?? "current observer"} lifecycle seam; Doctor reports the environment ceiling and does not claim workspace PASS`);
+  }
+  // Cooperative task-label comparison (parent/provider/repository already
+  // proven above). Only when BOTH the child and the bound Lead task-key are
+  // independently observable does a mismatch block; a missing legacy label on
+  // either side is a bounded warning, never a lifecycle deadlock.
+  const childTask = labelKeyOf(obs.labels, PPO_TASK_KEY);
+  const leadObserved = await observePaseoCurrentAgent(leadAgentId, { env });
+  const leadTask = leadObserved.ok ? labelKeyOf(leadObserved.observation.labels, PPO_TASK_KEY) : null;
+  if (childTask !== null && leadTask !== null) {
+    if (childTask !== leadTask) {
+      return { ok: false, error: `child ${id} task label ${childTask} does not match the bound Lead task ${leadTask}` };
+    }
+  } else {
+    if (childTask === null) warnings.push(`child ${id} carries no cooperative ${PPO_TASK_KEY} label; legacy label, so it is not treated as validation (correlation only)`);
+    if (leadTask === null) warnings.push(`the current Lead carries no cooperative ${PPO_TASK_KEY} label observable at the lifecycle seam; task-label correlation is unavailable, not a PASS`);
+  }
+  return { ok: true, child: obs, warnings };
 }
 function doctorActivation(roleCheck) {
   if (!roleCheck.ok) return "blocked";
@@ -4908,28 +4950,36 @@ export default function (pi) {
     }
     // v0.2 live child reconciliation: a Lead lifecycle call toward a Peer
     // child is allowed only when live Paseo inspection proves the child's
-    // parent equals the current Lead, its provider, its workspace/repository
-    // applicability, and (when the Lead asserts them) the exact task/assignment
-    // binding. Process-local sets are only caches; restart recovery rederives
-    // the child from Paseo facts. The closed public child-operation shapes
-    // carry only agentId (+ prompt), so task/assignment are reconciled exactly
-    // when the call asserts them — never required from absent op args.
+    // parent equals the current Lead, its provider equals the configured Peer
+    // provider (derived from the latched alias, never from the child-op
+    // caller), and its workspace/repository applicability. Cooperative
+    // task/assignment labels are correlation metadata, not authentication:
+    // the closed public child-operation shapes carry only agentId (+ prompt),
+    // so no caller-supplied task/assignment value is ever treated as
+    // validation. Missing optional labels or unobservable typed workspace are
+    // surfaced as exact bounded warnings/environment ceilings, never a silent
+    // PASS and never a lifecycle deadlock. Process-local sets are only caches;
+    // restart recovery rederives the child from Paseo facts.
     let reconciledChildId = null;
     if (latch.role === "lead" && event.toolName === "mcp") {
       const op = canonicalMcpOperation(event?.input?.server, event?.input?.tool);
       if ([PASEO_CHILD_TOOLS.has(op)].some(Boolean) && typeof event?.input?.args?.agentId === "string") {
-        const args = event?.input?.args ?? {};
         const reconRepo = protocolPin?.repoRoot ?? null;
         const rec = await reconcilePeerChild(event.input.args.agentId, {
           leadAgentId: latch.agentId,
           env: envOf(ctx),
           expectedRepoRoot: reconRepo,
-          expectedTaskId: typeof args.taskId === "string" ? args.taskId : "",
-          expectedAssignmentId: typeof args.assignmentId === "string" ? args.assignmentId : "",
+          // The mandatory expected provider is the Human-configured Peer
+          // provider alias/settings (PI_PASEO_ORCHESTRATION_PEER_ALIAS),
+          // reproduced after restart — not a value echoed from op args.
+          expectedProvider: latch.peerProviderAlias ?? "",
         });
         if (!rec.ok) {
           ctx.ui?.notify?.(`Blocked ${event.toolName}: ${rec.error}`, "error");
           return { block: true, reason: rec.error };
+        }
+        for (const warning of rec.warnings ?? []) {
+          ctx.ui?.notify?.(`${event.toolName}: ${warning}`, "info");
         }
         reconciledChildId = event.input.args.agentId;
       }
