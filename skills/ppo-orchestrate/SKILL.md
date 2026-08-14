@@ -53,7 +53,7 @@ Do not poll agents. Do not expose the complete Workspace Protocol to a Peer. Do 
 
 ## Observation through bounded events
 
-The Lead sends only meaningful milestone events to its verified bound Supervisor: `LEAD_STARTED`, `PEER_BLOCKED`, `CANDIDATE_READY`, `REVIEW_COMPLETE`, `HUMAN_DECISION_REQUIRED`, `LEAD_FINISHED`. Each event triggers exactly one bounded Supervisor observation pass; the observation is returned to the Human or appended to the Notebook when useful, then the Supervisor returns to idle. Event receipt is an attention signal and not acceptance; it carries no authority.
+The Lead sends only meaningful milestone events to its verified root Supervisor through `paseo_send_agent_prompt`, using the closed event envelope as the first nonempty message content: `LEAD_STARTED`, `PEER_BLOCKED`, `CANDIDATE_READY`, `REVIEW_COMPLETE`, `HUMAN_DECISION_REQUIRED`, `LEAD_FINISHED`. The runtime live-reconciles the recipient, sender, repository, kind, and event ID before allowing the MCP call; do not bypass it with CLI `paseo send`. Each event triggers exactly one bounded Supervisor observation pass; the observation is returned to the Human or appended to the Notebook when useful, then the Supervisor returns to idle. Event receipt is an attention signal and not acceptance; it carries no authority. When the Human supplied a root Pi observer callback contract, send that observer one terminal `LEAD_FINISHED` envelope only; nonterminal observer events and non-Pi observer targets fail closed.
 
 A Peer communicates with its parent Lead only through the allowed kinds `question`, `blocked`, `dependency`, `progress`, and `handoff`, resolving the parent from Paseo parentage. A Supervisor never messages Peers, directs the Lead, or issues project acceptance.
 

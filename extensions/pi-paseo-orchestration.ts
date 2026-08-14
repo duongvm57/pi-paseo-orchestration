@@ -667,13 +667,16 @@ export function checkToolCall(toolName, input, policy) {
       if (!closedKeys(input.args, ["agentId"], op === "send_agent_prompt" ? ["prompt", "background", "notifyOnFinish"] : [])) {
         return block(`${op} arguments are not the closed child-specific shape`);
       }
-      // v0.2 live reconciliation is authoritative: a Lead lifecycle call is
-      // allowed only when live Paseo inspection proved the child's parent is
-      // the current Lead. There is no process-local ownership cache or grant.
-      if (policy.reconciledChildId !== input.args.agentId) return block(`${op} target is not reconciled as a Peer child of the current Lead`);
       if (op === "send_agent_prompt" && (typeof input.args.prompt !== "string" || input.args.prompt.trim() === "")) {
         return block("send_agent_prompt prompt must be nonempty");
       }
+      // Child lifecycle operations remain child-only. Event delivery may also
+      // target one live-reconciled root Supervisor, or a root Human observer
+      // for LEAD_FINISHED only; the runtime validates the closed envelope and
+      // recipient before setting reconciledEventRecipientId.
+      const child = policy.reconciledChildId === input.args.agentId;
+      const eventRecipient = op === "send_agent_prompt" && policy.reconciledEventRecipientId === input.args.agentId;
+      if (!child && !eventRecipient) return block(`${op} target is not reconciled as a Peer child or bounded event recipient of the current Lead`);
     }
     if (input.server === "paseo" && op === "list_agents") {
       if (!["supervisor", "lead"].includes(policy.role) || !closedKeys(input.args ?? {}, [], ["includeArchived", "cwd", "sinceHours", "statuses", "limit"])) {
@@ -4355,6 +4358,7 @@ let lastAcceptance = null;
 // one Lead per active assignment.
 let boundSupervisorId = null;
 let boundLeadId = null;
+let boundObserverId = null;
 
 let inspectionParentAgentId = null;
 
@@ -4423,45 +4427,34 @@ export async function verifyPartnerBinding(opts) {
   return { ok: true, partnerId: claimedId.trim(), taskId };
 }
 
-// Directional bounded event delivery. The recipient must be the exact verified
-// bound partner for the direction, and the kind must be in the allowed set for
-// that direction. Delivery goes through a caller-injected Paseo transport/send
-// callback exactly once; ambiguity or a failed/absent transport returns an
-// explicit failure and is never auto-retried. A duplicate event_id is
-// idempotently ignored before delivery.
-export async function sendBoundedEvent(opts) {
-  const { kind, recipientId, taskId, repoRoot, senderRole, senderAgentId, payload = {}, send } = (opts ?? {});
-  if (typeof send !== "function") {
-    return { ok: false, error: "sendBoundedEvent requires an injected Paseo transport/send callback" };
+// Directional bounded event delivery is enforced before the MCP call: exact
+// sender/recipient/repository, root topology, role, kind, and event-id dedupe.
+// The event ID is consumed before transport so ambiguous delivery is never
+// automatically retried.
+/** Live-reconciles one Lead event recipient before the MCP send call. */
+export async function reconcileLeadEventRecipient(agentId, envelope, options) {
+  const { leadAgentId, repoRoot, env = process.env } = /** @type {{ leadAgentId?: string, repoRoot?: string, env?: NodeJS.ProcessEnv }} */ (options ?? {});
+  if (envelope?.sender_agent_id !== leadAgentId) return { ok: false, error: "event sender does not match the current Lead" };
+  if (envelope?.recipient_agent_id !== agentId) return { ok: false, error: "event recipient does not match send_agent_prompt target" };
+  if (envelope?.repository_root !== repoRoot) return { ok: false, error: "event repository does not match the pinned repository" };
+  if (!EVENT_LEAD_MILESTONES.has(envelope?.kind)) return { ok: false, error: "event kind is not a Lead milestone" };
+  const observed = await observePaseoCurrentAgent(agentId, { env });
+  if (!observed.ok) return { ok: false, error: `event recipient inspection failed: ${observed.error}` };
+  const recipient = observed.observation;
+  if (recipient.parent_agent_id !== null) return { ok: false, error: "bounded event recipient must be a root agent" };
+  const cwd = recipient.cwd?.replace(/\/+$/, "");
+  const root = repoRoot?.replace(/\/+$/, "");
+  if (!cwd || !root || (cwd !== root && !cwd.startsWith(root + "/"))) return { ok: false, error: "bounded event recipient is outside the pinned repository" };
+  if (recipient.provider === "ppo-supervisor") {
+    if (boundSupervisorId !== null && boundSupervisorId !== agentId) return { ok: false, error: "event recipient does not match the bound Supervisor" };
+    boundSupervisorId = agentId;
+    return { ok: true, recipientKind: "supervisor" };
   }
-  if (senderRole === "lead") {
-    if (recipientId === null || recipientId !== boundSupervisorId) return { ok: false, error: "a Lead sends milestone events only to its verified bound Supervisor" };
-    if (!EVENT_LEAD_MILESTONES.has(kind)) return { ok: false, error: `kind ${String(kind)} is not a Lead-to-Supervisor milestone` };
-  } else if (senderRole === "supervisor") {
-    return { ok: false, error: "Supervisor is observation-only and has no agent-send transport" };
-  } else if (senderRole === "peer") {
-    if (recipientId === null || recipientId !== (inspectionParentAgentId ?? boundLeadId)) return { ok: false, error: "a Peer sends only to its actual Paseo parent Lead" };
-    if (!EVENT_PEER_MESSAGE_KINDS.has(kind)) return { ok: false, error: `kind ${String(kind)} is not an allowed Peer-to-Lead kind` };
-  } else {
-    return { ok: false, error: `unknown sender role ${String(senderRole)}` };
-  }
-  const built = buildEventEnvelope({ kind, taskId, senderAgentId: senderAgentId ?? senderRole, recipientAgentId: recipientId, repoRoot, payload });
-  if (!built.ok) return { ok: false, error: built.error ?? "invalid event envelope" };
-  const envelope = built.envelope;
-  if (envelope === undefined) return { ok: false, error: "event envelope body is missing" };
-  if (eventDedupe(envelope.event_id)) return { ok: false, error: "duplicate event_id is ignored (idempotent)" };
-  // Deliver exactly once through the injected transport. Ambiguity (error,
-  // timeout, unconfirmed, or non-delivery) is an explicit failure with no retry.
-  let delivered;
-  try {
-    delivered = await Promise.resolve(send(envelope));
-  } catch (err) {
-    return { ok: false, error: `event delivery failed: ${err.message}` };
-  }
-  if (delivered === undefined || delivered === null || (typeof delivered === "object" && delivered.ok !== true)) {
-    return { ok: false, error: "event delivery was not confirmed; ambiguous send is NOT retried" };
-  }
-  return { ok: true, envelope, delivered: delivered === true || delivered.ok === true ? true : !!delivered };
+  if (envelope.kind !== "LEAD_FINISHED") return { ok: false, error: "a Human observer receives only LEAD_FINISHED" };
+  if (recipient.provider !== "pi") return { ok: false, error: "the Human observer must be a root Pi agent" };
+  if (boundObserverId !== null && boundObserverId !== agentId) return { ok: false, error: "event recipient does not match the bound Human observer" };
+  boundObserverId = agentId;
+  return { ok: true, recipientKind: "observer" };
 }
 
 export function bindExactPartner({ supervisorId = null, leadId = null }) {
@@ -4892,6 +4885,7 @@ export default function (pi) {
   pi.on("session_start", async (_event, ctx) => {
     boundSupervisorId = null;
     boundLeadId = null;
+    boundObserverId = null;
     inspectionParentAgentId = null;
     lastPeerReport = null;
     lastAcceptance = null;
@@ -5092,9 +5086,22 @@ export default function (pi) {
     // lifecycle deadlock. Process-local sets are only caches; restart recovery
     // rederives the child from Paseo facts.
     let reconciledChildId = null;
+    let reconciledEventRecipientId = null;
     if (latch.role === "lead" && event.toolName === "mcp") {
       const op = canonicalMcpOperation(event?.input?.server, event?.input?.tool);
-      if ([PASEO_CHILD_TOOLS.has(op)].some(Boolean) && typeof event?.input?.args?.agentId === "string") {
+      const eventText = op === "send_agent_prompt" ? event?.input?.args?.prompt : null;
+      const parsedEvent = parseEventEnvelopeText(eventText);
+      if (!parsedEvent.ok) return { block: true, reason: parsedEvent.error };
+      if (parsedEvent.envelope !== null && typeof event?.input?.args?.agentId === "string") {
+        const recipient = await reconcileLeadEventRecipient(event.input.args.agentId, parsedEvent.envelope, {
+          leadAgentId: latch.agentId,
+          repoRoot: protocolPin?.repoRoot ?? null,
+          env: envOf(ctx),
+        });
+        if (!recipient.ok) return { block: true, reason: recipient.error };
+        if (eventDedupe(parsedEvent.envelope.event_id)) return { block: true, reason: "duplicate event_id is ignored (idempotent)" };
+        reconciledEventRecipientId = event.input.args.agentId;
+      } else if ([PASEO_CHILD_TOOLS.has(op)].some(Boolean) && typeof event?.input?.args?.agentId === "string") {
         const reconRepo = protocolPin?.repoRoot ?? null;
         const rec = await reconcilePeerChild(event.input.args.agentId, {
           leadAgentId: latch.agentId,
@@ -5127,6 +5134,7 @@ export default function (pi) {
       currentAgentId: latch.agentId,
       repoRoot,
       reconciledChildId,
+      reconciledEventRecipientId,
     });
     if (decision?.block) {
       ctx.ui?.notify?.(`Blocked ${event.toolName}: ${decision.reason}`, "error");

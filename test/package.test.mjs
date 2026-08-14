@@ -706,6 +706,9 @@ test("checkToolCall: Lead lifecycle routes target only live-reconciled Peer chil
   }
   assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_send_agent_prompt", args: { agentId: "peer-1", prompt: "Return exact evidence" } }, policy), undefined);
   assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_send_agent_prompt", args: { agentId: "peer-1", prompt: "" } }, policy).block, true);
+  const eventPolicy = { ...policy, reconciledChildId: null, reconciledEventRecipientId: "sup-1" };
+  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_send_agent_prompt", args: { agentId: "sup-1", prompt: "<validated event>" } }, eventPolicy), undefined);
+  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_send_agent_prompt", args: { agentId: "other", prompt: "<validated event>" } }, eventPolicy).block, true);
 });
 
 // Cooperative task/assignment labels are OPTIONAL on create_agent (legacy/
@@ -929,6 +932,24 @@ test("handler: a normal Lead child lifecycle op reconciles through the integrate
       // The unobservable typed workspace at the CLI seam surfaces as an explicit
       // environment-ceiling warning (info), never a silent PASS.
       assert.equal(fake.notifications.some(([msg, level]) => level === "info" && /typed workspace identity.*not observable/.test(msg)), true, `${op.tool} must surface the workspace environment ceiling`);
+    }
+
+    // A closed milestone envelope to a live root Supervisor passes the same
+    // integrated MCP gate without being misclassified as a Peer lifecycle call.
+    const eventBin = await mkdtemp(join(tmpdir(), "ppo-event-recipient-"));
+    const eventScript = `#!/bin/sh\nif [ "$1" = "inspect" ]; then\n  printf '{"Id":"sup-1","Provider":"ppo-supervisor","Status":"idle","Cwd":"${repo.dir}","ParentAgentId":""}'\n  exit 0\nfi\nexit 1\n`;
+    await writeFile(join(eventBin, "paseo"), eventScript, { mode: 0o755 });
+    try {
+      const event = buildEventEnvelope({ kind: "CANDIDATE_READY", taskId: "task-1", senderAgentId: "lead-9", recipientAgentId: "sup-1", repoRoot: repo.dir });
+      assert.equal(event.ok, true);
+      const prompt = `<pi-paseo-orchestration event="v1">${JSON.stringify(event.envelope)}</pi-paseo-orchestration>`;
+      const delivered = await fake.handlers.get("tool_call")({ toolName: "mcp", input: { server: "paseo", tool: "paseo_send_agent_prompt", args: { agentId: "sup-1", prompt } } }, { ...fake.ctx, env: { ...fake.ctx.env, PATH: `${eventBin}:${process.env.PATH ?? ""}` } });
+      assert.equal(delivered, undefined, JSON.stringify(delivered));
+      const duplicate = await fake.handlers.get("tool_call")({ toolName: "mcp", input: { server: "paseo", tool: "paseo_send_agent_prompt", args: { agentId: "sup-1", prompt } } }, { ...fake.ctx, env: { ...fake.ctx.env, PATH: `${eventBin}:${process.env.PATH ?? ""}` } });
+      assert.equal(duplicate.block, true);
+      assert.match(duplicate.reason, /duplicate event_id/);
+    } finally {
+      await rm(eventBin, { recursive: true, force: true });
     }
 
     // A child whose live parent is NOT the current Lead still fails closed.
@@ -1968,7 +1989,7 @@ const {
   observePaseoCurrentAgent,
   reconcilePeerChild,
   verifyPartnerBinding,
-  sendBoundedEvent,
+  reconcileLeadEventRecipient,
   bindExactPartner,
   buildEventEnvelope,
   validateEventEnvelope,
@@ -3652,42 +3673,29 @@ test("verifyPartnerBinding: root role/provider/repository partner binds only aft
   }
 });
 
-test("sendBoundedEvent delivers exactly once through an injected transport; ambiguity fails closed", async () => {
-  // No injected transport fails closed.
-  assert.equal((await sendBoundedEvent({ kind: "LEAD_STARTED", recipientId: "sup-1", taskId: "t", repoRoot: "/r", senderRole: "lead" })).ok, false);
-  // A Lead can only send milestones to its verified bound Supervisor.
-  const sendFns = [];
-  const confirmSend = async () => true;
-  const leadRes = await sendBoundedEvent({ kind: "LEAD_STARTED", recipientId: "sup-1", taskId: "t", repoRoot: "/r", senderRole: "lead", send: confirmSend });
-  assert.equal(leadRes.ok, false, "no bound Supervisor yet");
+test("reconcileLeadEventRecipient permits root Supervisor milestones and root observer completion only", async () => {
   bindExactPartner({ supervisorId: "sup-1" });
-  const leadOk = await sendBoundedEvent({ kind: "LEAD_STARTED", recipientId: "sup-1", taskId: "t", repoRoot: "/r", senderRole: "lead", send: async (env) => { sendFns.push(env); return true; } });
-  assert.equal(leadOk.ok, true);
-  assert.equal(sendFns.length, 1, "delivered exactly once");
-  // A fresh envelope always mints a new event_id; idempotent dedupe is on a
-  // delivered envelope (covered by eventDedupe unit checks below).
-  const envelope = buildEventEnvelope({ kind: "CANDIDATE_READY", taskId: "t", senderAgentId: "lead-1", recipientAgentId: "sup-1", repoRoot: "/r" });
-  assert.equal(envelope.ok, true);
-  assert.equal(eventDedupe(envelope.envelope.event_id), false);
-  assert.equal(eventDedupe(envelope.envelope.event_id), true, "same event_id is idempotently ignored");
-  // Ambiguous send (no confirmation) is an explicit failure, never retried.
-  const ambiguous = await sendBoundedEvent({ kind: "CANDIDATE_READY", recipientId: "sup-1", taskId: "t", repoRoot: "/r", senderRole: "lead", send: async () => undefined });
-  assert.equal(ambiguous.ok, false);
-  assert.match(ambiguous.error, /not confirmed/);
-  const throwing = await sendBoundedEvent({ kind: "CANDIDATE_READY", recipientId: "sup-1", taskId: "t", repoRoot: "/r", senderRole: "lead", send: async () => { throw new Error("down"); } });
-  assert.equal(throwing.ok, false);
-  // Peer parent message path: a Peer sends only to its actual parent Lead.
-  const peerRes = await sendBoundedEvent({ kind: "handoff", recipientId: "any", taskId: "t2", repoRoot: "/r", senderRole: "peer", send: async () => true });
-  assert.equal(peerRes.ok, false);
-  assert.match(peerRes.error, /only to its actual Paseo parent/);
-  bindExactPartner({ leadId: "lead-7" });
-  const peerOk = await sendBoundedEvent({ kind: "handoff", recipientId: "lead-7", taskId: "t2", repoRoot: "/r", senderRole: "peer", send: async () => true, senderAgentId: "peer-1" });
-  assert.equal(peerOk.ok, true, peerOk.error);
-  // Supervisor is observation-only and has no outbound agent transport.
-  const supRes = await sendBoundedEvent({ kind: "observation", recipientId: "lead-7", taskId: "t3", repoRoot: "/r", senderRole: "supervisor", send: async () => true });
-  assert.equal(supRes.ok, false);
-  assert.match(supRes.error, /observation-only/);
+  const supervisorBin = await fakePaseoBin({ rootAgent: true, provider: "ppo-supervisor", idEcho: true });
+  const observerBin = await fakePaseoBin({ rootAgent: true, provider: "pi", idEcho: true });
+  const base = { version: 1, event_id: "event-1", task_id: "task-1", sender_agent_id: "lead-1", repository_root: "/tmp/repo", payload: {} };
+  try {
+    const sup = await reconcileLeadEventRecipient("sup-1", { ...base, kind: "CANDIDATE_READY", recipient_agent_id: "sup-1" }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: supervisorBin } });
+    assert.equal(sup.ok, true, sup.error);
+    assert.equal(sup.recipientKind, "supervisor");
+    const observer = await reconcileLeadEventRecipient("human-1", { ...base, kind: "LEAD_FINISHED", recipient_agent_id: "human-1" }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: observerBin } });
+    assert.equal(observer.ok, true, observer.error);
+    assert.equal(observer.recipientKind, "observer");
+    const early = await reconcileLeadEventRecipient("human-1", { ...base, kind: "LEAD_STARTED", recipient_agent_id: "human-1" }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: observerBin } });
+    assert.equal(early.ok, false);
+    assert.match(early.error, /only LEAD_FINISHED/);
+    const forged = await reconcileLeadEventRecipient("sup-1", { ...base, kind: "LEAD_FINISHED", sender_agent_id: "other-lead", recipient_agent_id: "sup-1" }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: supervisorBin } });
+    assert.equal(forged.ok, false);
+  } finally {
+    await rm(supervisorBin, { recursive: true, force: true });
+    await rm(observerBin, { recursive: true, force: true });
+  }
 });
+
 // Provenance capture was removed in the resolved Human model: ordinary local
 // reversible work needs no runtime-captured authority, spec marker, digest,
 // or grant. The following tests assert the removal and the direct allowance.
