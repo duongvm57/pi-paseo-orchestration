@@ -3817,9 +3817,9 @@ export async function buildDoctorReport(options = {}) {
   const leadSupervisorStatus = (leadNeedsSupervisor || supervisorNeedsLead) ? ((leadNeedsSupervisor ? boundSupervisorId : boundLeadId) !== null ? "PASS" : "BLOCKED") : "WARN";
   checks.push(doctorCheck("LEAD_SUPERVISOR_BINDING", "Lead ↔ bound Supervisor binding", leadSupervisorStatus, "one exact Supervisor bound to a Lead and revalidated from Paseo facts", (leadNeedsSupervisor || supervisorNeedsLead) ? (leadNeedsSupervisor ? (boundSupervisorId ?? "no Supervisor bound") : (boundLeadId ?? "no bound Lead")) : "not applicable", [{ kind: "memory", source: "process binding cache", output: leadNeedsSupervisor ? boundSupervisorId : boundLeadId }], { owner: "human", action: "Bind exactly one Supervisor to this Lead through live Paseo inspection before governed work.", applicable: role !== null, required: leadNeedsSupervisor || supervisorNeedsLead }));
 
-  const eventCapability = (role === "lead" || role === "supervisor") && typeof pi?.sendEvent === "function";
-  const eventStatus = role ? (eventCapability ? "PASS" : "BLOCKED") : "WARN";
-  checks.push(doctorCheck("EVENT_CAPABILITIES", "bounded event transport capability", eventStatus, role ? "the role can emit bounded milestone events with idempotency" : "event transport is not required in passive mode", role ? (eventCapability ? "event transport present" : "no event transport capability is observable") : "not applicable", [{ kind: "api", source: "Pi extension API", output: eventCapability ? "present" : "absent" }], { owner: "operator", action: "Expose a bounded event transport before governed event-driven orchestration; no continuous polling or heartbeat.", applicable: role !== null, required: role !== null }));
+  const eventCapability = role === "lead" && typeof pi?.sendEvent === "function";
+  const eventStatus = role === "lead" ? (eventCapability ? "PASS" : "BLOCKED") : (role ? "PASS" : "WARN");
+  checks.push(doctorCheck("EVENT_CAPABILITIES", "bounded event transport capability", eventStatus, role === "lead" ? "Lead can emit bounded milestone events with idempotency" : "Supervisor and Peer have no outbound event transport requirement", role === "lead" ? (eventCapability ? "event transport present" : "no event transport capability is observable") : "not applicable", [{ kind: "api", source: "Pi extension API", output: eventCapability ? "present" : "absent" }], { owner: "operator", action: "Expose a bounded event transport before governed Lead milestone delivery.", applicable: role === "lead", required: role === "lead" }));
 
   checks.sort((left, right) => left.code.localeCompare(right.code));
   const overall = checks.reduce((worst, check) => DOCTOR_STATUS_RANK[check.status] > DOCTOR_STATUS_RANK[worst] ? check.status : worst, role === null ? "WARN" : "PASS");
@@ -4438,8 +4438,7 @@ export async function sendBoundedEvent(opts) {
     if (recipientId === null || recipientId !== boundSupervisorId) return { ok: false, error: "a Lead sends milestone events only to its verified bound Supervisor" };
     if (!EVENT_LEAD_MILESTONES.has(kind)) return { ok: false, error: `kind ${String(kind)} is not a Lead-to-Supervisor milestone` };
   } else if (senderRole === "supervisor") {
-    if (recipientId === null || recipientId !== boundLeadId) return { ok: false, error: "a Supervisor sends observations only to its verified bound Lead" };
-    if (kind !== "observation") return { ok: false, error: `kind ${String(kind)} is not an allowed Supervisor observation` };
+    return { ok: false, error: "Supervisor is observation-only and has no agent-send transport" };
   } else if (senderRole === "peer") {
     if (recipientId === null || recipientId !== (inspectionParentAgentId ?? boundLeadId)) return { ok: false, error: "a Peer sends only to its actual Paseo parent Lead" };
     if (!EVENT_PEER_MESSAGE_KINDS.has(kind)) return { ok: false, error: `kind ${String(kind)} is not an allowed Peer-to-Lead kind` };

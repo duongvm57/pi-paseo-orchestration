@@ -30,7 +30,7 @@ The initial Human root task and the exact Lead assignment authorize ordinary loc
 
 - Peer → Lead: narrow parent-scoped kinds `question`, `blocked`, `dependency`, `progress`, `handoff`, resolved from Paseo parentage.
 - Lead → Supervisor: milestone events `LEAD_STARTED`, `PEER_BLOCKED`, `CANDIDATE_READY`, `REVIEW_COMPLETE`, `HUMAN_DECISION_REQUIRED`, `LEAD_FINISHED`.
-- Supervisor → Lead: evidence-backed observation only to the verified bound Lead.
+- Supervisor → Human/Notebook: evidence-backed observation; Supervisor has no agent-send tool.
 - One bounded versioned event envelope; duplicate `event_id` is idempotently ignored; receipt is an attention signal, not acceptance, and carries no authority.
 
 ## Cooperative task/assignment label contract

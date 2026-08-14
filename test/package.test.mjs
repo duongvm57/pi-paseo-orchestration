@@ -3683,9 +3683,10 @@ test("sendBoundedEvent delivers exactly once through an injected transport; ambi
   bindExactPartner({ leadId: "lead-7" });
   const peerOk = await sendBoundedEvent({ kind: "handoff", recipientId: "lead-7", taskId: "t2", repoRoot: "/r", senderRole: "peer", send: async () => true, senderAgentId: "peer-1" });
   assert.equal(peerOk.ok, true, peerOk.error);
-  // Supervisor observation path: only to its verified bound Lead.
+  // Supervisor is observation-only and has no outbound agent transport.
   const supRes = await sendBoundedEvent({ kind: "observation", recipientId: "lead-7", taskId: "t3", repoRoot: "/r", senderRole: "supervisor", send: async () => true });
-  assert.equal(supRes.ok, true, supRes.error);
+  assert.equal(supRes.ok, false);
+  assert.match(supRes.error, /observation-only/);
 });
 // Provenance capture was removed in the resolved Human model: ordinary local
 // reversible work needs no runtime-captured authority, spec marker, digest,

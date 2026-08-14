@@ -28,7 +28,7 @@ A Lead receives the Human task directly as a root agent. A Supervisor is created
 ## Supervisor binding
 
 1. The Supervisor inspects itself and the bound Lead; both must be root agents.
-2. The Supervisor sends one bounded `SUPERVISOR_BOUND` message to the exact Lead containing the schema version, event ID, Supervisor agent ID, Lead agent ID, task ID, repository root, and workspace identity when required.
+2. The Human announces the exact Supervisor agent ID to the Lead; Supervisor is observation-only and has no agent-send tool.
 3. The Lead inspects the claimed Supervisor and verifies role, root parentage, repository/workspace applicability, and task binding against live Paseo facts before accepting. Process memory is only a cache; restart recovery revalidates against Paseo facts.
 
 ## Lead workflow
@@ -53,9 +53,9 @@ Do not poll agents. Do not expose the complete Workspace Protocol to a Peer. Do 
 
 ## Observation through bounded events
 
-The Lead sends only meaningful milestone events to its verified bound Supervisor: `LEAD_STARTED`, `PEER_BLOCKED`, `CANDIDATE_READY`, `REVIEW_COMPLETE`, `HUMAN_DECISION_REQUIRED`, `LEAD_FINISHED`. Each event triggers exactly one bounded Supervisor observation pass; the Supervisor may send an evidence-backed observation to the bound Lead and append Notebook evidence when useful, then returns to idle. Event receipt is an attention signal and not acceptance; it carries no authority.
+The Lead sends only meaningful milestone events to its verified bound Supervisor: `LEAD_STARTED`, `PEER_BLOCKED`, `CANDIDATE_READY`, `REVIEW_COMPLETE`, `HUMAN_DECISION_REQUIRED`, `LEAD_FINISHED`. Each event triggers exactly one bounded Supervisor observation pass; the observation is returned to the Human or appended to the Notebook when useful, then the Supervisor returns to idle. Event receipt is an attention signal and not acceptance; it carries no authority.
 
-A Peer communicates with its parent Lead only through the allowed kinds `question`, `blocked`, `dependency`, `progress`, and `handoff`, resolving the parent from Paseo parentage. A Supervisor sends observations only to its one verified bound Lead and never directs Peers or issues project acceptance.
+A Peer communicates with its parent Lead only through the allowed kinds `question`, `blocked`, `dependency`, `progress`, and `handoff`, resolving the parent from Paseo parentage. A Supervisor never messages Peers, directs the Lead, or issues project acceptance.
 
 ## Peer assignment contract
 

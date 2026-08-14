@@ -50,10 +50,10 @@ The Human creates the team directly; there is no coordinator and no `/ppo:bootst
 
 1. **Create the Lead.** From a Human shell without `PASEO_AGENT_ID`, or through the Paseo UI, create a `ppo-lead` agent in the intended repository/workspace and supply the Human task as its initial prompt. The Lead is a root agent.
 2. **Create the Supervisor.** After obtaining the exact Lead agent ID, create a `ppo-supervisor` root agent and supply an assignment binding the exact Lead agent ID, the exact Human task/task ID, the exact repository root, and the expected workspace binding.
-3. **Bind Supervisor and Lead.** The Supervisor sends one bounded `SUPERVISOR_BOUND` message to the exact Lead, which verifies the claimed Supervisor's role, root parentage, repository/workspace applicability, and task binding before accepting.
+3. **Bind Supervisor and Lead.** The Human announces the exact Supervisor agent ID to the Lead. The Lead verifies that Supervisor's role, root parentage, repository/workspace applicability, and task binding before accepting it. Supervisor is observation-only and has no agent-send tool.
 4. **The Lead creates Peer children** through `paseo_create_agent`. Every Peer has `ParentAgentId` equal to the Lead and receives one bounded assignment.
 
-The Lead delegates bounded assignments to Peer children and returns the final candidate to the Human for local acceptance. Lead and Supervisor must both be root agents (`ParentAgentId = null`); a parented Lead or Supervisor fails closed before governed work, and a root or wrong-parent Peer is `BLOCKED`.
+The Lead delegates bounded assignments to Peer children and returns the final candidate to the Human for local acceptance. Lead and Supervisor must both be root agents (`ParentAgentId = null`); a parented Lead or Supervisor fails closed before governed work, and a root or wrong-parent Peer is `BLOCKED`. Root launch does not automatically subscribe another Pi harness to completion: when a harness must receive the result, it sends one bounded prompt after launch containing its exact observer agent ID and callback contract; an interactive Human may instead observe the root agents in Paseo.
 
 ## How it works
 
@@ -107,7 +107,7 @@ You may pin a tag or full commit SHA when you need an immutable version:
 pi install git:github.com/duongvm57/pi-paseo-orchestration@<tag-or-full-sha>
 ```
 
-After changing package version or source, restart Pi/Paseo. `pi-mcp-adapter` remains a separate installation; this package does not add or update it.
+After changing package version or source, restart Pi/Paseo. Wait until `paseo status` reports the daemon reachable, then reconnect the injected Paseo MCP server once; if it is still unavailable, fail fast with that exact evidence rather than polling or silently falling back to CLI. `pi-mcp-adapter` remains a separate installation; this package does not add or update it.
 
 ## Set up
 
@@ -128,7 +128,7 @@ Choose the Supervisor and Lead models, then configure the built-in Peer routes:
 - `architecture`
 - `reviewer`
 
-Custom Peer routes are also supported. Run `/ppo:settings` again and choose **Paseo profiles** to install or update these providers without changing unrelated Paseo configuration:
+Custom Peer routes are also supported. Use a capable model for Lead orchestration; cheaper models are appropriate for bounded Peer work when they can follow the assignment contract. Run `/ppo:settings` again and choose **Paseo profiles** to install or update these providers without changing unrelated Paseo configuration:
 
 - `ppo-supervisor`
 - `ppo-lead`

@@ -1,7 +1,7 @@
 # Manual Root Team — v0.2 Specification
 
 Type: implementation spec
-Status: proposed
+Status: implemented; pending Human Local Acceptance and publication
 Spec version: 2
 Target package version: 0.2.0
 
@@ -73,15 +73,7 @@ The Supervisor must inspect itself and the Lead. Both must be root agents. Missi
 
 ### 3. Bind Supervisor and Lead
 
-The Supervisor sends one bounded `SUPERVISOR_BOUND` message to the exact Lead. It contains:
-
-- schema version;
-- event ID;
-- Supervisor agent ID;
-- Lead agent ID;
-- task ID;
-- repository root;
-- workspace identity when required.
+The Human announces the exact Supervisor agent ID to the Lead. Supervisor is observation-only and has no agent-send tool.
 
 The Lead inspects the claimed Supervisor and verifies its role, root parentage, repository/workspace applicability, and task binding before accepting the binding. Process memory is only a cache; restart recovery must reconcile against Paseo facts.
 
@@ -174,9 +166,9 @@ Allowed message kinds:
 
 Lead may send milestone events only to its verified bound Supervisor.
 
-### Supervisor → Lead
+### Supervisor observations
 
-Allow Supervisor to send observations only to its verified bound Lead. Observations may contain evidence, uncertainty, question, impact, recommendation, or a relayed Human decision. They may not grant authority or direct Peers.
+Supervisor returns observations to the Human or appends them to the Notebook when useful. Observations may contain evidence, uncertainty, question, impact, or recommendation. They may not grant authority, direct the Lead, or direct Peers.
 
 ### Event envelope
 
@@ -332,8 +324,8 @@ This is a breaking topology/command change and targets package `0.2.0` with spec
 1. Remove bootstrap command, coordinator workflow and dead supporting code.
 2. Update package/skill descriptions and README for direct Human creation.
 3. Add self-inspection and root/child topology validation.
-4. Implement Supervisor→bound-Lead observation transport and guards.
-5. Implement Lead↔Supervisor handshake and reconciliation.
+4. Keep Supervisor observation-only and Human-facing.
+5. Implement Human-announced Lead↔Supervisor binding and reconciliation.
 6. Implement bounded milestone envelopes and event handling.
 7. Implement Peer→parent-Lead communication from Paseo parentage.
 8. Replace authoritative `createdPeerIds` checks with Paseo reconciliation.
@@ -372,7 +364,7 @@ All commands must pass in the supported release environment. Expected live-envir
 9. A wrong parent/provider/repository or an observable task-label mismatch blocks; missing task/assignment labels or unavailable typed workspace are explicit warnings/Doctor ceilings, not silent PASS and not global lifecycle deadlocks.
 10. Supervisor restart revalidates the Lead binding.
 11. Lead accepts only a verified root Supervisor binding.
-12. Supervisor sends observation only to its bound Lead.
+12. Supervisor returns observations to the Human or Notebook and cannot message Peers.
 13. Lead sends milestones only to its bound Supervisor.
 14. Duplicate/stale/out-of-order events do not grant authority or acceptance.
 15. Delivery ambiguity does not cause automatic duplicate sends.
@@ -397,7 +389,7 @@ Chỉ nghiệm thu phiên bản `0.2.0` khi quan sát được toàn bộ kết 
 
 - Human có thể tạo trực tiếp một Lead root và một Supervisor root bằng Paseo UI hoặc `paseo run`; không cần coordinator hay `/ppo:bootstrap`.
 - Lead và Supervisor có `ParentAgentId = null`; role root có parent bị chặn trước governed work.
-- Supervisor bind đúng một Lead bằng live Paseo evidence, gửi observation được tới Lead đó và bị chặn khi nhắm agent khác.
+- Human báo exact Supervisor ID cho Lead; Lead bind đúng Supervisor bằng live Paseo evidence. Supervisor trả observation cho Human hoặc Notebook và không có agent-send tool.
 - Lead tạo được Peer child; Peer có `ParentAgentId` đúng Lead và bị chặn nếu root hoặc thuộc parent khác.
 - Peer hỏi/báo blocker/handoff được tới parent Lead thực tế mà không dựa vào Lead ID chỉ có trong prompt.
 - Sau restart, Lead tìm lại đúng Peer children và Supervisor binding từ Paseo; process-local memory không phải nguồn ownership duy nhất.

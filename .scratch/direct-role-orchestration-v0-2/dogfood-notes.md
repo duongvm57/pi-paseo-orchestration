@@ -21,6 +21,7 @@ Record only observed runtime behavior. Each unresolved product issue must be fix
 - Observation: initial MCP server status was `configured but not connected`; explicit reconnect exposed all 38 Paseo tools and subsequent calls succeeded.
 - Impact: a role that treats initial disconnected status as permanent would block valid work.
 - Required v0.2 behavior: doctor may perform one bounded reconnect attempt, then fail fast with exact evidence; no repeated polling or config archaeology.
+- Resolution: README now records the one-attempt reconnect/fail-fast operating rule. Doctor remains observation-only and reports the exact operator action.
 
 ### DOGFOOD-003 — Requested model and runtime model differ
 
@@ -34,6 +35,7 @@ Record only observed runtime behavior. Each unresolved product issue must be fix
 - Impact: if the harness simply returns idle after launch, it may not receive root-agent completion automatically.
 - Mitigation used: harness sent one bounded prompt to each root through `paseo_send_agent_prompt`. Paseo confirmed that the harness will be notified when the prompted agent finishes/errors/needs permission. Lead and Supervisor were also given an exact callback contract for candidate, blocker, Human-decision and completion events, with one-shot CLI fallback if v0.1 target policy blocks MCP send.
 - Required v0.2 behavior: the Human-created-root flow must explicitly establish and test milestone/completion delivery; successful launch without a return event route is not ready.
+- Resolution: README now states that root launch does not auto-subscribe a harness; a harness sends one bounded prompt carrying its exact observer ID and callback contract, while an interactive Human may observe through Paseo.
 
 ### DOGFOOD-005 — Active-turn sleep was used instead of returning idle for child notification
 
@@ -120,12 +122,14 @@ The Human-facing Pi package source was temporarily switched from the main checko
 
 - Mechanism: Paseo injects the `paseo` MCP server into Pi agents through a temporary `--mcp-config` file (the static `~/.pi/agent/mcp.json` is empty). The server connects to the daemon on `127.0.0.1:6767`; pi-mcp-adapter defaults to `lifecycle: lazy` (no auto-reconnect), so a daemon restart drops the connection.
 - Operating rule: after `paseo restart`, first wait until `paseo status` reports `running`/`reachable`, then call `mcp({ connect: "paseo" })`; if it fails with "Tool mcp not found", wait 5-10s and retry — the MCP gateway needs the daemon ready before it can reconnect. Do not fall back to the CLI silently without attempting this.
+- Resolution: the supported README workflow now records daemon-ready-before-reconnect and one-attempt fail-fast behavior.
 
 ### DOGFOOD-015 — Cheap models cannot drive the MCP outer gate; Lead/Supervisor need a capable model
 
 - Live E2E with all roles on `deepseek-v4-flash` (wks_81c1c1dfc3e1f6a3): both root Lead `8c233db6` and root Supervisor `1f769a76` activated (defer fix worked, no silent block), but then spun calling the outer `mcp` tool with wrong shapes (`paseo_get_agent` vs canonical `get_agent_status`, `agent_id` vs `agentId`) and got correctly blocked by the fail-closed gate; they never self-corrected and produced no Peer.
 - Conclusion: the MCP gate is working as designed; `deepseek-v4-flash` is too weak to drive the outer MCP protocol. Keep cheap models for Peer work; Lead/Supervisor orchestration needs a capable model (e.g. `gpt-5.6-luna`) or a better-described MCP contract for weak models.
 - Follow-up options: (a) retry E2E with Lead/Supervisor on a capable model, Peers cheap; (b) improve the extension prompt surface so weak models call the outer MCP gate correctly.
+- Resolution: commit `98ec274` added the exact outer MCP call contract, DOGFOOD-017 passed with a capable Lead, and README now recommends capable Lead models while retaining cheap bounded Peers.
 
 ### DOGFOOD-016 — Unrecorded operational friction from the live runs
 
@@ -141,11 +145,5 @@ The Human-facing Pi package source was temporarily switched from the main checko
 - Run (wks_5f997a22e09055ae): root Lead `173f1530` (gpt-5.6-luna), root Supervisor `41c97bdb` (deepseek-v4-flash, observation-only), Engineer Peer `9e8c3239` (deepseek-v4-flash), Reviewer Peer `b4a5117` (gpt-5.6-sol minimal).
 - Sequence: Lead activation+verify idle → Human announced Supervisor ID to Lead (correct binding path; Supervisor has no send tool by design) → Lead verified Supervisor live → created Engineer (route general) → Engineer wrote `LIVE_DOGFOOD.md` byte-exact (27 bytes) and committed `29292bd8` → returned strict v1 HANDOFF report (after one Lead-requested correlation fix: report-1 used assignment ID as peer_agent_id; report-2 used the real agent ID) → Lead created independent Reviewer → Reviewer APPROVE, no findings → Lead sent READY callback v1 to observer `303bf336` with candidate_ref `git:v1:6c33e9ca:29292bd8`.
 - MCP contract prompt fix (`98ec274`) is what let the Lead drive `paseo_create_agent` correctly; before it, weak models called the outer mcp tool with wrong shapes.
-- Remaining notes: first Supervisor spawn was cancelled after I mistakenly prompted it to "send SUPERVISOR_BOUND" (impossible by design — Supervisor gate has only read tools); Human announcement is the real binding path. Local Acceptance and publication were not performed.
-
-
-- Root cause: fresh governed root agents failed closed during `session_start` when self/topology observation could not yet see the newly created Paseo agent, then the sticky block made the first input look like a silently spinning turn (`LastUsage: null`, zero activity).
-- Fix `50b4e97` surfaced every block as a machine-visible custom message (`pi-paseo-orchestration-blocked`), proving the block existed but was hidden.
-- Fix `cb0a877` defers topology observation to the first input: `session_start` marks activation pending when parentage is not yet observable; the `input` handler retries activation once, then runs the normal gates. Fail-closed semantics are unchanged — a retry that still cannot observe topology reports the exact reason.
-- Live verification (deepseek-v4-flash, ~$0.0005): fresh `ppo-lead` agent returned `PONG`; pre-fix it blocked with "governed lead activation requires live Paseo self/topology evidence". Regression test "fresh governed activation defers topology observation to first input" added; full suite 96/96 pass.
-- Main repo now carries the full v0.2 candidate (merge a820437); package source stays pointed at the main checkout.
+- Remaining notes: first Supervisor spawn was cancelled after I mistakenly prompted it to "send SUPERVISOR_BOUND" (impossible by design — Supervisor gate has only read tools); Human announcement is the real binding path. README, spec, skill, and Supervisor profile now match that verified contract.
+- Human-only remaining actions: Local Acceptance and npm publication were not performed. The public npm version remains `0.1.1`; repository candidate version is `0.2.0`.
