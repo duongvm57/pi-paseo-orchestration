@@ -121,6 +121,12 @@ The Human-facing Pi package source was temporarily switched from the main checko
 - Mechanism: Paseo injects the `paseo` MCP server into Pi agents through a temporary `--mcp-config` file (the static `~/.pi/agent/mcp.json` is empty). The server connects to the daemon on `127.0.0.1:6767`; pi-mcp-adapter defaults to `lifecycle: lazy` (no auto-reconnect), so a daemon restart drops the connection.
 - Operating rule: after `paseo restart`, first wait until `paseo status` reports `running`/`reachable`, then call `mcp({ connect: "paseo" })`; if it fails with "Tool mcp not found", wait 5-10s and retry — the MCP gateway needs the daemon ready before it can reconnect. Do not fall back to the CLI silently without attempting this.
 
+### DOGFOOD-015 — Cheap models cannot drive the MCP outer gate; Lead/Supervisor need a capable model
+
+- Live E2E with all roles on `deepseek-v4-flash` (wks_81c1c1dfc3e1f6a3): both root Lead `8c233db6` and root Supervisor `1f769a76` activated (defer fix worked, no silent block), but then spun calling the outer `mcp` tool with wrong shapes (`paseo_get_agent` vs canonical `get_agent_status`, `agent_id` vs `agentId`) and got correctly blocked by the fail-closed gate; they never self-corrected and produced no Peer.
+- Conclusion: the MCP gate is working as designed; `deepseek-v4-flash` is too weak to drive the outer MCP protocol. Keep cheap models for Peer work; Lead/Supervisor orchestration needs a capable model (e.g. `gpt-5.6-luna`) or a better-described MCP contract for weak models.
+- Follow-up options: (a) retry E2E with Lead/Supervisor on a capable model, Peers cheap; (b) improve the extension prompt surface so weak models call the outer MCP gate correctly.
+
 
 - Root cause: fresh governed root agents failed closed during `session_start` when self/topology observation could not yet see the newly created Paseo agent, then the sticky block made the first input look like a silently spinning turn (`LastUsage: null`, zero activity).
 - Fix `50b4e97` surfaced every block as a machine-visible custom message (`pi-paseo-orchestration-blocked`), proving the block existed but was hidden.
