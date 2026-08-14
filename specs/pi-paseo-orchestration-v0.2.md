@@ -57,11 +57,11 @@ A Lead lifecycle call toward a child is allowed only when live Paseo inspection 
 
 - `ParentAgentId` equals the current Lead;
 - provider equals the configured Peer provider (derived from the Human-configured `PI_PASEO_ORCHESTRATION_PEER_ALIAS`/Peer settings, never echoed from the child-operation caller);
-- observed `cwd` is applicable to the exact repository, and the supplied typed workspace identity reconciles when the observer provides it.
+- observed `cwd` is applicable to the exact repository, and a typed child workspace identity reconciles with the exact bound-Lead workspace (or an independently supplied expected workspace) when both are observable. Typed workspace is never sourced from child-op caller args.
 
 Task/assignment labels are cooperative correlation metadata, not authentication credentials. The child task label is compared with the bound Lead task only when both are independently observable from live inspection; a mismatch blocks. Missing task/assignment labels on legacy children are reported as explicit bounded warnings, never a lifecycle deadlock. Assignment ID remains mandatory in Peer report and handoff correlation. Caller-supplied task/assignment values are never treated as independent validation; the closed child-operation shapes carry only `agentId` (+ `prompt` for send).
 
-Typed workspace identity is checked when the observer supplies it. When the public runtime cannot expose typed workspace identity inside the lifecycle gate, Doctor reports an exact environment ceiling and the gate never claims workspace PASS; absence alone does not block a child whose exact parent, provider and repository applicability are proven. An otherwise missing/ambiguous observation, a parent other than the current Lead, a provider mismatch, a repository mismatch, or a supplied workspace mismatch fails closed (BLOCKED).
+Typed workspace identity is checked when both the child's typed workspace and an independent expected reference (the exact bound-Lead typed workspace, or an explicitly supplied expected workspace) are observable; a mismatch fails closed (BLOCKED). When either the public runtime cannot expose typed workspace identity inside the lifecycle gate (child or bound-Lead side), Doctor reports an exact environment ceiling and the gate never claims workspace PASS; absence alone does not block a child whose exact parent, provider and repository applicability are proven. An otherwise missing/ambiguous observation, a parent other than the current Lead, a provider mismatch, a repository mismatch, or a supplied workspace mismatch fails closed (BLOCKED).
 
 ## Acceptance
 

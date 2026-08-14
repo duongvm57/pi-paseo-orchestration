@@ -704,6 +704,51 @@ test("checkToolCall: Lead lifecycle routes target only live-reconciled Peer chil
   assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_send_agent_prompt", args: { agentId: "peer-1", prompt: "" } }, policy).block, true);
 });
 
+// Cooperative task/assignment labels are OPTIONAL on create_agent (legacy/
+// no-label calls stay valid). When supplied, the labels object must be closed
+// to exactly the two namespaced correlation keys with trimmed nonempty string
+// values. Unknown keys, empty/nonobject labels, empty/untrimmed values,
+// workspaceId, and caller-supplied lifecycle task/assignment extras are
+// rejected; workspaceId stays omitted so inherited parentage/workspace
+// placement is preserved.
+test("checkToolCall: create_agent accepts optional closed namespaced correlation labels and rejects drift", () => {
+  const createPolicy = {
+    role: "lead",
+    allowed: ["mcp"],
+    mcpTargets: { paseo: new Set(["create_agent"]) },
+    peerRoutes: { fast: { provider: "openai", model: "gpt-5", thinking: "off", description: "fast route" } },
+    peerProviderAlias: "ppo-peer",
+    currentAgentId: "agent-7",
+  };
+  const blank = { title: "Bounded peer", provider: "ppo-peer/openai/gpt-5", settings: { thinkingOptionId: "off" }, initialPrompt: 'Use "model_route":"fast" and bind "parent_lead_agent_id":"agent-7".', notifyOnFinish: true };
+  const call = (args) => extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_create_agent", args }, createPolicy);
+  const TASK = "pi-paseo-orchestration.task-key";
+  const ASSIGN = "pi-paseo-orchestration.assignment-key";
+  // Omitted labels pass (legacy/no-label contract).
+  assert.equal(call({ ...blank }), undefined);
+  // Exactly one allowed namespaced label passes.
+  assert.equal(call({ ...blank, labels: { [TASK]: "task-1" } }), undefined);
+  assert.equal(call({ ...blank, labels: { [ASSIGN]: "asgn-1" } }), undefined);
+  // Both allowed namespaced labels pass.
+  assert.equal(call({ ...blank, labels: { [TASK]: "task-1", [ASSIGN]: "asgn-1" } }), undefined);
+  // Unknown key, empty labels object, and nonobject labels block.
+  assert.equal(call({ ...blank, labels: { unexpected: "x" } }).block, true);
+  assert.equal(call({ ...blank, labels: { [TASK]: "task-1", extra: "x" } }).block, true);
+  assert.equal(call({ ...blank, labels: {} }).block, true);
+  assert.equal(call({ ...blank, labels: "not-an-object" }).block, true);
+  assert.equal(call({ ...blank, labels: [TASK] }).block, true);
+  // Empty, untrimmed, and non-string values block.
+  assert.equal(call({ ...blank, labels: { [TASK]: "" } }).block, true);
+  assert.equal(call({ ...blank, labels: { [TASK]: "   " } }).block, true);
+  assert.equal(call({ ...blank, labels: { [TASK]: " padded " } }).block, true);
+  assert.equal(call({ ...blank, labels: { [TASK]: 7 } }).block, true);
+  // workspaceId and caller-supplied lifecycle task/assignment extras block.
+  assert.equal(call({ ...blank, workspaceId: "wks-guessed" }).block, true);
+  assert.equal(call({ ...blank, labels: { taskId: "task-1" } }).block, true);
+  assert.equal(call({ ...blank, labels: { assignmentId: "asgn-1" } }).block, true);
+  assert.equal(call({ ...blank, labels: { [TASK]: "task-1", parentLeadAgentId: "agent-7" } }).block, true);
+});
+
 test("wiring: passive env stays ungoverned; governed blocks input, injects profile, shapes tools, gates calls", async () => {
   const ext = await freshExtension();
   const profiles = await profileDirFixture();
@@ -772,6 +817,27 @@ test("wiring: passive env stays ungoverned; governed blocks input, injects profi
       },
     }, fake.ctx);
     assert.equal(createPassed, undefined);
+
+    // Integrated-path create_agent label contract: labels omitted passes
+    // (legacy); a closed namespaced label object passes; unknown/lifecycle
+    // keys and workspaceId drift block through the real handler.
+    const createArgs = (extra) => ({
+      server: "paseo", tool: "paseo_create_agent",
+      args: {
+        title: "Bounded peer",
+        provider: "ppo-peer/openai/gpt-5",
+        settings: { thinkingOptionId: "off" },
+        initialPrompt: 'Use "model_route":"fast" and return the bounded read-only Peer Report with "parent_lead_agent_id":"agent-7".',
+        notifyOnFinish: true,
+        ...extra,
+      },
+    });
+    assert.equal(await fake.handlers.get("tool_call")({ toolName: "mcp", input: createArgs({}) }, fake.ctx), undefined, "labels omitted must pass");
+    assert.equal(await fake.handlers.get("tool_call")({ toolName: "mcp", input: createArgs({ labels: { "pi-paseo-orchestration.task-key": "task-1", "pi-paseo-orchestration.assignment-key": "asgn-1" } }) }, fake.ctx), undefined, "closed namespaced labels must pass");
+    assert.equal((await fake.handlers.get("tool_call")({ toolName: "mcp", input: createArgs({ labels: { "pi-paseo-orchestration.task-key": "task-1", taskId: "x" } }) }, fake.ctx)).block, true, "unknown lifecycle label key must block");
+    assert.equal((await fake.handlers.get("tool_call")({ toolName: "mcp", input: createArgs({ labels: {} }) }, fake.ctx)).block, true, "empty labels object must block");
+    assert.equal((await fake.handlers.get("tool_call")({ toolName: "mcp", input: createArgs({ labels: { "pi-paseo-orchestration.task-key": "  " } }) }, fake.ctx)).block, true, "untrimmed label value must block");
+    assert.equal((await fake.handlers.get("tool_call")({ toolName: "mcp", input: createArgs({ workspaceId: "wks-guessed" }) }, fake.ctx)).block, true, "workspaceId must block");
 
     // Governed: Pi-native new/fork are cancelled.
     assert.equal((await fake.handlers.get("session_before_switch")({}, fake.ctx)).cancel, true);
@@ -893,6 +959,106 @@ test("handler: a normal Lead child lifecycle op reconciles through the integrate
   } finally {
     process.chdir(previous);
     await rm(bin, { recursive: true, force: true });
+    await rm(profiles, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+  }
+});
+
+test("handler: reconciliation compares typed child workspace against the exact bound-Lead workspace, and repository/task-label mismatch close through the integrated gate", async () => {
+  // Handler-seam regressions (ppo-v02-dogfood-001, review-555b22d2): the
+  // integrated tool_call handler invokes reconcilePeerChild WITHOUT an
+  // independently supplied expectedWorkspaceId, so the reconcile function must
+  // fall back to the exact bound-Lead typed workspace as the independent live
+  // reference. A typed child workspace that contradicts the bound-Lead
+  // workspace must FAIL CLOSED in a normal closed child operation; a match must
+  // pass; an unobservable workspace on either side is an explicit
+  // environment-ceiling warning that never blocks an otherwise proven child.
+  // Repository mismatch and an observable task-label mismatch are also run
+  // through the integrated path (closing prior direct-helper-only coverage).
+  const ext = await freshExtension();
+  const profiles = await profileDirFixture();
+  const dir = await mkdtemp(join(tmpdir(), "ppo-recon-ws-"));
+  await writeSettings(dir, validDoc);
+  const repo = await gitRepoFixture();
+  const previous = process.cwd();
+  process.chdir(repo.dir);
+  const harness = async (script) => {
+    const bin = await mkdtemp(join(tmpdir(), "ppo-recon-ws-bin-"));
+    await writeFile(join(bin, "paseo"), script, { mode: 0o755 });
+    const fake = fakePi({
+      activeTools: ["read", "bash", "mcp", "mcp_script"],
+      env: { PI_PASEO_ORCHESTRATION_ROLE: "lead", PI_PASEO_ORCHESTRATION_PEER_ALIAS: "ppo-peer", PASEO_AGENT_ID: "lead-9", PASEO_LEAD_AGENT_ID: "", PI_CODING_AGENT_DIR: dir, PI_PASEO_ORCHESTRATION_PROFILES_DIR: profiles, PATH: `${bin}:${process.env.PATH ?? ""}` },
+    });
+    fake.pi.setActiveTools = (tools) => { fake.holder.activeTools = [...tools]; };
+    fake.pi.getActiveTools = () => [...fake.holder.activeTools];
+    ext.default(fake.pi);
+    const registry = fake.ctx.modelRegistry;
+    fake.ctx.model = registry.find("anthropic", "claude-sonnet-4-5");
+    fake.ctx.thinkingLevel = "medium";
+    fake.ctx.modelRegistry = { ...registry };
+    await fake.handlers.get("session_start")({ reason: "startup" }, fake.ctx);
+    await fake.handlers.get("before_agent_start")(
+      { prompt: "hi", systemPrompt: "base", systemPromptOptions: { selectedTools: ["read", "bash", "mcp", "mcp_script"] } },
+      fake.ctx,
+    );
+    return { fake, bin };
+  };
+  const op = { server: "paseo", tool: "get_agent_status", args: { agentId: "agent-42" } };
+  try {
+    // typed child workspace vs bound-Lead workspace MISMATCH fails closed.
+    const mismatchScript = `#!/bin/sh\nif [ "$1" = "inspect" ]; then\n  if [ "$2" = "lead-9" ]; then printf '{"Id":"lead-9","Provider":"ppo-peer","Status":"running","Cwd":"${repo.dir}","WorkspaceId":"wks-lead"}' ; else printf '{"Id":"agent-42","Provider":"ppo-peer","Status":"running","Cwd":"${repo.dir}","ParentAgentId":"lead-9","WorkspaceId":"wks-child"}' ; fi\n  exit 0\nfi\nexit 1\n`;
+    {
+      const { fake, bin } = await harness(mismatchScript);
+      try {
+        const blocked = await fake.handlers.get("tool_call")({ toolName: "mcp", input: op }, fake.ctx);
+        assert.equal(blocked.block, true);
+        assert.match(blocked.reason, /workspace .* does not match the expected workspace/);
+      } finally { await rm(bin, { recursive: true, force: true }); }
+    }
+    // MATCHING typed child == bound-Lead workspace passes (no workspace warning).
+    const matchScript = `#!/bin/sh\nif [ "$1" = "inspect" ]; then\n  printf '{"Id":"%s","Provider":"ppo-peer","Status":"running","Cwd":"${repo.dir}","ParentAgentId":"lead-9","WorkspaceId":"wks-same"}' "$2"\n  exit 0\nfi\nexit 1\n`;
+    {
+      const { fake, bin } = await harness(matchScript);
+      try {
+        const res = await fake.handlers.get("tool_call")({ toolName: "mcp", input: op }, fake.ctx);
+        assert.equal(res, undefined, `matching typed workspace must pass (got ${JSON.stringify(res)})`);
+        // Both sides expose workspace → no environment-ceiling workspace warning.
+        assert.equal(fake.notifications.some(([msg]) => /typed workspace/.test(msg) && /not observable/.test(msg)), false, "matching typed workspace must not warn as unobservable");
+      } finally { await rm(bin, { recursive: true, force: true }); }
+    }
+    // Workspace unavailable on the Lead side only → explicit warning, no block.
+    const leadMissingWsScript = `#!/bin/sh\nif [ "$1" = "inspect" ]; then\n  if [ "$2" = "lead-9" ]; then printf '{"Id":"lead-9","Provider":"ppo-peer","Status":"running","Cwd":"${repo.dir}"}' ; else printf '{"Id":"agent-42","Provider":"ppo-peer","Status":"running","Cwd":"${repo.dir}","ParentAgentId":"lead-9","WorkspaceId":"wks-child"}' ; fi\n  exit 0\nfi\nexit 1\n`;
+    {
+      const { fake, bin } = await harness(leadMissingWsScript);
+      try {
+        const res = await fake.handlers.get("tool_call")({ toolName: "mcp", input: op }, fake.ctx);
+        assert.equal(res, undefined, "workspace unavailable on the bound-Lead side must not block");
+        assert.equal(fake.notifications.some(([msg]) => /expected typed workspace .* not observable from the bound Lead/.test(msg)), true, "must warn the bound-Lead workspace ceiling");
+      } finally { await rm(bin, { recursive: true, force: true }); }
+    }
+    // REPOSITORY MISMATCH fails closed through the integrated path.
+    const wrongRepoScript = `#!/bin/sh\nif [ "$1" = "inspect" ]; then\n  printf '{"Id":"%s","Provider":"ppo-peer","Status":"running","Cwd":"/other/repo","ParentAgentId":"lead-9"}' "$2"\n  exit 0\nfi\nexit 1\n`;
+    {
+      const { fake, bin } = await harness(wrongRepoScript);
+      try {
+        const blocked = await fake.handlers.get("tool_call")({ toolName: "mcp", input: op }, fake.ctx);
+        assert.equal(blocked.block, true);
+        assert.match(blocked.reason, /outside the expected repository/);
+      } finally { await rm(bin, { recursive: true, force: true }); }
+    }
+    // OBSERVABLE TASK-LABEL MISMATCH (child task != bound-Lead task) blocks.
+    const labelMismatchScript = `#!/bin/sh\nif [ "$1" = "inspect" ]; then\n  if [ "$2" = "lead-9" ]; then printf '{"Id":"lead-9","Provider":"ppo-peer","Status":"running","Cwd":"${repo.dir}","Labels":{"pi-paseo-orchestration.task-key":"task-A"}}' ; else printf '{"Id":"agent-42","Provider":"ppo-peer","Status":"running","Cwd":"${repo.dir}","ParentAgentId":"lead-9","Labels":{"pi-paseo-orchestration.task-key":"task-B"}}' ; fi\n  exit 0\nfi\nexit 1\n`;
+    {
+      const { fake, bin } = await harness(labelMismatchScript);
+      try {
+        const blocked = await fake.handlers.get("tool_call")({ toolName: "mcp", input: op }, fake.ctx);
+        assert.equal(blocked.block, true);
+        assert.match(blocked.reason, /task label .* does not match the bound Lead task/);
+      } finally { await rm(bin, { recursive: true, force: true }); }
+    }
+  } finally {
+    process.chdir(previous);
     await rm(profiles, { recursive: true, force: true });
     await rm(dir, { recursive: true, force: true });
     await rm(repo.dir, { recursive: true, force: true });
