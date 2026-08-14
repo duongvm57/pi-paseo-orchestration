@@ -2,7 +2,7 @@
 
 Governed multi-agent work for [Pi](https://github.com/earendil-works/pi) running through Paseo.
 
-The package gives each process one explicit role—**Supervisor**, **Lead**, or **Peer**—and keeps Paseo as the source of truth for agents, workspaces, parentage, and lifecycle. It adds policy guardrails, repository workflow rules, bounded per-run grants, evidence-bearing handoffs, and local Git candidate acceptance.
+The package gives each process one explicit role—**Supervisor**, **Lead**, or **Peer**—and keeps Paseo as the source of truth for agents, workspaces, parentage, and lifecycle. It adds policy guardrails, repository workflow rules, runtime-captured Human task authority, evidence-bearing handoffs, and local Git candidate acceptance. There is no coordinator: the Human creates the root Lead and root Supervisor directly.
 
 ## Why subagents are not enough
 
@@ -13,7 +13,7 @@ A subagent API solves **process creation**. It does not solve ownership, indepen
 - **Attention dilution:** when the coordinator also implements, debugs, and repeatedly explains local details, it loses the project-wide view of ownership, dependencies, and agent lifecycle.
 - **Unsafe parallelism:** two agents can share one checkout and overwrite the same moving files. A workspace or agent ID does not provide filesystem isolation.
 - **Biased or stale review:** a reviewer forked from the author inherits the same framing, while a reviewer reading changing files may approve a candidate that no longer exists.
-- **False completion:** `finished`, `idle`, “done,” and passing tests are signals—not proof that the right artifact was reviewed by the right authority.
+- **False completion:** `finished`, `idle`, "done," and passing tests are signals—not proof that the right artifact was reviewed by the right authority.
 - **Split control planes:** if workers create their own untracked workers, no single system knows who owns the task, workspace, correction, or cleanup.
 
 More agents can therefore increase confidence and activity without increasing correctness.
@@ -22,7 +22,7 @@ More agents can therefore increase confidence and activity without increasing co
 
 This package applies the Deep Dive's **Supervisor–Lead–Peer (SLP)** model by separating kinds of judgment instead of building a rigid `Supervisor > Lead > Peer` hierarchy:
 
-```text
+```
                          Human
                            │
               ┌────────────┴────────────┐
@@ -44,15 +44,27 @@ This package applies the Deep Dive's **Supervisor–Lead–Peer (SLP)** model by
 
 This separation preserves independent judgment: the author proves its work, an independent Reviewer falsifies the exact candidate when required, the Lead judges project readiness, and the Human accepts owner-only trade-offs.
 
+## One supported startup flow
+
+The Human creates the team directly; there is no coordinator and no `/ppo:bootstrap`.
+
+1. **Create the Lead.** From a Human shell without `PASEO_AGENT_ID`, or through the Paseo UI, create a `ppo-lead` agent in the intended repository/workspace and supply the Human task as its initial prompt. The Lead is a root agent.
+2. **Create the Supervisor.** After obtaining the exact Lead agent ID, create a `ppo-supervisor` root agent and supply an assignment binding the exact Lead agent ID, the exact Human task/task ID, the exact repository root, and the expected workspace binding.
+3. **Bind Supervisor and Lead.** The Supervisor sends one bounded `SUPERVISOR_BOUND` message to the exact Lead, which verifies the claimed Supervisor's role, root parentage, repository/workspace applicability, and task binding before accepting.
+4. **The Lead creates Peer children** through `paseo_create_agent`. Every Peer has `ParentAgentId` equal to the Lead and receives one bounded assignment.
+
+The Lead delegates bounded assignments to Peer children and returns the final candidate to the Human for local acceptance. Lead and Supervisor must both be root agents (`ParentAgentId = null`); a parented Lead or Supervisor fails closed before governed work, and a root or wrong-parent Peer is `BLOCKED`.
+
 ## How it works
 
-1. `/ppo:bootstrap <task>` creates independent Supervisor and Lead processes in the same Paseo workspace. They are siblings with different authority, not a Supervisor-owned execution chain.
-2. Each process receives one durable Role Profile. The Lead also reads the repository's Workspace Protocol; each Peer receives only its bounded assignment. Keeping these layers separate avoids spending Peer attention on the whole organization manual.
-3. The Lead describes the outcome, constraints, known evidence, writable scope, exclusions, and verification—not a supposedly final implementation plan. One moving write scope has one owner; concurrent writers need disjoint scopes and isolated checkouts.
-4. Edit and local-commit capability come from a strict **current-run Task Authority Envelope**. Task prose alone cannot grant tools, and the grant is replaced on the next run.
+1. Each process receives one durable Role Profile. The Lead also reads the repository's Workspace Protocol; each Peer receives only its bounded assignment. Keeping these layers separate avoids spending Peer attention on the whole organization manual.
+2. The initial root Lead task is captured by the runtime as the current-run Human task authority—including provenance, objective, repository, and requested local effects. The Human types only `implement <spec-path>` (or equivalent) once; no marker, JSON envelope, hash, agent ID, assignment ID, scope syntax, or capability name is written. The runtime mechanically attenuates that authority to the exact child Peer created by the bound Lead; attenuation never widens it.
+3. The Lead describes the outcome, constraints, known evidence, writable scope, exclusions, and verification—not a supposedly final implementation plan. One moving write scope has one owner; concurrent writers need disjoint scopes and isolated checkouts. The Lead prepares required isolated worktrees itself.
+4. A dirty caller checkout is evidence to classify, not an automatic blocker: untracked/read-only issue notes, specifications, research, generated logs, or unrelated documentation do not block an isolated worktree from a known clean commit. Only a real collision, overwrite risk, competing writer, or ambiguous base blocks work.
 5. A Peer ends its run with a correlated report: `HANDOFF`, `REOPEN_REQUEST`, `DEPENDENCY_REQUEST`, or `BLOCKED`. The Lead reacts to that event instead of polling and consuming coordination attention.
 6. Write work produces one exact local Git **Stable Candidate**. Required review and verification bind to that commit, the Lead issues a candidate-bound verdict, and only a direct Human action crosses the Local Acceptance Boundary.
-7. Paseo remains the only lifecycle, workspace, parentage, follow-up, and timeline control plane. This package adds policy and evidence contracts, not another scheduler or agent database.
+7. Communication is event-driven and bounded. The Lead sends milestone events to its one bound Supervisor; the Supervisor performs one bounded observation pass per event and returns to idle. No daemon, continuous polling, or automatic heartbeat is introduced.
+8. Paseo remains the only lifecycle, workspace, parentage, follow-up, and timeline control plane. This package adds policy and evidence contracts, not another scheduler or agent database.
 
 Use this package when those boundaries matter. For a small single-agent task, ordinary Pi is simpler.
 
@@ -71,28 +83,28 @@ Choose either npm or Git.
 
 ### npm
 
-```sh
+```
 pi install npm:pi-paseo-orchestration
 ```
 
 Pin a specific release when reproducibility matters:
 
-```sh
-pi install npm:pi-paseo-orchestration@0.1.0
+```
+pi install npm:pi-paseo-orchestration@0.2.0
 ```
 
 ### Git
 
 A commit SHA is optional. Install the current repository version with:
 
-```sh
+```
 pi install git:github.com/duongvm57/pi-paseo-orchestration
 ```
 
 You may pin a tag or full commit SHA when you need an immutable version:
 
-```sh
-pi install git:github.com/duongvm57/pi-paseo-orchestration@<tag-or-full-commit-sha>
+```
+pi install git:github.com/duongvm57/pi-paseo-orchestration@<tag-or-full-sha>
 ```
 
 After changing package version or source, restart Pi/Paseo. `pi-mcp-adapter` remains a separate installation; this package does not add or update it.
@@ -103,7 +115,7 @@ After changing package version or source, restart Pi/Paseo. `pi-mcp-adapter` rem
 
 Open an ordinary, ungoverned Pi session and run:
 
-```text
+```
 /ppo:settings
 ```
 
@@ -128,7 +140,7 @@ Restart Paseo after updating the providers.
 
 Every governed repository needs:
 
-```text
+```
 .orchestration/workspace-protocol.md
 ```
 
@@ -136,7 +148,7 @@ This file contains decisions that cannot safely be global: how this repository c
 
 From an ordinary Pi session opened at the repository root, send this exact prompt:
 
-```text
+```
 Use the workspace-protocol skill to create .orchestration/workspace-protocol.md for this repository. Interview me before writing and show me the exact proposed diff for confirmation.
 ```
 
@@ -146,21 +158,15 @@ Use the workspace-protocol skill to create .orchestration/workspace-protocol.md 
 
 From the repository:
 
-```text
+```
 /ppo:doctor
 ```
 
-Doctor is observation-only. It reports the current Pi, Git, role, settings, protocol, and Paseo state without repairing or mutating them.
+Doctor is observation-only. It reports the current Pi, Git, role, settings, protocol, Paseo connection, identity, topology, and binding state without repairing or mutating them.
 
 ### 4. Start work
 
-From an idle, ungoverned Pi session in the repository:
-
-```text
-/ppo:bootstrap <task>
-```
-
-Bootstrap validates settings and the Workspace Protocol, then creates sibling Supervisor and Lead agents in the current Paseo workspace. The Lead delegates bounded assignments to Peer children and returns the final candidate to the Human for local acceptance.
+Follow the one supported startup flow above: the Human creates the root Lead with the task, then the root Supervisor bound to that Lead; the Lead creates Peer children and returns the final candidate to the Human for local acceptance.
 
 ### Supervisor Notebook
 
@@ -170,7 +176,7 @@ It is **not** a task queue, chat channel, source of authority, current status, o
 
 Initialize it explicitly from an ordinary Human session (or an active Supervisor) connected to a Paseo workspace when you want this history:
 
-```text
+```
 /ppo:notebook-init
 ```
 
@@ -180,25 +186,22 @@ After initialization, an activated Supervisor can append entries through the nar
 
 | Command | Purpose |
 | --- | --- |
-| `/ppo:bootstrap <task>` | Start a governed Supervisor/Lead team for one task. |
 | `/ppo:settings` | Configure role models, Peer routes, and Paseo providers. |
 | `/ppo:doctor` | Report readiness for the current context without mutation. |
-| `/ppo:lead-tiny` | Store a Human-confirmed one-run tiny Lead edit/commit grant. |
-| `/ppo:supervisor-recovery` | Store a Human-confirmed bounded Lead recovery grant. |
 | `/ppo:notebook-init` | Initialize the Supervisor Notebook for the current project. |
 
 The extension also exposes `supervisor_notebook_append` only to an activated Supervisor.
 
 ## Operating model
 
-```text
+```
 Role Profile
   > Workspace Protocol
-  > current-run Task Authority Envelope
+  > runtime-captured Human task authority (Lead) / Lead-attenuated authority (Peer)
   > task prose
 ```
 
-A lower layer cannot widen a higher layer. The Human controls settings, exceptional grants, protocol changes, and final local acceptance; the SLP roles follow the responsibilities above.
+A lower layer cannot widen a higher layer. The Human controls settings, exceptional grants, protocol changes, and final local acceptance; the SLP roles follow the responsibilities above. Human-only boundaries—push, merge, publish, deploy, protocol mutation, destructive/external effects, secrets/material cost, objective/irreversible decisions, and Local Acceptance—are preserved.
 
 Write work ends at an immutable local Git candidate. The package does not push, create pull requests, merge, deploy, or treat tests, lifecycle status, or agent prose as acceptance.
 
@@ -206,11 +209,11 @@ Write work ends at an immutable local Git candidate. The package does not push, 
 
 The extension narrows Pi's active tools and rejects recognizable disallowed calls. This is a cooperative in-process **policy guardrail**, not a sandbox or an authentication/authorization boundary. It does not isolate the filesystem, processes, network, Git, shell aliases, child programs, or other extensions.
 
-Missing, malformed, mismatched, or drifted governed state fails closed. Ordinary Pi sessions without `PI_PASEO_ORCHESTRATION_ROLE` remain ungoverned.
+Missing, malformed, mismatched, or drifted governed state fails closed. Ordinary Pi sessions without `PI_PASEO_ORCHESTRATION_ROLE` remain ungoverned. Governed Lead/Supervisor/Peer missing mandatory live Paseo evidence returns `BLOCKED`.
 
 ## Development
 
-```sh
+```
 npm install
 npm test
 npm run typecheck
@@ -225,7 +228,7 @@ git diff --check
 
 The npm tarball is intentionally limited to:
 
-```text
+```
 package.json
 README.md
 extensions/pi-paseo-orchestration.ts
