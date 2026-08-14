@@ -3468,6 +3468,47 @@ test("settings command: Esc mid-flow goes back instead of cancelling; Esc at the
 
 // ─── v0.2 follow-up behaviors ────────────────────────────────────────────────
 
+test("wiring: fresh governed activation defers topology observation to first input", async () => {
+  const ext = await freshExtension();
+  const repo = await gitRepoFixture();
+  const profiles = await profileDirFixture();
+  const dir = await mkdtemp(join(tmpdir(), "ppo-deferred-topology-"));
+  const failBin = await fakePaseoBin({ fail: true });
+  const previous = process.cwd();
+  process.chdir(repo.dir);
+  try {
+    await writeSettings(dir, validDoc);
+    let observations = 0;
+    const fake = fakePi({
+      activeTools: ["read", "bash", "mcp"],
+      env: {
+        PI_PASEO_ORCHESTRATION_ROLE: "lead",
+        PI_PASEO_ORCHESTRATION_PEER_ALIAS: "ppo-peer",
+        PASEO_AGENT_ID: "agent-7",
+        PI_CODING_AGENT_DIR: dir,
+        PI_PASEO_ORCHESTRATION_PROFILES_DIR: profiles,
+        PATH: failBin,
+      },
+      ctx: { observeParentAgentId: async () => ++observations === 1 ? undefined : null },
+    });
+    ext.default(fake.pi);
+
+    await fake.handlers.get("session_start")({ reason: "startup" }, fake.ctx);
+    assert.equal(observations, 1);
+    assert.deepEqual(await fake.handlers.get("input")({ text: "hi" }, fake.ctx), { action: "continue" });
+    assert.equal(observations, 2);
+    assert.deepEqual(fake.holder.sentMessages, []);
+    const before = await fake.handlers.get("before_agent_start")({ systemPrompt: "base" }, fake.ctx);
+    assert.match(before.systemPrompt, /<pi-paseo-orchestration role="lead"/);
+  } finally {
+    process.chdir(previous);
+    await rm(repo.dir, { recursive: true, force: true });
+    await rm(profiles, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true });
+    await rm(failBin, { recursive: true, force: true });
+  }
+});
+
 test("activate: live root/child topology fails closed during governed activation", async () => {
   const ext = await freshExtension();
   const profiles = await profileDirFixture();

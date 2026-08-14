@@ -4284,6 +4284,7 @@ async function runSettings(_args, ctx) {
 // process: drift or missing prerequisites require a fresh Paseo process.
 let latch = null;
 let blockedReason = null;
+let activationPending = false;
 let baseline = null;
 // The last tool set applied by this extension. It distinguishes intentional
 // policy transitions between runs from an external active-tool drift.
@@ -4719,6 +4720,68 @@ function reportBlockedInput(pi, reason) {
   }
 }
 
+async function activateGovernedSession(pi, ctx, { deferUnavailableTopology = false } = {}) {
+  activationPending = false;
+  const env = envOf(ctx);
+  const dir = configDir(env);
+  const source = await resolveProfileSource(env, bundledDir);
+  if (!source.ok) {
+    blockWith(ctx, source.error);
+    return false;
+  }
+
+  let observedParentAgentId = ctx.observedParentAgentId;
+  if (observedParentAgentId === undefined && typeof ctx.observeParentAgentId === "function") {
+    try {
+      observedParentAgentId = await Promise.resolve(ctx.observeParentAgentId((env[AGENT_ENV] ?? "").trim()));
+    } catch {
+      observedParentAgentId = undefined;
+    }
+  }
+  if (observedParentAgentId === undefined) {
+    const selfObs = await observePaseoCurrentAgent((env[AGENT_ENV] ?? "").trim(), { env });
+    observedParentAgentId = selfObs.ok ? selfObs.observation.parent_agent_id : undefined;
+  }
+  if (observedParentAgentId === undefined && deferUnavailableTopology) {
+    activationPending = true;
+    return false;
+  }
+
+  const expectedParentLeadId = (env.PI_PASEO_ORCHESTRATION_PARENT_LEAD_ID ?? "").trim() || null;
+  const result = await activate({
+    env,
+    dir,
+    profileDir: source.dir,
+    models: ctx.modelRegistry,
+    setModel: pi.setModel,
+    setThinkingLevel: pi.setThinkingLevel,
+    getThinkingLevel: pi.getThinkingLevel,
+    currentModel: ctx.model,
+    currentThinking: ctx.thinkingLevel,
+    observedParentAgentId,
+    expectedParentAgentId: expectedParentLeadId,
+  });
+  if (!result.ok) {
+    blockWith(ctx, result.error);
+    return false;
+  }
+  latch = result.latch;
+  inspectionParentAgentId = observedParentAgentId;
+  const tools = requireBaselineTools(baseline, latch.role);
+  if (!tools.ok) {
+    blockWith(ctx, tools.error);
+    return false;
+  }
+  if (latch.role === "lead") {
+    const pin = await ensureProtocolPin();
+    if (!pin.ok) {
+      blockWith(ctx, pin.error);
+      return false;
+    }
+  }
+  return true;
+}
+
 
 
 function registerCommand(pi, name, definition) {
@@ -4781,6 +4844,7 @@ export default function (pi) {
     inspectionParentAgentId = null;
     lastPeerReport = null;
     lastAcceptance = null;
+    activationPending = false;
     baseline = null;
     lastAppliedTools = null;
     const env = envOf(ctx);
@@ -4812,60 +4876,17 @@ export default function (pi) {
       return;
     }
 
-    const source = await resolveProfileSource(env, bundledDir);
-    if (!source.ok) {
-      blockWith(ctx, source.error);
-      return;
-    }
-
-    // v0.2 live root/child topology evidence: a governed role must observe its
-    // own Paseo identity and parentage before activation. Try the injected
-    // observer first, then the installed Paseo CLI; if neither yields parentage,
-    // activation fails closed (no undefined-parent success path).
-    let observedParentAgentId = ctx.observedParentAgentId;
-    if (observedParentAgentId === undefined && typeof ctx.observeParentAgentId === "function") {
-      try {
-        observedParentAgentId = await Promise.resolve(ctx.observeParentAgentId((env[AGENT_ENV] ?? "").trim()));
-      } catch {
-        observedParentAgentId = undefined;
-      }
-    }
-    if (observedParentAgentId === undefined) {
-      const selfObs = await observePaseoCurrentAgent((env[AGENT_ENV] ?? "").trim(), { env });
-      observedParentAgentId = selfObs.ok ? selfObs.observation.parent_agent_id : undefined;
-    }
-    const expectedParentLeadId = (env.PI_PASEO_ORCHESTRATION_PARENT_LEAD_ID ?? "").trim() || null;
-    const result = await activate({
-      env,
-      dir,
-      profileDir: source.dir,
-      models: ctx.modelRegistry,
-      setModel: pi.setModel,
-      setThinkingLevel: pi.setThinkingLevel,
-      getThinkingLevel: pi.getThinkingLevel,
-      currentModel: ctx.model,
-      currentThinking: ctx.thinkingLevel,
-      observedParentAgentId,
-      expectedParentAgentId: expectedParentLeadId,
-    });
-    if (!result.ok) {
-      blockWith(ctx, result.error);
-      return;
-    }
-    latch = result.latch;
-    inspectionParentAgentId = observedParentAgentId === undefined ? null : observedParentAgentId;
-    const tools = requireBaselineTools(baseline, latch.role);
-    if (!tools.ok) {
-      blockWith(ctx, tools.error);
-      return;
-    }
-    if (latch.role === "lead") {
-      const pin = await ensureProtocolPin();
-      if (!pin.ok) blockWith(ctx, pin.error);
-    }
+    await activateGovernedSession(pi, ctx, { deferUnavailableTopology: true });
   });
 
   pi.on("input", async (event, ctx) => {
+    if (activationPending) {
+      const activated = await activateGovernedSession(pi, ctx);
+      if (!activated) {
+        reportBlockedInput(pi, blockedReason ?? "governed activation could not observe live Paseo topology");
+        return { action: "handled" };
+      }
+    }
     if (latch === null && blockedReason === null) return { action: "continue" };
     if (blockedReason !== null) {
       ctx.ui?.notify?.(`pi-paseo-orchestration blocked: ${blockedReason}`, "error");
