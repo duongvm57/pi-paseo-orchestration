@@ -3468,8 +3468,7 @@ test("settings command: Esc mid-flow goes back instead of cancelling; Esc at the
 
 // ─── v0.2 follow-up behaviors ────────────────────────────────────────────────
 
-test("wiring: fresh governed activation defers topology observation to first input", async () => {
-  const ext = await freshExtension();
+test("wiring: fresh governed activation defers topology observation to first input", async () => {  const ext = await freshExtension();
   const repo = await gitRepoFixture();
   const profiles = await profileDirFixture();
   const dir = await mkdtemp(join(tmpdir(), "ppo-deferred-topology-"));
@@ -3712,4 +3711,64 @@ test("resolved model: effectiveTools grants write/edit to implementation roles o
   const supTool = extension.effectiveTools(base, "supervisor");
   assert.equal(supTool.includes("edit"), false);
   assert.equal(supTool.includes("write"), false);
+});
+
+test("wiring: per-role MCP call contract is injected into the agent prompt (DOGFOOD-015)", async () => {
+  const profiles = await profileDirFixture();
+  const dir = await mkdtemp(join(tmpdir(), "ppo-contract-"));
+  await writeSettings(dir, validDoc);
+  const envBase = (role) => ({
+    PI_PASEO_ORCHESTRATION_ROLE: role,
+    PI_PASEO_ORCHESTRATION_PEER_ALIAS: "ppo-peer",
+    PASEO_AGENT_ID: role === "peer" ? "peer-7" : "agent-7",
+    PASEO_LEAD_AGENT_ID: "",
+    PI_CODING_AGENT_DIR: dir,
+    PI_PASEO_ORCHESTRATION_PROFILES_DIR: profiles,
+  });
+  const activeTools = ["read", "bash", "mcp"];
+
+  for (const role of ["lead", "supervisor"]) {
+    const ext = await freshExtension();
+    const fake = fakePi({ activeTools, env: envBase(role) });
+    fake.pi.setActiveTools = (tools) => { fake.holder.activeTools = [...tools]; };
+    fake.pi.getActiveTools = () => [...fake.holder.activeTools];
+    ext.default(fake.pi);
+    const registry = fake.ctx.modelRegistry;
+    fake.ctx.model = registry.find("anthropic", "claude-sonnet-4-5");
+    fake.ctx.thinkingLevel = role === "lead" ? "medium" : "high";
+    fake.ctx.modelRegistry = { ...registry };
+    await fake.handlers.get("session_start")({ reason: "startup" }, fake.ctx);
+    const before = await fake.handlers.get("before_agent_start")(
+      { prompt: "hi", systemPrompt: "base", systemPromptOptions: { selectedTools: activeTools } },
+      fake.ctx,
+    );
+    assert.match(before.systemPrompt, /Outer MCP call contract/);
+    assert.match(before.systemPrompt, /"server": "paseo"/);
+    assert.match(before.systemPrompt, /get_agent_status \(args \{ agentId \}\)/);
+    if (role === "supervisor") {
+      assert.doesNotMatch(before.systemPrompt, /send_agent_prompt/);
+      assert.doesNotMatch(before.systemPrompt, /create_agent policy/);
+    } else {
+      assert.match(before.systemPrompt, /send_agent_prompt \(args \{ agentId, prompt \}\)/);
+    }
+  }
+
+  // Peer must not receive any MCP contract (no outer mcp tool).
+  const extPeer = await freshExtension();
+  const fakePeer = fakePi({ activeTools: ["read", "bash"], env: envBase("peer") });
+  fakePeer.pi.setActiveTools = (tools) => { fakePeer.holder.activeTools = [...tools]; };
+  fakePeer.pi.getActiveTools = () => [...fakePeer.holder.activeTools];
+  extPeer.default(fakePeer.pi);
+  const regPeer = fakePeer.ctx.modelRegistry;
+  fakePeer.ctx.model = regPeer.find("openai", "gpt-5");
+  fakePeer.ctx.thinkingLevel = "off";
+  fakePeer.ctx.modelRegistry = { ...regPeer };
+  await fakePeer.handlers.get("session_start")({ reason: "startup" }, fakePeer.ctx);
+  const beforePeer = await fakePeer.handlers.get("before_agent_start")(
+    { prompt: "hi", systemPrompt: "base", systemPromptOptions: { selectedTools: ["read", "bash"] } },
+    fakePeer.ctx,
+  );
+  assert.doesNotMatch(beforePeer.systemPrompt, /Outer MCP call contract/);
+  await rm(profiles, { recursive: true, force: true });
+  await rm(dir, { recursive: true, force: true });
 });

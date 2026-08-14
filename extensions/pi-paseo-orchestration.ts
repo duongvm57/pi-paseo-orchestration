@@ -474,6 +474,41 @@ function validProviderAlias(value) {
   return typeof value === "string" && value !== "" && value === value.trim() && !value.includes("/");
 }
 
+// MCP call contract exposed to the model for each role: the outer `mcp` tool
+// takes exactly { server, tool, args } with server "paseo"; only the listed
+// canonical ops and closed arg shapes pass the gate. Weak models fail closed
+// otherwise (DOGFOOD-015), so the contract is explicit in the prompt.
+const MCP_CONTRACT = {
+  lead: [
+    "list_agents (args {})",
+    "get_agent_status (args { agentId })",
+    "get_agent_activity (args { agentId })",
+    "send_agent_prompt (args { agentId, prompt })",
+    "cancel_agent (args { agentId })",
+    "archive_agent (args { agentId })",
+    "create_agent (see the create_agent policy above)",
+  ],
+  supervisor: [
+    "list_agents (args {})",
+    "get_agent_status (args { agentId })",
+    "get_agent_activity (args { agentId })",
+  ],
+};
+
+function mcpContractPrompt(role) {
+  const ops = MCP_CONTRACT[role];
+  if (!ops) return "";
+  return [
+    "Outer MCP call contract (the only way to reach Paseo): call the mcp tool exactly as {",
+    "  \"server\": \"paseo\",",
+    "  \"tool\": \"<tool-name>\",",
+    "  \"args\": { ... }",
+    "} — server must be exactly \"paseo\" and the tool name must be one of the canonical names below (prefixed paseo_<name> forms are also accepted):",
+    ...ops.map((op) => `- ${op}`),
+    "Any other shape (missing server/tool, wrong tool name, wrong arg key like agent_id) is rejected by the gate; use the exact arg keys shown.",
+  ].join("\n");
+}
+
 function createAgentPolicyPrompt(activeLatch) {
   if (activeLatch.role === "lead") {
     if (!validProviderAlias(activeLatch.peerProviderAlias)) {
@@ -490,7 +525,12 @@ function createAgentPolicyPrompt(activeLatch) {
       "- omit workspaceId (the child inherits this exact workspace and Paseo supplies parentage); cooperative labels are optional and, when supplied, must be closed to exactly the namespaced keys \"pi-paseo-orchestration.task-key\" and \"pi-paseo-orchestration.assignment-key\" with trimmed nonempty values",
       `- initialPrompt must bind \"parent_lead_agent_id\" to ${activeLatch.agentId}`,
       "- notifyOnFinish must be true; title and initialPrompt must be nonempty",
+      "",
+      mcpContractPrompt("lead"),
     ].join("\n");
+  }
+  if (activeLatch.role === "supervisor") {
+    return mcpContractPrompt("supervisor");
   }
   return "Paseo create_agent is unavailable for this run (only the Lead mints Peer children).";
 }
