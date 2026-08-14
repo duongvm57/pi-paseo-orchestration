@@ -804,6 +804,77 @@ test("wiring: passive process is never blocked, profiled, or shaped", async () =
   assert.deepEqual(fake.holder.activeTools, []);
 });
 
+test("handler: a normal Lead child lifecycle op reconciles through the integrated gate after restart", async () => {
+  // Regression (ppo-v02-dogfood-001): dfd2ce1 wired expectedTaskId/expectedAssignmentId
+  // from the closed child-operation args (which never carry them), so every normal
+  // Lead follow-up/status/cancel/archive call blocked before reconciliation. The
+  // fake `paseo inspect` proves live parent/provider/repository match while the op
+  // carries only { agentId } — the closed public child-operation shape.
+  const ext = await freshExtension();
+  const profiles = await profileDirFixture();
+  const dir = await mkdtemp(join(tmpdir(), "ppo-recon-"));
+  await writeSettings(dir, validDoc);
+  const repo = await gitRepoFixture();
+  const bin = await mkdtemp(join(tmpdir(), "ppo-recon-bin-"));
+  const previous = process.cwd();
+  process.chdir(repo.dir);
+  try {
+    const script = `#!/bin/sh\nif [ "$1" = "inspect" ]; then\n  printf '{"Id":"agent-42","Provider":"pi","Status":"running","Cwd":"${repo.dir}","ParentAgentId":"lead-9"}'\n  exit 0\nfi\necho "unknown command" >&2\nexit 1\n`;
+    await writeFile(join(bin, "paseo"), script, { mode: 0o755 });
+
+    const fake = fakePi({
+      activeTools: ["read", "bash", "mcp", "mcp_script"],
+      env: { PI_PASEO_ORCHESTRATION_ROLE: "lead", PI_PASEO_ORCHESTRATION_PEER_ALIAS: "ppo-peer", PASEO_AGENT_ID: "lead-9", PASEO_LEAD_AGENT_ID: "", PI_CODING_AGENT_DIR: dir, PI_PASEO_ORCHESTRATION_PROFILES_DIR: profiles, PATH: `${bin}:${process.env.PATH ?? ""}` },
+    });
+    fake.pi.setActiveTools = (tools) => { fake.holder.activeTools = [...tools]; };
+    fake.pi.getActiveTools = () => [...fake.holder.activeTools];
+    ext.default(fake.pi);
+    const registry = fake.ctx.modelRegistry;
+    fake.ctx.model = registry.find("anthropic", "claude-sonnet-4-5");
+    fake.ctx.thinkingLevel = "medium";
+    fake.ctx.modelRegistry = { ...registry };
+    await fake.handlers.get("session_start")({ reason: "startup" }, fake.ctx);
+    await fake.handlers.get("before_agent_start")(
+      { prompt: "hi", systemPrompt: "base", systemPromptOptions: { selectedTools: ["read", "bash", "mcp", "mcp_script"] } },
+      fake.ctx,
+    );
+
+    // Every real closed child-operation shape (agentId [+ prompt]) must be usable.
+    const opShapes = [
+      { server: "paseo", tool: "send_agent_prompt", args: { agentId: "agent-42", prompt: "Return exact evidence" } },
+      { server: "paseo", tool: "get_agent_status", args: { agentId: "agent-42" } },
+      { server: "paseo", tool: "get_agent_activity", args: { agentId: "agent-42" } },
+      { server: "paseo", tool: "cancel_agent", args: { agentId: "agent-42" } },
+      { server: "paseo", tool: "archive_agent", args: { agentId: "agent-42" } },
+    ];
+    for (const op of opShapes) {
+      const res = await fake.handlers.get("tool_call")({ toolName: "mcp", input: op }, fake.ctx);
+      assert.equal(res, undefined, `${op.tool} must pass the integrated gate (got ${JSON.stringify(res)})`);
+    }
+
+    // A child whose live parent is NOT the current Lead still fails closed.
+    const rogueBin = await mkdtemp(join(tmpdir(), "ppo-recon-rogue-"));
+    const rogue = `#!/bin/sh\nif [ "$1" = "inspect" ]; then\n  printf '{"Id":"agent-99","Provider":"pi","Status":"running","Cwd":"${repo.dir}","ParentAgentId":"someone-else"}'\n  exit 0\nfi\nexit 1\n`;
+    await writeFile(join(rogueBin, "paseo"), rogue, { mode: 0o755 });
+    try {
+      const blocked = await fake.handlers.get("tool_call")({
+        toolName: "mcp",
+        input: { server: "paseo", tool: "get_agent_status", args: { agentId: "agent-99" } },
+      }, { ...fake.ctx, env: { ...fake.ctx.env, PATH: `${rogueBin}:${process.env.PATH ?? ""}` } });
+      assert.equal(blocked.block, true);
+      assert.match(blocked.reason, /does not equal the current Lead/);
+    } finally {
+      await rm(rogueBin, { recursive: true, force: true });
+    }
+  } finally {
+    process.chdir(previous);
+    await rm(bin, { recursive: true, force: true });
+    await rm(profiles, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+  }
+});
+
 test("checkToolCall: prototype-named mcp servers fail closed without crashing", () => {
   const leadPolicy = { role: "lead", allowed: ["read", "bash", "mcp"] };
   for (const server of ["__proto__", "constructor", "toString", "hasOwnProperty"]) {
@@ -3226,7 +3297,7 @@ test("activate: live root/child topology fails closed during governed activation
   }
 });
 
-test("reconcilePeerChild: a child is owned only when live Paseo parentage, provider, and repository facts match the assignment", async () => {
+test("reconcilePeerChild: a child is owned only when live Paseo parentage, provider, and repository facts match; asserted task/assignment are bound", async () => {
   const bin = await fakePaseoBin();
   try {
     const env = { ...process.env, PATH: bin };
@@ -3245,11 +3316,21 @@ test("reconcilePeerChild: a child is owned only when live Paseo parentage, provi
     // Repository mismatch fails closed.
     const wrongRepo = await reconcilePeerChild("agent-42", { ...base, expectedRepoRoot: "/other/repo" });
     assert.equal(wrongRepo.ok, false);
-    // Missing mandatory task/assignment binding fails closed.
+    // Task/assignment are Lead-asserted workflow binding facts, not Paseo
+    // child attributes and not members of the closed child-operation shapes.
+    // When absent they are not required: the live parent/provider/repository
+    // reconciliation (mandatory) still passes, and `bound` omits them.
     const noTask = await reconcilePeerChild("agent-42", { ...base, expectedTaskId: "" });
-    assert.equal(noTask.ok, false);
+    assert.equal(noTask.ok, true, noTask.error);
+    assert.equal("taskId" in noTask.bound, false);
+    assert.equal(noTask.bound.assignmentId, "assign-1");
     const noAssign = await reconcilePeerChild("agent-42", { ...base, expectedAssignmentId: "" });
-    assert.equal(noAssign.ok, false);
+    assert.equal(noAssign.ok, true, noAssign.error);
+    assert.equal("assignmentId" in noAssign.bound, false);
+    // When asserted, they are bound exactly as before.
+    const bothAbsent = await reconcilePeerChild("agent-42", { leadAgentId: "lead-9", env, expectedRepoRoot: "/tmp/repo" });
+    assert.equal(bothAbsent.ok, true, bothAbsent.error);
+    assert.deepEqual(bothAbsent.bound, {});
   } finally {
     await rm(bin, { recursive: true, force: true });
   }

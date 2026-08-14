@@ -3437,9 +3437,14 @@ export async function reconcilePeerChild(agentId, opts) {
   const id = (agentId ?? "").trim();
   if (id === "") return { ok: false, error: "no Peer child id to reconcile" };
   if (typeof leadAgentId !== "string" || leadAgentId.trim() === "") return { ok: false, error: "the current Lead id is required to reconcile a child" };
-  if (typeof expectedTaskId !== "string" || expectedTaskId.trim() === "") return { ok: false, error: "the exact task id is required to reconcile a Peer child" };
-  if (typeof expectedAssignmentId !== "string" || expectedAssignmentId.trim() === "") return { ok: false, error: "the exact assignment id is required to reconcile a Peer child" };
+  // (MANDATORY) live Paseo facts reproduced after Lead restart: repository root
+  // applicability, and below the exact parent/provider/workspace of the child.
   if (typeof expectedRepoRoot !== "string" || expectedRepoRoot === "") return { ok: false, error: "the exact repository root is required to reconcile a Peer child" };
+  // task/assignment are Lead-asserted workflow binding facts, not Paseo
+  // child-agent attributes and not members of the closed public child-operation
+  // shapes (agentId [+ prompt]). The normal follow-up/status/cancel/archive path
+  // therefore cannot assert them, so they must not be mandatory inputs here.
+  // When asserted they are validated (returned bound) exactly as before.
   const observed = await observePaseoCurrentAgent(id, { env });
   if (!observed.ok) return { ok: false, error: `child reconciliation inspection failed: ${observed.error}` };
   const obs = observed.observation;
@@ -3461,7 +3466,14 @@ export async function reconcilePeerChild(agentId, opts) {
   } else {
     return { ok: false, error: `child ${id} repository applicability is not observable from live inspection` };
   }
-  return { ok: true, child: obs, bound: { taskId: expectedTaskId, assignmentId: expectedAssignmentId } };
+  return {
+    ok: true,
+    child: obs,
+    bound: {
+      ...(typeof expectedTaskId === "string" && expectedTaskId !== "" ? { taskId: expectedTaskId } : {}),
+      ...(typeof expectedAssignmentId === "string" && expectedAssignmentId !== "" ? { assignmentId: expectedAssignmentId } : {}),
+    },
+  };
 }
 function doctorActivation(roleCheck) {
   if (!roleCheck.ok) return "blocked";
@@ -4897,7 +4909,11 @@ export default function (pi) {
     // v0.2 live child reconciliation: a Lead lifecycle call toward a Peer
     // child is allowed only when live Paseo inspection proves the child's
     // parent equals the current Lead, its provider, its workspace/repository
-    // applicability, and the exact task/assignment binding.
+    // applicability, and (when the Lead asserts them) the exact task/assignment
+    // binding. Process-local sets are only caches; restart recovery rederives
+    // the child from Paseo facts. The closed public child-operation shapes
+    // carry only agentId (+ prompt), so task/assignment are reconciled exactly
+    // when the call asserts them — never required from absent op args.
     let reconciledChildId = null;
     if (latch.role === "lead" && event.toolName === "mcp") {
       const op = canonicalMcpOperation(event?.input?.server, event?.input?.tool);
