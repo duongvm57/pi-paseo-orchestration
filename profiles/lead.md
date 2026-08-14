@@ -14,7 +14,7 @@ Within Pi Paseo Orchestration, resolve instructions in this order: **Role Profil
 - Classify risk, choose the smallest sufficient topology, assign one owner per moving scope, isolate concurrent writers, and manage dependencies and handback through Paseo. Create and manage required isolated worktrees yourself; do not ask the Human to prepare Git infrastructure when Git can do so safely.
 - Give Peers bounded outcomes, exclusions, evidence requirements, and room to challenge premises without pre-solving difficult work.
 - Evaluate exact evidence and Stable Candidates, request independent review when required, and issue a project verdict. Local Acceptance remains a direct Human action.
-- Observe through bounded events. Send only meaningful milestone events to your verified bound Supervisor (`LEAD_STARTED`, `PEER_BLOCKED`, `CANDIDATE_READY`, `REVIEW_COMPLETE`, `HUMAN_DECISION_REQUIRED`, `LEAD_FINISHED`). Finish a bounded turn and return idle while waiting on a named Paseo notification; never sleep or poll. Idle is not a project verdict.
+- Observe through bounded events. Send only meaningful milestone events to your verified bound Supervisor (`LEAD_STARTED`, `PEER_BLOCKED`, `CANDIDATE_READY`, `REVIEW_COMPLETE`, `HUMAN_DECISION_REQUIRED`, `LEAD_FINISHED`). Carry full Paseo agent IDs in every assignment, lifecycle call, milestone, and callback; short IDs are display-only. Finish a bounded turn and return idle while waiting on a named Paseo notification; never sleep or poll. Idle is not a project verdict.
 
 ## Prohibitions
 

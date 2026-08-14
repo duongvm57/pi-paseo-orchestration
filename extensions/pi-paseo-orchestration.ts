@@ -474,24 +474,25 @@ function validProviderAlias(value) {
   return typeof value === "string" && value !== "" && value === value.trim() && !value.includes("/");
 }
 
-// MCP call contract exposed to the model for each role: the outer `mcp` tool
-// takes exactly { server, tool, args } with server "paseo"; only the listed
-// canonical ops and closed arg shapes pass the gate. Weak models fail closed
-// otherwise (DOGFOOD-015), so the contract is explicit in the prompt.
+// Exact role-specific rows teach the model the same closed outer MCP shape the
+// gate enforces (DOGFOOD-015). Canonical operations are the prompt contract;
+// accepted implementation aliases stay out of the agent's decision surface.
 const MCP_CONTRACT = {
   lead: [
-    "list_agents (args {})",
-    "get_agent_status (args { agentId })",
-    "get_agent_activity (args { agentId })",
-    "send_agent_prompt (args { agentId, prompt })",
-    "cancel_agent (args { agentId })",
-    "archive_agent (args { agentId })",
-    "create_agent (see the create_agent policy above)",
+    "`list_workspaces` with `{}`",
+    "`list_providers` with `{}`",
+    "`list_agents` with `{}`",
+    "`get_agent_status` with `{\"agentId\":\"<full Paseo agent ID>\"}`",
+    "`get_agent_activity` with `{\"agentId\":\"<full Paseo agent ID>\"}`",
+    "`send_agent_prompt` with `{\"agentId\":\"<full Paseo agent ID>\",\"prompt\":\"<nonempty prompt>\"}`",
+    "`cancel_agent` with `{\"agentId\":\"<full Paseo agent ID>\"}`",
+    "`archive_agent` with `{\"agentId\":\"<full Paseo agent ID>\"}`",
+    "`create_agent` with the exact Peer creation arguments above",
   ],
   supervisor: [
-    "list_agents (args {})",
-    "get_agent_status (args { agentId })",
-    "get_agent_activity (args { agentId })",
+    "`list_agents` with `{}`",
+    "`get_agent_status` with `{\"agentId\":\"<full Paseo agent ID>\"}`",
+    "`get_agent_activity` with `{\"agentId\":\"<full Paseo agent ID>\"}`",
   ],
 };
 
@@ -499,32 +500,43 @@ function mcpContractPrompt(role) {
   const ops = MCP_CONTRACT[role];
   if (!ops) return "";
   return [
-    "Outer MCP call contract (the only way to reach Paseo): call the mcp tool exactly as {",
-    "  \"server\": \"paseo\",",
-    "  \"tool\": \"<tool-name>\",",
-    "  \"args\": { ... }",
-    "} — server must be exactly \"paseo\" and the tool name must be one of the canonical names below (prefixed paseo_<name> forms are also accepted):",
+    "## Paseo calls",
+    "Call the outer `mcp` tool with exactly these three fields:",
+    "```text",
+    "{\"server\":\"paseo\",\"tool\":\"<operation>\",\"args\":{...}}",
+    "```",
+    "Match `<operation>` and `args` to one row:",
     ...ops.map((op) => `- ${op}`),
-    "Any other shape (missing server/tool, wrong tool name, wrong arg key like agent_id) is rejected by the gate; use the exact arg keys shown.",
+    "A call is ready when its envelope matches one row exactly. Use full Paseo agent IDs; short IDs are display-only.",
   ].join("\n");
 }
 
 function createAgentPolicyPrompt(activeLatch) {
   if (activeLatch.role === "lead") {
     if (!validProviderAlias(activeLatch.peerProviderAlias)) {
-      return `Paseo create_agent is blocked until ${PEER_ALIAS_ENV} names the Human-configured Peer provider alias.`;
+      return [
+        "## Peer creation",
+        `Blocked: ${PEER_ALIAS_ENV} must name the Human-configured Peer provider alias.`,
+        "",
+        mcpContractPrompt("lead"),
+      ].join("\n");
     }
     const routes = objectEntries(activeLatch.settings.peer_routes).map(([id, route]) => {
       /** @type {any} */ const candidate = route;
       return `- ${id}: ${Reflect.get(Object(candidate), "description")} => provider ${activeLatch.peerProviderAlias}/${Reflect.get(Object(candidate), "provider")}/${Reflect.get(Object(candidate), "model")}; settings {\"thinkingOptionId\":${JSON.stringify(Reflect.get(Object(candidate), "thinking"))}}`;
     });
     return [
-      "Paseo create_agent policy (closed v2, accepts canonical create_agent and paseo_create_agent): choose one Human-configured model route for this assignment:",
+      "## Peer creation",
+      "Choose one Human-configured route:",
       ...routes,
-      "- initialPrompt must bind the chosen route exactly once as \"model_route\":\"<route-id>\"",
-      "- omit workspaceId (the child inherits this exact workspace and Paseo supplies parentage); cooperative labels are optional and, when supplied, must be closed to exactly the namespaced keys \"pi-paseo-orchestration.task-key\" and \"pi-paseo-orchestration.assignment-key\" with trimmed nonempty values",
-      `- initialPrompt must bind \"parent_lead_agent_id\" to ${activeLatch.agentId}`,
-      "- notifyOnFinish must be true; title and initialPrompt must be nonempty",
+      "Build one `create_agent` call:",
+      "- Set `provider` and `settings` exactly from the chosen route.",
+      "- Bind the route once in `initialPrompt` as \"model_route\":\"<route-id>\".",
+      `- Bind this full Lead ID once in \`initialPrompt\` as \"parent_lead_agent_id\":\"${activeLatch.agentId}\".`,
+      "- Set a trimmed nonempty `title` (maximum 60 characters), a nonempty `initialPrompt`, and `notifyOnFinish: true`.",
+      "- Let Paseo inherit workspace and parentage; the argument shape excludes `workspaceId`.",
+      "- Labels are optional. When present, use only `pi-paseo-orchestration.task-key` and `pi-paseo-orchestration.assignment-key`, each with a trimmed nonempty value.",
+      "The call is ready when one route and one parent Lead are bound, route settings match, notification is enabled, and every supplied key matches this shape.",
       "",
       mcpContractPrompt("lead"),
     ].join("\n");

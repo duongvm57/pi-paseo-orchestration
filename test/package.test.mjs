@@ -181,6 +181,9 @@ test("declared resources and private profiles are nonempty files", async () => {
     assert.equal((await stat(file)).isFile(), true, `${path} must be a file`);
     assert.notEqual((await readFile(file, "utf8")).trim(), "", `${path} must be nonempty`);
   }
+  for (const role of ["lead", "peer", "supervisor"]) {
+    assert.match(await readFile(join(root, `profiles/${role}.md`), "utf8"), /short IDs are display-only/);
+  }
 
   assert.equal(JSON.stringify(manifest.pi).includes("profiles"), false);
   const skill = await readFile(join(root, manifest.pi.skills[0]), "utf8");
@@ -3468,7 +3471,8 @@ test("settings command: Esc mid-flow goes back instead of cancelling; Esc at the
 
 // ─── v0.2 follow-up behaviors ────────────────────────────────────────────────
 
-test("wiring: fresh governed activation defers topology observation to first input", async () => {  const ext = await freshExtension();
+test("wiring: fresh governed activation defers topology observation to first input", async () => {
+  const ext = await freshExtension();
   const repo = await gitRepoFixture();
   const profiles = await profileDirFixture();
   const dir = await mkdtemp(join(tmpdir(), "ppo-deferred-topology-"));
@@ -3742,14 +3746,20 @@ test("wiring: per-role MCP call contract is injected into the agent prompt (DOGF
       { prompt: "hi", systemPrompt: "base", systemPromptOptions: { selectedTools: activeTools } },
       fake.ctx,
     );
-    assert.match(before.systemPrompt, /Outer MCP call contract/);
-    assert.match(before.systemPrompt, /"server": "paseo"/);
-    assert.match(before.systemPrompt, /get_agent_status \(args \{ agentId \}\)/);
+    assert.match(before.systemPrompt, /## Paseo calls/);
+    assert.match(before.systemPrompt, /\{"server":"paseo","tool":"<operation>","args":\{\.\.\.\}\}/);
+    assert.match(before.systemPrompt, /`get_agent_status` with `\{"agentId":"<full Paseo agent ID>"\}`/);
+    assert.match(before.systemPrompt, /A call is ready when its envelope matches one row exactly/);
+    assert.match(before.systemPrompt, /short IDs are display-only/);
+    assert.doesNotMatch(before.systemPrompt, /paseo_get_agent_status|"agent_id"\s*:|prefixed/);
     if (role === "supervisor") {
-      assert.doesNotMatch(before.systemPrompt, /send_agent_prompt/);
-      assert.doesNotMatch(before.systemPrompt, /create_agent policy/);
+      assert.doesNotMatch(before.systemPrompt, /send_agent_prompt|list_workspaces|list_providers/);
+      assert.doesNotMatch(before.systemPrompt, /## Peer creation/);
     } else {
-      assert.match(before.systemPrompt, /send_agent_prompt \(args \{ agentId, prompt \}\)/);
+      assert.match(before.systemPrompt, /`list_workspaces` with `\{\}`/);
+      assert.match(before.systemPrompt, /`list_providers` with `\{\}`/);
+      assert.match(before.systemPrompt, /`send_agent_prompt` with `\{"agentId":"<full Paseo agent ID>","prompt":"<nonempty prompt>"\}`/);
+      assert.match(before.systemPrompt, /## Peer creation/);
     }
   }
 
@@ -3768,7 +3778,7 @@ test("wiring: per-role MCP call contract is injected into the agent prompt (DOGF
     { prompt: "hi", systemPrompt: "base", systemPromptOptions: { selectedTools: ["read", "bash"] } },
     fakePeer.ctx,
   );
-  assert.doesNotMatch(beforePeer.systemPrompt, /Outer MCP call contract/);
+  assert.doesNotMatch(beforePeer.systemPrompt, /## Paseo calls/);
   await rm(profiles, { recursive: true, force: true });
   await rm(dir, { recursive: true, force: true });
 });
