@@ -94,6 +94,7 @@ const fakePi = (ctxOverrides = {}) => {
         find: (provider, id) => baseModels().find((m) => m.provider === provider && m.id === id),
         complete: () => { throw new Error("settings must never invoke a model"); },
       },
+      observeParentAgentId: async () => role === "peer" ? "lead-7" : null,
       ...(ctxOverrides.ctx ?? {}),
     },
   };
@@ -572,24 +573,25 @@ test("activate: governed role requires agent id, settings snapshot, profile, and
 
     await writeSettings(dir, validDoc);
     const peerEnv = { ...baseEnv, PI_PASEO_ORCHESTRATION_ROLE: "peer" };
-    const approvedPeer = await ext.activate({ env: peerEnv, dir, profileDir: profiles, models: baseModels(), currentModel: baseModels()[1], currentThinking: "off", setModel: async () => true, setThinkingLevel: () => {}, getThinkingLevel: () => "off" });
+    const approvedPeer = await ext.activate({ env: peerEnv, dir, profileDir: profiles, models: baseModels(), currentModel: baseModels()[1], currentThinking: "off", observedParentAgentId: "lead-7", expectedParentAgentId: "lead-7", setModel: async () => true, setThinkingLevel: () => {}, getThinkingLevel: () => "off" });
     assert.equal(approvedPeer.ok, true);
     assert.equal(approvedPeer.latch.selectedPeerRoute, "fast");
-    const unapprovedPeer = await ext.activate({ env: peerEnv, dir, profileDir: profiles, models: baseModels(), currentModel: baseModels()[0], currentThinking: "high", setModel: async () => true, setThinkingLevel: () => {}, getThinkingLevel: () => "high" });
+    const unapprovedPeer = await ext.activate({ env: peerEnv, dir, profileDir: profiles, models: baseModels(), currentModel: baseModels()[0], currentThinking: "high", observedParentAgentId: "lead-7", setModel: async () => true, setThinkingLevel: () => {}, getThinkingLevel: () => "high" });
     assert.equal(unapprovedPeer.ok, false);
     assert.match(unapprovedPeer.error, /allowed Human-configured route/);
-    const wrongPeerThinking = await ext.activate({ env: peerEnv, dir, profileDir: profiles, models: baseModels(), currentModel: baseModels()[1], currentThinking: "high", setModel: async () => true, setThinkingLevel: () => {}, getThinkingLevel: () => "high" });
+    const wrongPeerThinking = await ext.activate({ env: peerEnv, dir, profileDir: profiles, models: baseModels(), currentModel: baseModels()[1], currentThinking: "high", observedParentAgentId: "lead-7", setModel: async () => true, setThinkingLevel: () => {}, getThinkingLevel: () => "high" });
     assert.equal(wrongPeerThinking.ok, false);
 
     // setThinkingLevel returns void in the real Pi API; the effective level
     // must be read back. A clamped level (read-back mismatch) blocks.
-    const clamped = await ext.activate({ env: baseEnv, dir, profileDir: profiles, models: baseModels(), setModel: async () => true, setThinkingLevel: (l) => {}, getThinkingLevel: () => "off" });
+    const clamped = await ext.activate({ env: baseEnv, dir, profileDir: profiles, models: baseModels(), observedParentAgentId: null, setModel: async () => true, setThinkingLevel: (l) => {}, getThinkingLevel: () => "off" });
     assert.equal(clamped.ok, false);
     assert.match(clamped.error, /unavailable or clamped/);
-    const noObservation = await ext.activate({ env: baseEnv, dir, profileDir: profiles, models: baseModels(), setModel: async () => true, setThinkingLevel: (l) => {} });
+    const noObservation = await ext.activate({ env: baseEnv, dir, profileDir: profiles, models: baseModels(), setModel: async () => true, setThinkingLevel: (l) => {}, getThinkingLevel: () => "medium" });
     assert.equal(noObservation.ok, false);
+    assert.match(noObservation.error, /requires live Paseo self\/topology evidence/);
 
-    const ok = await ext.activate({ env: baseEnv, dir, profileDir: profiles, models: baseModels(), setModel: async () => true, setThinkingLevel: (l) => {}, getThinkingLevel: () => "medium" });
+    const ok = await ext.activate({ env: baseEnv, dir, profileDir: profiles, models: baseModels(), observedParentAgentId: null, setModel: async () => true, setThinkingLevel: (l) => {}, getThinkingLevel: () => "medium" });
     assert.equal(ok.ok, true);
     assert.equal(ok.latch.role, "lead");
     assert.equal(ok.latch.agentId, "agent-7");
@@ -615,7 +617,7 @@ test("verifyLatch: settings, profile, role, or agent drift blocks; unchanged pas
     await writeSettings(dir, validDoc);
     const baseEnv = { PI_PASEO_ORCHESTRATION_ROLE: "lead", PASEO_AGENT_ID: "agent-7" };
     const runtime = { model: baseModels()[0], thinkingLevel: "medium" };
-    const { latch } = await ext.activate({ env: baseEnv, dir, profileDir: profiles, models: baseModels(), setModel: async () => true, setThinkingLevel: (l) => {}, getThinkingLevel: () => "medium" });
+    const { latch } = await ext.activate({ env: baseEnv, dir, profileDir: profiles, models: baseModels(), observedParentAgentId: null, setModel: async () => true, setThinkingLevel: (l) => {}, getThinkingLevel: () => "medium" });
 
     assert.equal((await ext.verifyLatch(latch, baseEnv, dir, runtime)).ok, true);
 
@@ -671,39 +673,35 @@ test("checkToolCall: closed per-role gates, outer MCP validation, git publicatio
   assert.equal(extension.checkToolCall("mcp", { tool: "observe_current_agent" }, observerPolicy).block, true);
   assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "observe_current_agent", args: "nope" }, observerPolicy).block, true);
 
-  // Git: commits need a grant (none yet) and publication routes are always blocked.
-  for (const cmd of ["git commit -m x", "git push origin main", "git push --force origin main", "git merge feature", "git commit --amend", "gh pr create", "git pull --rebase && git push"]) {
+  // Git: local reversible commit is allowed for implementation roles with no authority state.
+  for (const cmd of ["git push origin main", "git push --force origin main", "git merge feature", "git commit --amend", "gh pr create", "git pull --rebase && git push"]) {
     assert.equal(extension.checkToolCall("bash", { command: cmd }, peerPolicy).block, true, `must block: ${cmd}`);
   }
   const listPolicy = { role: "lead", allowed: ["mcp"], mcpTargets: { paseo: new Set(["paseo_list_agents"]) } };
   assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_list_agents", args: { statuses: ["idle", "running"], limit: 100 } }, listPolicy), undefined);
   assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_list_agents", args: { workspaceId: "guessed" } }, listPolicy).block, true);
 
-  for (const cmd of ["git status", "git log --oneline", "git diff", "git branch -a", "git fetch origin", "ls -la", "npm test", "git checkout -b feature", "git stash list"]) {
+  for (const cmd of ["git commit -m x", "git status", "git log --oneline", "git diff", "git branch -a", "git fetch origin", "ls -la", "npm test", "git checkout -b feature", "git stash list"]) {
     assert.equal(extension.checkToolCall("bash", { command: cmd }, peerPolicy), undefined, `must pass: ${cmd}`);
   }
 });
 
 
 test("checkToolCall: Lead lifecycle routes target only live-reconciled Peer children", () => {
-  const createdPeerIds = new Set(["peer-1"]);
   const policy = {
     role: "lead",
     allowed: ["mcp"],
     mcpTargets: { paseo: new Set(["send_agent_prompt", "get_agent_status", "get_agent_activity", "cancel_agent", "archive_agent"]) },
-    createdPeerIds,
     reconciledChildId: "peer-1",
   };
   for (const tool of ["paseo_get_agent_status", "paseo_get_agent_activity", "paseo_cancel_agent", "paseo_archive_agent"]) {
     assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool, args: { agentId: "peer-1" } }, policy), undefined);
-    // A non-reconciled target does NOT pass on the cache alone: reconciliation is authoritative.
+    // A non-reconciled target fails closed: only live reconciliation is authoritative.
     assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool, args: { agentId: "other" } }, policy).block, true);
     assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool, args: { agentId: "peer-2" } }, { ...policy, reconciledChildId: null }).block, true);
   }
   assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_send_agent_prompt", args: { agentId: "peer-1", prompt: "Return exact evidence" } }, policy), undefined);
   assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_send_agent_prompt", args: { agentId: "peer-1", prompt: "" } }, policy).block, true);
-  // The process-local createdPeerIds cache alone never grants lifecycle authority.
-  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_get_agent_status", args: { agentId: "peer-1" } }, { ...policy, reconciledChildId: null }).block, true);
 });
 
 test("wiring: passive env stays ungoverned; governed blocks input, injects profile, shapes tools, gates calls", async () => {
@@ -723,7 +721,7 @@ test("wiring: passive env stays ungoverned; governed blocks input, injects profi
     fake.pi.getActiveTools = () => [...fake.holder.activeTools];
     ext.default(fake.pi);
 
-    assert.deepEqual([...fake.handlers.keys()].sort(), ["agent_end", "before_agent_start", "input", "session_before_fork", "session_before_switch", "session_start", "tool_call", "tool_result"]);
+    assert.deepEqual([...fake.handlers.keys()].sort(), ["agent_end", "before_agent_start", "input", "session_before_fork", "session_before_switch", "session_start", "tool_call"]);
 
     // session_start activates with exact model application.
     const registry = fake.ctx.modelRegistry;
@@ -741,16 +739,16 @@ test("wiring: passive env stays ungoverned; governed blocks input, injects profi
       { prompt: "hi", systemPrompt: "base", systemPromptOptions: { selectedTools: ["read", "bash", "write", "mcp", "mcp_script"] } },
       fake.ctx,
     );
-    assert.deepEqual(fake.holder.activeTools, ["read", "bash", "mcp"]);
+    assert.deepEqual(fake.holder.activeTools, ["read", "bash", "write", "mcp"]);
     assert.match(beforeResult.systemPrompt, /<pi-paseo-orchestration role="lead"/);
     assert.match(beforeResult.systemPrompt, /# lead profile/);
     assert.match(beforeResult.systemPrompt, /ppo-peer\/openai\/gpt-5/);
-    assert.doesNotMatch(beforeResult.systemPrompt, /write/);
 
-    // tool_call: write blocked, read passes, unknown MCP is blocked, and the
-    // exact role-bound create_agent route passes through the real handler.
-    const blocked = await fake.handlers.get("tool_call")({ toolName: "write", input: { path: "/x" } }, fake.ctx);
-    assert.equal(blocked.block, true);
+    // tool_call: local write/edit and read pass for the Lead role (no authority
+    // state), unknown MCP is blocked, and the role-bound create_agent route
+    // passes through the real handler.
+    const passedWrite = await fake.handlers.get("tool_call")({ toolName: "write", input: { path: "/x" } }, fake.ctx);
+    assert.equal(passedWrite, undefined);
     const passed = await fake.handlers.get("tool_call")({ toolName: "read", input: {} }, fake.ctx);
     assert.equal(passed, undefined);
     const mcpBlocked = await fake.handlers.get("tool_call")({ toolName: "mcp", input: { server: "paseo", tool: "x" } }, fake.ctx);
@@ -816,7 +814,6 @@ test("checkToolCall: prototype-named mcp servers fail closed without crashing", 
 test("checkToolCall: git global-flag forms and deploy routes are blocked", () => {
   const peerPolicy = { role: "peer", allowed: ["read", "bash"] };
   for (const cmd of [
-    "git --no-pager commit -m x",
     "git -C /repo push origin main",
     "git --git-dir=/x/.git merge feature",
     "vercel deploy",
@@ -860,17 +857,11 @@ test("wiring: missing read or outer mcp baseline blocks a governed lead", async 
   }
 });
 
-// ─── Slice 3: Task Authority Envelope ──────────────────────────────────────────
+// ─── Slice 3: effective tools and scope validation ────────────────────────────
 
 const {
-  ENVELOPE_BEGIN,
-  ENVELOPE_END,
-  parseEnvelope,
   validateScope,
   effectiveTools,
-  checkCommitGate,
-  getAuthority,
-  getAuthorityReason,
 } = extension;
 
 const gitEnv = {
@@ -895,7 +886,7 @@ const validMeta = {
 
 const coreSections = [
   ["decision matrix", "The Human decides product, priority, irreversible trade-off, external-effect, authority, protocol, subjective, and material cost/risk questions; every other role treats those as must-ask boundaries. Supervisor owns observation and authoring; Lead owns framing, routing, and verdicts; Peer owns assigned work."],
-  ["task classes and routing", "Lead self-work is allowed only for tiny/bounded work when a matching Human lead_tiny grant exists; otherwise bounded work routes to one Peer. Cross-module/lifecycle work routes to one Engineer Peer with an isolated checkout. Architecture-sensitive work routes to an Architect disposition and independent review."],
+  ["task classes and routing", "Lead self-work is allowed. Ordinary local reversible work routes to one Peer for the exact assignment; tiny/bounded work routes directly. Cross-module/lifecycle work routes to one Engineer Peer with an isolated checkout. Architecture-sensitive work routes to an Architect disposition and independent review."],
   ["ownership and isolation", "One writer per moving scope; concurrent writers use disjoint scopes and isolated checkouts; ownership returns by explicit handback; the Lead does not take over an owned scope."],
   ["candidate, verification, review, and acceptance", "Every class produces one git Stable Candidate; verification is exact commands with recorded evidence; review triggers follow risk class; acceptance is a direct Human message only."],
   ["reopen, dependency, and blocked handling", "REOPEN_REQUEST names the failed premise; DEPENDENCY_REQUEST names the owner and requirement; BLOCKED reports bounded attempts; requests are decisions, not candidate acceptance."],
@@ -930,22 +921,6 @@ async function gitRepoFixture({ withProtocol = true } = {}) {
   const { stdout } = await git(["rev-parse", "HEAD"], dir);
   return { dir, base: stdout.trim() };
 }
-
-const envelopeText = (obj) => `${ENVELOPE_BEGIN}\n${JSON.stringify(obj, null, 2)}\n${ENVELOPE_END}`;
-
-const peerEnvelope = (over = {}) => ({
-  version: 1,
-  grant_kind: "peer",
-  role: "peer",
-  issuer: "human",
-  agent_id: "agent-7",
-  task_id: "task-42",
-  objective: "Implement the feature under src/",
-  capabilities: ["edit", "local_commit"],
-  scope: "src",
-  base: "0".repeat(40),
-  ...over,
-});
 
 // Governed (supervisor|lead|peer) process wired on a fresh extension instance.
 async function governedFixture(ext, { role = "peer", activeTools = ["read", "bash"] } = {}) {
@@ -1405,16 +1380,14 @@ test("wiring: peer read/grep/ls/find of the protocol or .orchestration is blocke
     const readSrc = await env.fake.handlers.get("tool_call")({ toolName: "read", input: { path: "src/main.go" } }, env.fake.ctx);
     assert.equal(readSrc, undefined);
 
-    // A peer with a valid current edit grant still may not read the protocol.
-    // v0.2: a Peer derives attenuated authority from its exact Paseo parent
-    // Lead, not from a Human-written envelope.
-    ext.bindExactPartner({ leadId: "lead-7" });
-    await inputText(env.fake, "continue the bounded assignment");
-    assert.notEqual(ext.getAuthority(), null);
+    // A Peer with local edit authority still may not read the protocol; the
+    // peer read gate is role-based, not authority-state based.
     const grantedRead = await env.fake.handlers.get("tool_call")({ toolName: "read", input: { path: protoAbs } }, env.fake.ctx);
     assert.equal(grantedRead.block, true);
+    // Ordinary local reversible write outside the protocol path is allowed by
+    // the Peer role with no authority grant.
     const grantedWrite = await env.fake.handlers.get("tool_call")({ toolName: "write", input: { path: join(repo.dir, "src", "x.go") } }, env.fake.ctx);
-    assert.equal(grantedWrite, undefined, "the grant still works outside the protocol path");
+    assert.equal(grantedWrite, undefined, "local write is allowed without any authority grant");
   } finally {
     await rm(env.dir, { recursive: true, force: true });
     await rm(env.profiles, { recursive: true, force: true });
@@ -1725,6 +1698,7 @@ const {
   reconcilePeerChild,
   verifyPartnerBinding,
   sendBoundedEvent,
+  bindExactPartner,
   buildEventEnvelope,
   validateEventEnvelope,
   eventDedupe,
@@ -1741,9 +1715,11 @@ async function commitCandidate(repo, path = "src/feature.go", content = "feature
   return (await git(["rev-parse", "HEAD"], repo.dir)).stdout.trim();
 }
 
-// v0.2 acceptance authority is runtime-captured Human/Lead provenance, not an
-// envelope. The chain must carry the exact candidate base, task/agent ids,
-// the Peer assignment and parent identity, and the assignment scope.
+// Acceptance/candidate evidence validation binds workflow/ownership facts (the
+// exact candidate base, task/agent ids, the Peer assignment and parent
+// identity, and the assignment scope) as artifact checks - not capability
+// credentials and not runtime-captured authority.
+
 const candidateAuthority = (repo, grantedBase, over = {}) => ({
   taskId: "task-1",
   agentId: "peer-1",
@@ -3250,60 +3226,116 @@ test("activate: live root/child topology fails closed during governed activation
   }
 });
 
-test("reconcilePeerChild: a child is owned only when live Paseo parentage equals the current Lead", async () => {
+test("reconcilePeerChild: a child is owned only when live Paseo parentage, provider, and repository facts match the assignment", async () => {
   const bin = await fakePaseoBin();
   try {
     const env = { ...process.env, PATH: bin };
-    const ok = await reconcilePeerChild("agent-42", { leadAgentId: "lead-9", env });
+    const base = { leadAgentId: "lead-9", env, expectedTaskId: "task-1", expectedAssignmentId: "assign-1", expectedRepoRoot: "/tmp/repo", expectedProvider: "pi" };
+    const ok = await reconcilePeerChild("agent-42", base);
     assert.equal(ok.ok, true, ok.error);
-    const wrongLead = await reconcilePeerChild("agent-42", { leadAgentId: "lead-other", env });
+    assert.equal(ok.bound.taskId, "task-1");
+    // Wrong parent fails closed.
+    const wrongLead = await reconcilePeerChild("agent-42", { ...base, leadAgentId: "lead-other" });
     assert.equal(wrongLead.ok, false);
     assert.match(wrongLead.error, /does not equal the current Lead/);
+    // Wrong provider fails closed.
+    const wrongProvider = await reconcilePeerChild("agent-42", { ...base, expectedProvider: "openai" });
+    assert.equal(wrongProvider.ok, false);
+    assert.match(wrongProvider.error, /provider .* does not match/);
+    // Repository mismatch fails closed.
+    const wrongRepo = await reconcilePeerChild("agent-42", { ...base, expectedRepoRoot: "/other/repo" });
+    assert.equal(wrongRepo.ok, false);
+    // Missing mandatory task/assignment binding fails closed.
+    const noTask = await reconcilePeerChild("agent-42", { ...base, expectedTaskId: "" });
+    assert.equal(noTask.ok, false);
+    const noAssign = await reconcilePeerChild("agent-42", { ...base, expectedAssignmentId: "" });
+    assert.equal(noAssign.ok, false);
   } finally {
     await rm(bin, { recursive: true, force: true });
   }
 });
 
-test("verifyPartnerBinding: root Supervisor/Lead binds after live inspection; no false bound partner", async () => {
+test("verifyPartnerBinding: root role/provider/repository partner binds only after live inspection", async () => {
   const bin = await fakePaseoBin({ rootAgent: true });
   try {
     const env = { ...process.env, PATH: bin };
-    const ok = await verifyPartnerBinding({ claimedId: "agent-42", kind: "supervisor", selfId: "another-agent", env });
+    const base = { claimedId: "agent-42", kind: "supervisor", selfId: "another-agent", env, expectedRole: "supervisor", expectedProvider: "pi", expectedRepoRoot: "/tmp/repo", expectedWorkspaceId: "workspace-1", taskId: "task-1" };
+    const ok = await verifyPartnerBinding(base);
     assert.equal(ok.ok, true, ok.error);
+    // Missing mandatory role/task/repo blocks.
+    assert.equal((await verifyPartnerBinding({ ...base, expectedRole: "" })).ok, false);
+    assert.equal((await verifyPartnerBinding({ ...base, taskId: "" })).ok, false);
+    assert.equal((await verifyPartnerBinding({ ...base, expectedRepoRoot: "" })).ok, false);
+    // Wrong expected role blocks.
+    assert.equal((await verifyPartnerBinding({ ...base, expectedRole: "lead" })).ok, false);
+    // Repository mismatch blocks.
+    assert.equal((await verifyPartnerBinding({ ...base, expectedRepoRoot: "/other/repo" })).ok, false);
   } finally {
     await rm(bin, { recursive: true, force: true });
   }
 });
 
-test("sendBoundedEvent and envelope: direction, allowed kind, and duplicate-id fail closed", async () => {
-  assert.equal(sendBoundedEvent({ kind: "LEAD_STARTED", recipientId: "sup-1", taskId: "t", repoRoot: "/r", senderRole: "lead" }).ok, false);
-  const peerRes = sendBoundedEvent({ kind: "handoff", recipientId: "any", taskId: "t", repoRoot: "/r", senderRole: "peer" });
+test("sendBoundedEvent delivers exactly once through an injected transport; ambiguity fails closed", async () => {
+  // No injected transport fails closed.
+  assert.equal((await sendBoundedEvent({ kind: "LEAD_STARTED", recipientId: "sup-1", taskId: "t", repoRoot: "/r", senderRole: "lead" })).ok, false);
+  // A Lead can only send milestones to its verified bound Supervisor.
+  const sendFns = [];
+  const confirmSend = async () => true;
+  const leadRes = await sendBoundedEvent({ kind: "LEAD_STARTED", recipientId: "sup-1", taskId: "t", repoRoot: "/r", senderRole: "lead", send: confirmSend });
+  assert.equal(leadRes.ok, false, "no bound Supervisor yet");
+  bindExactPartner({ supervisorId: "sup-1" });
+  const leadOk = await sendBoundedEvent({ kind: "LEAD_STARTED", recipientId: "sup-1", taskId: "t", repoRoot: "/r", senderRole: "lead", send: async (env) => { sendFns.push(env); return true; } });
+  assert.equal(leadOk.ok, true);
+  assert.equal(sendFns.length, 1, "delivered exactly once");
+  // A fresh envelope always mints a new event_id; idempotent dedupe is on a
+  // delivered envelope (covered by eventDedupe unit checks below).
+  const envelope = buildEventEnvelope({ kind: "CANDIDATE_READY", taskId: "t", senderAgentId: "lead-1", recipientAgentId: "sup-1", repoRoot: "/r" });
+  assert.equal(envelope.ok, true);
+  assert.equal(eventDedupe(envelope.envelope.event_id), false);
+  assert.equal(eventDedupe(envelope.envelope.event_id), true, "same event_id is idempotently ignored");
+  // Ambiguous send (no confirmation) is an explicit failure, never retried.
+  const ambiguous = await sendBoundedEvent({ kind: "CANDIDATE_READY", recipientId: "sup-1", taskId: "t", repoRoot: "/r", senderRole: "lead", send: async () => undefined });
+  assert.equal(ambiguous.ok, false);
+  assert.match(ambiguous.error, /not confirmed/);
+  const throwing = await sendBoundedEvent({ kind: "CANDIDATE_READY", recipientId: "sup-1", taskId: "t", repoRoot: "/r", senderRole: "lead", send: async () => { throw new Error("down"); } });
+  assert.equal(throwing.ok, false);
+  // Peer parent message path: a Peer sends only to its actual parent Lead.
+  const peerRes = await sendBoundedEvent({ kind: "handoff", recipientId: "any", taskId: "t2", repoRoot: "/r", senderRole: "peer", send: async () => true });
   assert.equal(peerRes.ok, false);
   assert.match(peerRes.error, /only to its actual Paseo parent/);
-  const built = buildEventEnvelope({ kind: "CANDIDATE_READY", taskId: "t", senderAgentId: "lead-1", recipientAgentId: "sup-1", repoRoot: "/r" });
-  assert.equal(built.ok, true);
-  assert.equal(eventDedupe(built.envelope.event_id), false);
-  assert.equal(eventDedupe(built.envelope.event_id), true);
-  assert.equal(validateEventEnvelope({ version: 1, kind: "BLOCKED_KIND", event_id: "e", task_id: "t", sender_agent_id: "a", recipient_agent_id: "b", repository_root: "/r", payload: {} }, { direction: "lead_supervisor" }).ok, false);
+  bindExactPartner({ leadId: "lead-7" });
+  const peerOk = await sendBoundedEvent({ kind: "handoff", recipientId: "lead-7", taskId: "t2", repoRoot: "/r", senderRole: "peer", send: async () => true, senderAgentId: "peer-1" });
+  assert.equal(peerOk.ok, true, peerOk.error);
+  // Supervisor observation path: only to its verified bound Lead.
+  const supRes = await sendBoundedEvent({ kind: "observation", recipientId: "lead-7", taskId: "t3", repoRoot: "/r", senderRole: "supervisor", send: async () => true });
+  assert.equal(supRes.ok, true, supRes.error);
 });
-
-test("Lead captures the canonical spec path and sha256 digest from the direct task", async () => {
-  const ext = await freshExtension();
-  const repo = await gitRepoFixture();
-  const previous = process.cwd();
-  process.chdir(repo.dir);
-  try {
-    const specPath = join(repo.dir, "SUBPEC.md");
-    const crypto = await import("node:crypto");
-    const body = "# spec v2\n";
-    await writeFile(specPath, body, "utf8");
-    const expected = crypto.createHash("sha256").update(body).digest("hex");
-    // Deterministic check of the digest the lead capture computes.
-    const computed = crypto.createHash("sha256").update(await readFile(specPath, "utf8")).digest("hex");
-    assert.equal(computed, expected);
-    assert.equal(expected.length, 64);
-  } finally {
-    await rm(repo.dir, { recursive: true, force: true });
-    process.chdir(previous);
-  }
+// Provenance capture was removed in the resolved Human model: ordinary local
+// reversible work needs no runtime-captured authority, spec marker, digest,
+// or grant. The following tests assert the removal and the direct allowance.
+test("resolved model: no hidden authority state or getters remain", () => {
+  assert.equal(typeof extension.getAuthority, "undefined");
+  assert.equal(typeof extension.getAuthorityReason, "undefined");
+});
+test("resolved model: local write/edit and local commit pass for implementation roles without any authority state", () => {
+  const peerPolicy = { role: "peer", allowed: ["read", "bash", "write", "edit"] };
+  const leadPolicy = { role: "lead", allowed: ["read", "bash", "write", "edit", "mcp"] };
+  assert.equal(extension.checkToolCall("write", { path: "src/x.go" }, peerPolicy), undefined);
+  assert.equal(extension.checkToolCall("edit", { path: "src/x.go" }, peerPolicy), undefined);
+  assert.equal(extension.checkToolCall("bash", { command: "git commit -m x" }, peerPolicy), undefined);
+  assert.equal(extension.checkToolCall("bash", { command: "git commit -m x" }, leadPolicy), undefined);
+  // The observation-only Supervisor still cannot write/edit.
+  assert.equal(extension.checkToolCall("write", { path: "x" }, { role: "supervisor", allowed: ["read", "bash", "write", "edit", "mcp"] }).block, true);
+  // Hard Human-only boundaries remain: publish, merge, and amend stay blocked.
+  assert.equal(extension.checkToolCall("bash", { command: "git push" }, peerPolicy).block, true);
+  assert.equal(extension.checkToolCall("bash", { command: "git commit --amend" }, peerPolicy).block, true);
+});
+test("resolved model: effectiveTools grants write/edit to implementation roles only", () => {
+  const base = ["read", "bash", "write", "edit", "mcp"];
+  assert.deepEqual(extension.effectiveTools(base, "lead"), ["read", "bash", "write", "edit", "mcp"]);
+  const peerTool = extension.effectiveTools(base, "peer");
+  assert.equal(peerTool.includes("edit"), true);
+  const supTool = extension.effectiveTools(base, "supervisor");
+  assert.equal(supTool.includes("edit"), false);
+  assert.equal(supTool.includes("write"), false);
 });

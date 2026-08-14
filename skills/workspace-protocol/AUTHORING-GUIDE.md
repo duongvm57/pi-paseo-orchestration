@@ -27,7 +27,6 @@ Preserve this precedence:
 ```text
 Role Profile
   > Workspace Protocol
-  > current-run Task Authority Envelope
   > ordinary task prose
 ```
 

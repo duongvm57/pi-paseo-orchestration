@@ -22,16 +22,16 @@ Human
 - A Peer requires `ParentAgentId = <exact Lead agent ID>`; a root Peer or a Peer of another parent completes as `BLOCKED`.
 - The Supervisor observes exactly one bound Lead per active assignment; it does not direct Peers or issue project acceptance.
 
-## Runtime-captured Human authority
+## Resolved Human model for ordinary local work
 
-The initial root Lead task is captured by the runtime as the current-run Human task authority, including provenance, objective, repository, and requested local effects. The Human writes no marker, JSON envelope, hash, agent ID, assignment ID, scope syntax, or capability name. The runtime mechanically attenuates that authority to the exact child Peer created by the bound Lead; attenuation may narrow but never widen. Push, merge, publish, deploy, protocol mutation, destructive/external effects, secrets/material cost, objective/irreversible decisions, and Local Acceptance remain Human-only boundaries.
+The initial Human root task and the exact Lead assignment authorize ordinary local reversible repository work directly — inspect, edit, test, create/manage an isolated worktree, and create a local commit. No runtime-captured authority state, marker, JSON envelope, capability list, digest, scope parser, attenuation token, or Human-to-Peer grant exists; assignment, ownership, scope, and exclusions are workflow/evidence facts, not capability credentials. The observation-only Supervisor never edits project code. Push, merge, publish, deploy, protocol mutation, destructive/external effects, secrets/material cost, objective/irreversible decisions, and Local Acceptance remain direct Human-only boundaries. Candidate/review/acceptance validation stays an artifact check independent of any authority credential.
 
 ## Event-driven communication
 
 - Peer → Lead: narrow parent-scoped kinds `question`, `blocked`, `dependency`, `progress`, `handoff`, resolved from Paseo parentage.
 - Lead → Supervisor: milestone events `LEAD_STARTED`, `PEER_BLOCKED`, `CANDIDATE_READY`, `REVIEW_COMPLETE`, `HUMAN_DECISION_REQUIRED`, `LEAD_FINISHED`.
 - Supervisor → Lead: evidence-backed observation only to the verified bound Lead.
-- One bounded versioned event envelope; duplicate `event_id` is idempotently ignored; receipt is an attention signal, never acceptance or an Authority Grant.
+- One bounded versioned event envelope; duplicate `event_id` is idempotently ignored; receipt is an attention signal, not acceptance, and carries no authority.
 
 ## MCP operation normalization
 
@@ -43,7 +43,7 @@ Adds checks for `PASEO_MCP_CONNECTED`, `PASEO_REQUIRED_OPERATIONS`, `PASEO_AGENT
 
 ## Removal
 
-`/ppo:bootstrap` and the coordinator workflow are removed. `lead_tiny` and `supervisor_recovery` authority grant kinds are removed. The handwritten authority-envelope markers/parsing and the local edit/commit gate are removed in favor of runtime-captured Human authority.
+`/ppo:bootstrap` and the coordinator workflow are removed. `lead_tiny` and `supervisor_recovery` authority grant kinds are removed. All hidden Task Authority Envelope ceremony for ordinary work is deleted — not renamed: the envelope parser, markers, grant/capability/scope-parser machinery, `currentAuthority`/`authorityActive`/`authorityReason` state and getters, `createdPeerIds` ownership cache, and the local edit/commit gate are gone. Ordinary local reversible edit/test/commit is allowed directly by the assignment; only real external/destructive/Human-only gates remain.
 
 ## Reconciliation and restart
 

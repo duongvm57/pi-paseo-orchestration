@@ -139,8 +139,9 @@ export const AGENT_ENV = "PASEO_AGENT_ID";
 
 // Closed role ceilings: Peer is read+Bash; Supervisor and Lead add the outer
 // mcp tool (whose inner targets are validated separately). write/edit are never
-// in a ceiling — they come only from a current-run Task Authority Envelope
-// grant. mcp_script is in no ceiling.
+// in a ceiling — they are enabled for the implementation roles (Lead and Peer)
+// that perform local reversible repository work from the exact assignment.
+// mcp_script is in no ceiling.
 export const CEILINGS = {
   supervisor: ["read", "bash", "mcp"],
   lead: ["read", "bash", "mcp"],
@@ -148,10 +149,11 @@ export const CEILINGS = {
 };
 
 // Validated outer-MCP inner targets. Lead lifecycle calls are restricted to
-// exact child IDs minted in this process; Paseo remains the control plane.
-// Canonical (unnormalized) operation names only. checkToolCall normalizes
-// adapter-prefixed inputs to these names via canonicalMcpOperation before any
-// policy decision, so prefixed and canonical forms are identical.
+// live-reconciled Peer children (own Paseo parentage), never a process cache;
+// Paseo remains the control plane. Canonical (unnormalized) operation names
+// only. checkToolCall normalizes adapter-prefixed inputs to these names via
+// canonicalMcpOperation before any policy decision, so prefixed and canonical
+// forms are identical.
 export const MCP_TARGETS = {
   supervisor: { paseo: new Set(["list_agents", "get_agent_status", "get_agent_activity"]) },
   lead: { paseo: new Set(["list_workspaces", "list_providers", "list_agents", "create_agent", "send_agent_prompt", "get_agent_status", "get_agent_activity", "cancel_agent", "archive_agent"]) },
@@ -195,34 +197,29 @@ export function canonicalMcpOperation(server, tool) {
 }
 
 const PASEO_CHILD_TOOLS = new Set(["send_agent_prompt", "get_agent_status", "get_agent_activity", "cancel_agent", "archive_agent"]);
-const createdPeerIds = new Set();
 
 // Read-family tools whose targets are checked against the protocol path by the
 // peer read gate inside checkToolCall.
 const PROTOCOL_READ_TOOLS = ["read", "grep", "ls", "find"];
 
 // Cooperative, recognizable-only command detection. Not a sandbox: aliases,
-// scripts, and child programs can bypass it. The git patterns also catch global
-// flag forms (`git --no-pager commit`) by scanning the command line for the
-// subcommand after any `git` invocation.
-const GIT_COMMIT = /\bgit\b[^\n;&|]*\bcommit\b/; // commits need a current-run local_commit grant
-const GIT_COMMIT_INVOCATION = /\bgit\b[^\n;&|]*\bcommit\b/g;
-const GIT_AMEND = /\bgit\b[^\n;&|]*\bcommit\b[^\n;&|]*--amend\b/; // amend is forbidden even with a grant
-
-function recognizableCommitCount(command) {
-  return String(command ?? "").replace(/\r?\n/g, ";").match(GIT_COMMIT_INVOCATION)?.length ?? 0;
-}
+// scripts, and child programs can bypass it. Local reversible commit is
+// allowed for implementation roles by the exact assignment; only amend,
+// push, and merge stay blocked.
+const GIT_AMEND = /\bgit\b[^\n;&|]*\bcommit\b[^\n;&|]*--amend\b/;
 const PUBLICATION = [
   /\bgit\b[^\n;&|]*\b(?:push|merge)\b/, // push/merge never allowed
   /\bgh\s+pr\b/,
   /\b(?:vercel|netlify|flyctl?|railway|supabase|render|amplify)\s+deploy\b/,
 ];
 
-// v0.2: the runtime captures the initial root Human task as the current-run
-// Human authority; no marker, JSON envelope, capability list, digest, scope
-// parser, or grant token is written by the Human. A verified Engineer child
-// derives attenuated authority from its Paseo parentage to the Lead. Common
-// Git object identity helpers used by candidate/doctor validation:
+// Resolved Human model: ordinary local reversible repository work (inspect,
+// edit, test, worktree, local commit) is authorized directly by the initial
+// Human root task and the exact Lead assignment. No marker, JSON envelope,
+// capability list, digest, scope parser, attenuation token, or Human-to-Peer
+// grant exists. Assignment/ownership/scope/exclusions remain workflow facts,
+// not capability credentials. Common Git object identity helpers used by
+// candidate/doctor validation:
 const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 
@@ -300,22 +297,24 @@ export async function activate({ env, dir, profileDir, models, setModel, setThin
 
   const agentId = (env[AGENT_ENV] ?? "").trim();
   if (agentId === "") return { ok: false, error: `${AGENT_ENV} must be nonblank for a governed ${roleCheck.role} process` };
-  // v0.2 live root/child topology validation (fail closed during governed
-  // activation when live Paseo parentage is observed by bounded self-inspection).
-  // A supplied proof of parentage is authoritative; a violation always blocks.
-  if (observedParentAgentId !== undefined) {
-    const par = observedParentAgentId === null ? null : String(observedParentAgentId).trim() || null;
-    if (roleCheck.role === "lead" || roleCheck.role === "supervisor") {
-      if (par !== null) {
-        return { ok: false, error: "a " + roleCheck.role + " must be a root agent; live Paseo inspection observes parent " + par };
-      }
-    } else if (roleCheck.role === "peer") {
-      if (par === null) {
-        return { ok: false, error: "a Peer must have a live Paseo parent equal to the bound Lead; inspection observed none" };
-      }
-      if (expectedParentAgentId !== null && par !== expectedParentAgentId) {
-        return { ok: false, error: "Peer parent " + par + " does not match the bound Lead " + expectedParentAgentId };
-      }
+  // v0.2 live root/child topology validation: governed activation FAILS CLOSED
+  // when mandatory live self/topology evidence is unavailable. A governed role
+  // must observe its own Paseo identity and parentage before it activates; an
+  // undefined parentage (no live observer/CLI) is NOT a success path.
+  if (observedParentAgentId === undefined) {
+    return { ok: false, error: `governed ${roleCheck.role} activation requires live Paseo self/topology evidence (parentage was not observed)` };
+  }
+  const par = observedParentAgentId === null ? null : String(observedParentAgentId).trim() || null;
+  if (roleCheck.role === "lead" || roleCheck.role === "supervisor") {
+    if (par !== null) {
+      return { ok: false, error: "a " + roleCheck.role + " must be a root agent; live Paseo inspection observes parent " + par };
+    }
+  } else if (roleCheck.role === "peer") {
+    if (par === null) {
+      return { ok: false, error: "a Peer must have a live Paseo parent equal to the bound Lead; inspection observed none" };
+    }
+    if (expectedParentAgentId !== null && par !== expectedParentAgentId) {
+      return { ok: false, error: "Peer parent " + par + " does not match the bound Lead " + expectedParentAgentId };
     }
   }
 
@@ -547,7 +546,7 @@ export function checkToolCall(toolName, input, policy) {
   // Peer read gate: the repository-wide Workspace Protocol is Lead governance
   // material. Reading the full protocol is a governance violation for the peer
   // role — assignment-relevant constraints arrive via the prompt, not the
-  // file. The gate is role-based, so a current-run edit grant never unlocks
+  // file. The gate is role-based, so local edit authority never unlocks
   // protocol reads, and protocol presence never bypasses this check.
   if (policy.role === "peer" && PROTOCOL_READ_TOOLS.includes(toolName)) {
     const target = input?.path ?? input?.file_path ?? null;
@@ -595,10 +594,10 @@ export function checkToolCall(toolName, input, policy) {
       if (!closedKeys(input.args, ["agentId"], op === "send_agent_prompt" ? ["prompt", "background", "notifyOnFinish"] : [])) {
         return block(`${op} arguments are not the closed child-specific shape`);
       }
-      // v0.2 live reconciliation is authoritative; createdPeerIds is only a
-      // process-local cache and never grants lifecycle authority.
-      if (policy.reconciledChildId !== input.args.agentId
-          && !(policy.createdPeerIds?.has(input.args.agentId) && policy.reconciledChildAllowCache === true)) return block(`${op} target is not reconciled as a Peer child of the current Lead`);
+      // v0.2 live reconciliation is authoritative: a Lead lifecycle call is
+      // allowed only when live Paseo inspection proved the child's parent is
+      // the current Lead. There is no process-local ownership cache or grant.
+      if (policy.reconciledChildId !== input.args.agentId) return block(`${op} target is not reconciled as a Peer child of the current Lead`);
       if (op === "send_agent_prompt" && (typeof input.args.prompt !== "string" || input.args.prompt.trim() === "")) {
         return block("send_agent_prompt prompt must be nonempty");
       }
@@ -623,19 +622,16 @@ export function checkToolCall(toolName, input, policy) {
       if (pattern.test(input.command)) return block("publication route is always blocked");
     }
     if (GIT_AMEND.test(input.command)) return block("git commit --amend is forbidden");
-    if (GIT_COMMIT.test(input.command) && !policy.authorityActive) {
-      return block("local reversible commits require current-run Human/Lead authority");
-    }
     return undefined;
   }
   if (toolName === "write" || toolName === "edit") {
-    if (!policy.authorityActive) return block("write/edit requires current-run Human/Lead authority");
+    if (policy.role === "supervisor") return block("write/edit is unavailable to the observation-only Supervisor role");
     return undefined;
   }
   return undefined;
 }
 
-// ─── Task Authority Envelope ─────────────────────────────────────────────────
+// ─── Document parsing helpers and scope validation ────────────────────────────
 
 // Raw duplicate-key scan: JSON.parse silently keeps the last duplicate, but the
 // closed schema must reject duplicate fields. Keys are compared decoded (via
@@ -705,7 +701,7 @@ function targetToRepoRelative(repoRoot, target) {
   return rel;
 }
 
-// One granted scope path: nonempty, repository-relative, no absolute/home
+// One assignment scope path (artifact/candidate check): nonempty, repository-relative, no absolute/home
 // path, no backslashes, no empty/dot/traversal segments, no glob characters,
 // no symlink components, and at most a new final component inside an existing
 // real directory ("new files outside an existing real directory" are rejected).
@@ -744,8 +740,9 @@ async function checkScopePath(repoRoot, p, label) {
   return { ok: true, canonical: p };
 }
 
-// Normalized repository-relative writable scope plus in-scope exclusions,
-// checked at envelope activation against the real repository filesystem.
+// Normalized repository-relative writable scope plus in-scope exclusions.
+// validateScope is used by candidate/acceptance Git-fact validation; it never
+// gates ordinary local work and carries no authority credential.
 export async function validateScope(repoRoot, scope, exclusions = []) {
   const scopeCheck = await checkScopePath(repoRoot, scope, "scope");
   if (!scopeCheck.ok) return { ok: false, error: scopeCheck.error };
@@ -761,20 +758,18 @@ export async function validateScope(repoRoot, scope, exclusions = []) {
   return { ok: true, scope, exclusions: canonical };
 }
 
-// One shared effective-policy computation: baseline ∩ (role ceiling ∪
-// current-run envelope capabilities). The envelope's `edit` capability maps to
-// the write and edit tools; `local_commit` gates git commit through bash
-// instead of adding a tool. Tools outside the baseline are never re-enabled.
-export function effectiveTools(baseline, role, authority = null) {
+// One shared effective-policy computation: baseline INTERSECT (role ceiling UNION
+// implementation-role local tools). write/edit and local commit are
+// enabled for the implementation roles (Lead and Peer) as ordinary local
+// reversible work from the exact assignment - no authority state, envelope,
+// capability list, or grant gates them. The observation-only Supervisor gets
+// neither write nor edit. Tools outside the baseline are never re-enabled.
+export function effectiveTools(baseline, role) {
   if (!Array.isArray(baseline)) return [];
   const ceiling = CEILINGS[role] ?? [];
-  // v0.2: local reversible edit capability is enabled whenever the current run
-  // holds captured Human authority (a root Lead) or Lead-attenuated authority
-  // (a verified child Peer). No envelope capability list gates it.
-  const extra = authority !== null && authority !== undefined ? ["write", "edit"] : [];
-  return baseline.filter((tool) => ceiling.includes(tool) || extra.includes(tool));
+  const localWrite = role === "lead" || role === "peer" ? ["write", "edit"] : [];
+  return baseline.filter((tool) => ceiling.includes(tool) || localWrite.includes(tool));
 }
-
 function gitOut(repoRoot, args, trim = true) {
   return execFileAsync("git", args, {
     cwd: repoRoot,
@@ -808,8 +803,8 @@ async function gitChangedPaths(repoRoot) {
 
 // One strict v1 Peer Report, parsed as the first nonempty content of a Peer
 // run's final response. A report is validated as a document only: it NEVER
-// grants authority, NEVER changes the envelope/authority state, and NEVER
-// accepts anything (8.16). Emission, transport, and consumption are Peer/Lead
+// grants authority and NEVER accepts anything. Emission, transport, and
+// consumption are Peer/Lead
 // conduct — the extension validates the format and the correlation facts and
 // implements no mailbox, queue, retry, or notification arming.
 export const REPORT_BEGIN = '<pi-paseo-orchestration report="v1">';
@@ -905,7 +900,7 @@ function validateReportShape(obj) {
 // { ok: true, report: null } when no report is present, { ok: true, report }
 // for a schema-valid report, or { ok: false, error } when a report attempt
 // exists but is misplaced, duplicated, malformed, or invalid — nothing is
-// accepted in that case. Validation never touches authority state.
+// accepted in that case. Validation never minted authority.
 export function parseReport(text) {
   if (typeof text !== "string") return { ok: true, report: null };
   const stripped = text.trimStart();
@@ -984,9 +979,11 @@ export function correlateReport(report, known) {
 // v0.2 moves to event-driven communication with no daemon, continuous polling,
 // or automatic heartbeat. The event envelope below is the shared bounded
 // versioned shape for Lead→Supervisor milestone events and the Peer→Lead /
-// Supervisor→Lead message paths. Receipt is an attention signal, never
-// acceptance or an Authority Grant; identities are inspected before use; a
+// versioned shape for Lead→Supervisor milestone events and the Peer→Lead /
+// Supervisor→Lead message paths. Receipt is an attention signal, not
+// acceptance, and grants nothing; identities are inspected before use; a
 // duplicate event_id is idempotently ignored.
+
 export const EVENT_ENVELOPE_VERSION = 1;
 
 export const EVENT_LEAD_MILESTONES = new Set([
@@ -1077,8 +1074,7 @@ export function parseEventEnvelopeText(text) {
 }
 
 // Idempotency ledger for event_ids. Duplicate delivery of an already-seen
-// event_id is reported and ignored; stale/out-of-order events can never widen
-// authority because nothing in the envelope is an Authority Grant.
+// authority because nothing in the envelope carries any grant or authority.
 const seenEventIds = new Set();
 export function eventDedupe(eventId) {
   const isDuplicate = seenEventIds.has(eventId);
@@ -1319,11 +1315,10 @@ const EVIDENCE_FIELDS = [
 ];
 
 function authorityScope(authority) {
-  const grant = authority?.envelope ?? authority;
-  const scope = authority?.scope ?? grant?.scope;
-  const exclusions = authority?.exclusions ?? grant?.exclusions ?? [];
+  const scope = authority?.scope;
+  const exclusions = authority?.exclusions ?? [];
   if (typeof scope !== "string" || scope === "" || !Array.isArray(exclusions)) {
-    return { ok: false, error: "candidate evidence validation requires the granted scope and exclusions" };
+    return { ok: false, error: "candidate evidence validation requires the assignment scope and exclusions" };
   }
   return { ok: true, scope, exclusions };
 }
@@ -1340,13 +1335,8 @@ function validateCandidateEvidenceShape(object, authority) {
     if (!check.ok) return { ok: false, error: check.error };
   }
   for (const field of ["assignment_id", "parent_id"]) {
-    if (object[field] !== null) {
-      const check = checkNonemptyString(object[field], field);
-      if (!check.ok) return { ok: false, error: check.error };
-    }
-  }
-  if ((object.assignment_id === null) !== (object.parent_id === null)) {
-    return { ok: false, error: "assignment_id and parent_id must both be nonempty strings or both be null for Lead tiny" };
+    const check = checkNonemptyString(object[field], field);
+    if (!check.ok) return { ok: false, error: `${field} must be a nonempty string for a Peer candidate` };
   }
   if (typeof object.workspace_protocol_digest !== "string" || !SHA256_HEX.test(object.workspace_protocol_digest)) {
     return { ok: false, error: "workspace_protocol_digest must be a full sha256 hex digest" };
@@ -1644,10 +1634,11 @@ function validateVerdictShape(object) {
     check = checkNonemptyString(object[field], field);
     if (!check.ok) return { ok: false, error: check.error };
   }
-  if (object.assignment_id !== null) {
-    check = checkNonemptyString(object.assignment_id, "assignment_id");
-    if (!check.ok) return { ok: false, error: check.error };
+  if (object.assignment_id === null) {
+    return { ok: false, error: "verdict assignment_id must be non-null for a PEER_HANDOFF verdict" };
   }
+  check = checkNonemptyString(object.assignment_id, "assignment_id");
+  if (!check.ok) return { ok: false, error: check.error };
   if (typeof object.workspace_protocol_digest !== "string" || !SHA256_HEX.test(object.workspace_protocol_digest)) {
     return { ok: false, error: "workspace_protocol_digest must be a full sha256 hex digest" };
   }
@@ -1656,17 +1647,11 @@ function validateVerdictShape(object) {
 
   check = checkClosedObject(object.origin, ["kind", "evidence_id"], "verdict origin");
   if (!check.ok) return { ok: false, error: check.error };
-  if (!["PEER_HANDOFF", "LEAD_TINY"].includes(object.origin.kind)) {
-    return { ok: false, error: "origin.kind must be PEER_HANDOFF or LEAD_TINY" };
+  if (object.origin.kind !== "PEER_HANDOFF") {
+    return { ok: false, error: "origin.kind must be exactly PEER_HANDOFF" };
   }
   check = checkNonemptyString(object.origin.evidence_id, "origin.evidence_id");
   if (!check.ok) return { ok: false, error: check.error };
-  if (object.origin.kind === "PEER_HANDOFF" && object.assignment_id === null) {
-    return { ok: false, error: "PEER_HANDOFF verdict requires a non-null assignment_id" };
-  }
-  if (object.origin.kind === "LEAD_TINY" && object.assignment_id !== null) {
-    return { ok: false, error: "LEAD_TINY verdict requires assignment_id null" };
-  }
   if (!["PASS", "FAIL"].includes(object.scope_result)) {
     return { ok: false, error: "scope_result must be PASS or FAIL" };
   }
@@ -1771,9 +1756,10 @@ export function parseAcceptance(text, source) {
   return parsed;
 }
 
-// v0.2 acceptance authority is the runtime-captured Human/Lead provenance, not
-// an envelope. The chain must carry the exact candidate base, task/agent ids,
-// the Peer assignment and parent identity, and the assignment scope.
+// Acceptance validation binds workflow/ownership facts (exact candidate base,
+// task/agent ids, the Peer assignment and parent identity, and the assignment
+// scope) as artifact checks - not capability credentials. It validates the
+// candidate evidence chain without any runtime-captured authority.
 function acceptanceAuthority(authority) {
   if (!isRecord(authority)) return { ok: false, error: "acceptance requires the validated candidate authority" };
   for (const [field, value] of [
@@ -1793,12 +1779,13 @@ function acceptanceAuthority(authority) {
     if (!check.ok) return { ok: false, error: `authority.${field} must be a nonempty string for a Peer candidate` };
   }
   if (typeof authority.base !== "string" || !FULL_SHA.test(authority.base)) {
-    return { ok: false, error: "authority.base must be a full Git commit SHA (the captured candidate base)" };
+    return { ok: false, error: "assignment.base must be a full Git commit SHA (the assignment candidate base)" };
   }
   const scope = authorityScope(authority);
   if (!scope.ok) return { ok: false, error: scope.error };
-  // grant_kind is fixed internally to Peer write work (lead_tiny is removed).
-  const grant = { grant_kind: "peer", agent_id: authority.agentId, task_id: authority.taskId, base: authority.base };
+  // The Peer-write binding is an assignment fact (agent/task/base), not a
+  // grant; ordinary local work needs no grant.
+  const grant = { agent_id: authority.agentId, task_id: authority.taskId, base: authority.base };
   return { ok: true, grant, scope: scope.scope, exclusions: scope.exclusions };
 }
 
@@ -1882,9 +1869,8 @@ export async function validateAcceptance(options = {}) {
   if (verdict.origin.evidence_id !== evidence.evidence_id) {
     return { ok: false, error: "verdict origin does not reference the candidate evidence id" };
   }
-  const expectedOrigin = auth.grant.grant_kind === "peer" ? "PEER_HANDOFF" : "LEAD_TINY";
-  if (verdict.origin.kind !== expectedOrigin) {
-    return { ok: false, error: `verdict origin must be ${expectedOrigin} for this authority` };
+  if (verdict.origin.kind !== "PEER_HANDOFF") {
+    return { ok: false, error: "verdict origin must be PEER_HANDOFF for this assignment" };
   }
   if (verdict.verdict !== "READY" || verdictStatus(verdict) !== "READY") {
     return { ok: false, error: "Local Acceptance requires a READY verdict after precedence revalidation" };
@@ -1969,9 +1955,10 @@ export async function validateAcceptance(options = {}) {
 // One canonical repository-wide protocol at the repository root; v0.1 has no
 // overlays. This slice is read/validate/pin/guard only: workflow consumption
 // of the protocol (classification, routing) is a later slice. The protocol can
-// narrow workflow, but it cannot grant a Capability or override the Role
-// Profile / Task Authority Envelope — the pin is advisory-only for authority
-// and checkToolCall never consults it.
+// narrow workflow, but it cannot grant a capability or override the Role
+// Profile. The pin is advisory-only for authority and was designed before the
+// resolved Human model removed authority ceremony; checkToolCall never
+// consults it.
 
 // Required core section headings, normalized (lowercase, whitespace-collapsed).
 // Optional sections are limited to the closed set below; their presence grants
@@ -2167,8 +2154,8 @@ export async function readAndValidateProtocol(repoRoot) {
 // and every later gate (input / before_agent_start / tool_call) re-reads,
 // re-validates, and compares. Drift or identity mismatch blocks permanently;
 // the pin is per repoRoot and re-pins when the resolved root changes. Peer and
-// Supervisor roles never pin: the protocol is advisory-only for authority, so
-// authority checks never consult it.
+// Supervisor roles never pin: the protocol is advisory-only, so no policy or
+// lifecycle gate consults it for authority.
 async function ensureProtocolPin() {
   if (latch === null || latch.role !== "lead") return { ok: true };
   const repoRoot = await findRepoRoot();
@@ -3230,7 +3217,7 @@ const DOCTOR_CHECK_CODES = [
   "PASEO_SELF_INSPECT", "ADAPTER_OBSERVER", "OBSERVER_ATTESTATION",
   "ROLE_ACTIVATION", "ROLE_SETTINGS", "ROLE_PROFILE", "ROLE_PROVIDER", "ROLE_PARENTAGE",
   "WORKSPACE_PROTOCOL", "WORKSPACE_BINDING", "LEAD_SUPERVISOR_BINDING", "PEER_PARENT_BINDING",
-  "TOOL_POLICY", "AUTHORITY_STATE", "EVENT_CAPABILITIES",
+  "TOOL_POLICY", "EVENT_CAPABILITIES",
 ];
 
 function doctorRemediation(status, owner, action) {
@@ -3301,10 +3288,16 @@ function validatePaseoObservation(observation, agentId) {
   if (typeof workspaceId !== "string" || workspaceId.trim() === "") return { ok: false, error: "observer typed workspace_id is missing" };
   if (typeof projectId !== "string" || projectId.trim() === "") return { ok: false, error: "observer workspace project_id is missing" };
   if (observation.workspace_typed !== true && workspace.typed !== true) return { ok: false, error: "observer typed workspace binding is not attested" };
-  if (!Object.prototype.hasOwnProperty.call(observation, "parent_id") && !Object.prototype.hasOwnProperty.call(observation, "parent")) return { ok: false, error: "observer parentage is missing" };
+  const hasParentId = Object.prototype.hasOwnProperty.call(observation, "parent_agent_id")
+    || Object.prototype.hasOwnProperty.call(observation, "parent_id")
+    || Object.prototype.hasOwnProperty.call(observation, "parent");
+  if (!hasParentId) return { ok: false, error: "observer parentage is missing" };
   const parent = isRecord(observation.parent) ? observation.parent : {};
-  const parentId = Object.prototype.hasOwnProperty.call(observation, "parent_id") ? observation.parent_id : (parent.id ?? null);
-  if (parentId !== null && typeof parentId !== "string") return { ok: false, error: "observer parent_id is malformed" };
+  const parentId = Object.prototype.hasOwnProperty.call(observation, "parent_agent_id")
+    ? observation.parent_agent_id
+    : Object.prototype.hasOwnProperty.call(observation, "parent_id") ? observation.parent_id : (parent.id ?? null);
+  if (parentId !== null && typeof parentId !== "string") return { ok: false, error: "observer parent field is malformed" };
+  if (parentId !== null && observation.parent_resolvable !== true && parent.resolvable !== true) return { ok: false, error: "observer parent resolvability is not attested" };
   if (parentId !== null && observation.parent_resolvable !== true && parent.resolvable !== true) return { ok: false, error: "observer parent resolvability is not attested" };
   const runtime = observation.runtimeInfo ?? observation.runtime_info;
   if (!isRecord(runtime)) return { ok: false, error: "observer runtimeInfo is missing" };
@@ -3429,23 +3422,46 @@ function topologyFromParentage(role, observedParentId, boundLeadId = null) {
 const REQUIRED_REMOTE_OPERATIONS = ["create_agent", "list_agents", "get_agent_status", "get_agent_activity", "send_agent_prompt"];
 
 // Reconciles a claimed Peer child against live Paseo facts before any lifecycle
-// call (send/inspect/cancel/archive). v0.2 removes process-local createdPeerIds
-// as the ownership authority: ownership is the actual Paseo parentage of the
-// child equal to the current Lead, plus provider/task/assignment pinning.
-// Returns a pass only when live inspection proves the exact parent chain; a
-// missing or ambiguous observation, or a parent other than the current Lead,
-// fails closed (BLOCKED).
+// call (send/inspect/cancel/archive). Ownership is the actual Paseo parentage
+// of the child equal to the current Lead, plus live provider/role, task and
+// assignment binding, and workspace/repository applicability. Returns a pass
+// only when live inspection proves the exact parent chain and the mandatory
+// Peer binding facts; a missing or ambiguous observation, a parent other than
+// the current Lead, a provider/role mismatch, or a workspace/repository
+// mismatch fails closed (BLOCKED).
 export async function reconcilePeerChild(agentId, opts) {
-  const { leadAgentId, env = process.env } = (opts ?? {});
+  const {
+    leadAgentId, env = process.env,
+    expectedProvider, expectedWorkspaceId, expectedRepoRoot, expectedTaskId, expectedAssignmentId,
+  } = (opts ?? {});
   const id = (agentId ?? "").trim();
   if (id === "") return { ok: false, error: "no Peer child id to reconcile" };
   if (typeof leadAgentId !== "string" || leadAgentId.trim() === "") return { ok: false, error: "the current Lead id is required to reconcile a child" };
+  if (typeof expectedTaskId !== "string" || expectedTaskId.trim() === "") return { ok: false, error: "the exact task id is required to reconcile a Peer child" };
+  if (typeof expectedAssignmentId !== "string" || expectedAssignmentId.trim() === "") return { ok: false, error: "the exact assignment id is required to reconcile a Peer child" };
+  if (typeof expectedRepoRoot !== "string" || expectedRepoRoot === "") return { ok: false, error: "the exact repository root is required to reconcile a Peer child" };
   const observed = await observePaseoCurrentAgent(id, { env });
   if (!observed.ok) return { ok: false, error: `child reconciliation inspection failed: ${observed.error}` };
-  const parent = observed.observation.parent_agent_id ?? null;
+  const obs = observed.observation;
+  const parent = obs.parent_agent_id ?? null;
   if (parent === null || parent === "") return { ok: false, error: `child ${id} is not a Peer; live inspection observes no parent` };
   if (parent !== leadAgentId) return { ok: false, error: `child ${id} parent ${parent} does not equal the current Lead ${leadAgentId}` };
-  return { ok: true, child: observed.observation };
+  if (typeof expectedProvider === "string" && expectedProvider !== "" && obs.provider !== expectedProvider) {
+    return { ok: false, error: `child ${id} provider ${obs.provider} does not match the expected Peer provider ${expectedProvider}` };
+  }
+  if (typeof expectedWorkspaceId === "string" && expectedWorkspaceId !== ""
+      && obs.workspace_id !== null && obs.workspace_id !== expectedWorkspaceId) {
+    return { ok: false, error: `child ${id} workspace ${obs.workspace_id} does not match the expected workspace ${expectedWorkspaceId}` };
+  }
+  if (typeof obs.cwd === "string" && obs.cwd !== "") {
+    const normCwd = obs.cwd.replace(/\/+$/, "");
+    if (normCwd !== expectedRepoRoot.replace(/\/+$/, "") && !normCwd.startsWith(expectedRepoRoot.replace(/\/+$/, "") + "/")) {
+      return { ok: false, error: `child ${id} cwd ${obs.cwd} is outside the expected repository ${expectedRepoRoot}` };
+    }
+  } else {
+    return { ok: false, error: `child ${id} repository applicability is not observable from live inspection` };
+  }
+  return { ok: true, child: obs, bound: { taskId: expectedTaskId, assignmentId: expectedAssignmentId } };
 }
 function doctorActivation(roleCheck) {
   if (!roleCheck.ok) return "blocked";
@@ -3460,26 +3476,19 @@ function doctorPiCapabilities(pi) {
   return { missing, observed: required.filter((name) => typeof pi?.[name] === "function") };
 }
 
-function doctorAuthorityState() {
-  if (currentAuthority !== null) return "valid";
-  if (authorityReason !== null) return "rejected";
-  return "none";
-}
-
 function doctorEffectiveToolReport(pi, role) {
   const observed = readActiveTools(pi);
   const actual = observed.ok ? observed.tools : [];
   const base = baseline ?? [];
-  const authority = currentAuthority;
-  const expected = role ? effectiveTools(base, role, authority) : [];
-  const requested = authority !== null && authority !== undefined ? ["edit"] : [];
+  const expected = role ? effectiveTools(base, role) : [];
+  const requested = role === "lead" || role === "peer" ? ["write", "edit"] : [];
   const names = [...new Set([...base, ...CEILINGS[role] ?? [], "mcp_script", "write", "edit"])].sort();
   const effective = names.map((name) => {
     const active = actual.includes(name);
     const allowed = expected.includes(name);
     return {
       name,
-      source: base.includes(name) ? "session_baseline" : "role_ceiling_or_authority",
+      source: base.includes(name) ? "session_baseline" : "role_ceiling_or_local",
       state: active ? "active" : (base.includes(name) || allowed ? "inactive" : "unavailable"),
       reason: active ? (allowed ? "effective_policy" : "policy_drift") : (base.includes(name) ? "human_disabled_or_not_applied" : "outside_role_ceiling"),
     };
@@ -3554,7 +3563,7 @@ export async function buildDoctorReport(options = {}) {
   checks.push(doctorCheck("ROLE_PARENTAGE", "Paseo role parentage", parentageStatus, role ? "Lead/Supervisor are root (ParentAgentId null); Peer parent equals the bound Lead" : "parentage is not constrained in passive mode", role ? parentage.reason : "not applicable", [{ kind: "api", source: "current observation tuple", output: role ? (paseo.observation?.parent_agent_id ?? paseo.observation?.parent?.id ?? "null") : null }], { owner: role === "lead" || role === "supervisor" ? "human" : "lead", action: "Create Lead and Supervisor as root agents and Peers as exact Lead children; a root role with a Paseo parent must be recreated.", applicable: role !== null, required: parentageRequired }));
 
   const selfInspected = paseo.status === "PASS" && paseo.observation?.agent_id === (env[AGENT_ENV] ?? "").trim()
-    && typeof paseo.observation?.parent_id !== "undefined";
+    && typeof (paseo.observation?.parent_agent_id ?? paseo.observation?.parent?.id) !== "undefined";
   const selfInspectStatus = role ? (selfInspected ? "PASS" : "BLOCKED") : "WARN";
   checks.push(doctorCheck("PASEO_SELF_INSPECT", "self-inspection of the current Paseo agent", selfInspectStatus, role ? "the current agent self-inspects identity, parentage, model, and cwd" : "self-inspection is not required in passive mode", selfInspected ? "self-inspection tuple present" : (paseo.reason ?? "self-inspection unavailable"), [{ kind: "api", source: paseo.observation?.source ?? "current-agent observation", output: selfInspected ? "complete" : "incomplete" }], { owner: "operator", action: "Provide a live current-agent self-inspection (paseo inspect or public observer) before governed work.", applicable: role !== null, required: role !== null }));
 
@@ -3648,10 +3657,8 @@ export async function buildDoctorReport(options = {}) {
   const expectedActiveTools = baseline === null ? null : (lastAppliedTools ?? baseline);
   const toolDrift = role ? expectedActiveTools === null || !sameList(toolReport.actual, expectedActiveTools) : false;
   const toolStatus = !missingCore.ok || toolDrift || toolReport.actual.includes("mcp_script") ? (role ? "BLOCKED" : "WARN") : "PASS";
-  checks.push(doctorCheck("TOOL_POLICY", "baseline, ceiling, authority, and effective tools", toolStatus, role ? "actual tools equal baseline ∩ role policy ∩ current authority" : "passive mode does not shape tools", JSON.stringify({ baseline: toolReport.base, ceiling: CEILINGS[role] ?? [], requested: toolReport.requested, effective: toolReport.actual }), [{ kind: "memory", source: "Pi active-tool API", output: JSON.stringify(toolReport.effective) }], { owner: "human", action: "Restore the Human-selected baseline and rerun the governed process; doctor never re-enables tools.", applicable: role !== null, required: role !== null }));
-  const authorityState = doctorAuthorityState();
-  const authorityStatus = blockedReason !== null ? "BLOCKED" : authorityState === "rejected" ? "WARN" : "PASS";
-  checks.push(doctorCheck("AUTHORITY_STATE", "current-run Human/Lead authority provenance", authorityStatus, "doctor reports internal authority only; no authority is minted or inferred", authorityState, [{ kind: "memory", source: "extension authority state", output: currentAuthority ? JSON.stringify({ source: currentAuthority.source, agentId: currentAuthority.agentId, taskId: currentAuthority.taskId ?? null }) : authorityReason ?? "none" }], { owner: "human", action: "Issue the Human task to the root Lead and verify a Lead-attenuated Peer via Paseo parentage; doctor mints no authority." }));
+  checks.push(doctorCheck("TOOL_POLICY", "baseline, role ceiling, and effective tools", toolStatus, role ? "actual tools equal the baseline intersected with the role ceiling and local implementation tools" : "passive mode does not shape tools", JSON.stringify({ baseline: toolReport.base, ceiling: CEILINGS[role] ?? [], requested: toolReport.requested, effective: toolReport.actual }), [{ kind: "memory", source: "Pi active-tool API", output: JSON.stringify(toolReport.effective) }], { owner: "human", action: "Restore the Human-selected baseline and rerun the governed process; doctor never re-enables tools.", applicable: role !== null, required: role !== null }));
+
 
   // v0.2 binding evidence: a bound Supervisor for the Lead, a bound Lead for
   // the Peer/Supervisor, and event capability presence. Missing binding is
@@ -3682,9 +3689,8 @@ export async function buildDoctorReport(options = {}) {
     protocol_project_id: protocol?.ok ? protocol.protocol.meta.project_id : null,
     role,
   };
-  const authoritySource = currentAuthority?.source ?? null;
   const actualToolPolicy = {
-    session_baseline: [...toolReport.base], role_ceiling: [...(CEILINGS[role] ?? [])], authority_state: authorityState,
+    session_baseline: [...toolReport.base], role_ceiling: [...(CEILINGS[role] ?? [])],
     requested_capabilities: [...toolReport.requested],
     effective_tools: toolReport.effective,
   };
@@ -3712,9 +3718,6 @@ export async function buildDoctorReport(options = {}) {
       "Human/profile/protocol semantics are not cryptographically proven",
     ],
   };
-  // Keep the authority variable intentionally local to the observation block;
-  // it is not included in raw prompt form and does not alter current authority.
-  void authoritySource;
   if (paseo.status === "PASS") {
     const finalPaseo = await doctorPaseoObservation(ctx, env, role);
     if (finalPaseo.status !== "PASS" || canonicalNotebookJson(finalPaseo.observation) !== canonicalNotebookJson(paseo.observation)) {
@@ -3739,7 +3742,7 @@ export function formatDoctorTable(report) {
   for (const check of report.checks) {
     lines.push(`${check.status} | ${check.code} | ${check.observed} | ${check.remediation.action ?? "none"}`);
   }
-  lines.push(`authority=${report.policy.authority_state} tools=${report.policy.effective_tools.filter((tool) => tool.state === "active").map((tool) => tool.name).join(",") || "none"}`);
+  lines.push(`tools=${report.policy.effective_tools.filter((tool) => tool.state === "active").map((tool) => tool.name).join(",") || "none"}`);
   lines.push(`limitations=${report.limitations.join("; ")}`);
   return lines.join("\n");
 }
@@ -3826,9 +3829,8 @@ export function parseDoctorReport(text) {
       if (typeof command.command !== "string" || typeof command.mutates !== "boolean") return { ok: false, error: "doctor remediation command is malformed" };
     }
   }
-  check = notebookClosed(report.policy, ["session_baseline", "role_ceiling", "authority_state", "requested_capabilities", "effective_tools"], "doctor policy"); if (!check.ok) return { ok: false, error: check.error };
+  check = notebookClosed(report.policy, ["session_baseline", "role_ceiling", "requested_capabilities", "effective_tools"], "doctor policy"); if (!check.ok) return { ok: false, error: check.error };
   for (const field of ["session_baseline", "role_ceiling", "requested_capabilities"]) { check = validateDoctorStringArray(report.policy[field], `doctor policy.${field}`); if (!check.ok) return { ok: false, error: check.error }; }
-  if (!["none", "valid", "rejected", "stale_inactive"].includes(report.policy.authority_state)) return { ok: false, error: "doctor policy authority_state is invalid" };
   if (!Array.isArray(report.policy.effective_tools)) return { ok: false, error: "doctor policy.effective_tools must be an array" };
   for (const tool of report.policy.effective_tools) {
     check = notebookClosed(tool, ["name", "source", "state", "reason"], "doctor policy tool"); if (!check.ok) return { ok: false, error: check.error };
@@ -4196,16 +4198,10 @@ let lastAppliedTools = null;
 // Protocol pin: { repoRoot, version, projectId, digest } for the Lead role,
 // process-latched like the role latch. Advisory-only for authority.
 let protocolPin = null;
-// Current-run authority record: { envelope, repoRoot, scope, exclusions } or
-// null when the run carries no valid grant. Replaced on every input event.
-let currentAuthority = null;
-// Last validated terminal Peer Report / acceptance are process-local evidence only;
-// no mailbox, registry, or durable workflow state is created.
+// Last validated terminal Peer Report / acceptance are process-local evidence
+// only; no mailbox, registry, or durable workflow state is created.
 let lastPeerReport = null;
 let lastAcceptance = null;
-// Last explicit no-authority reason (diagnostics; doctor reads it later).
-let authorityReason = null;
-
 // v0.2 binding state (process-local cache only). The exact single Supervisor
 // bound to a Lead, the exact Lead bound to a Supervisor, and the bound Lead for
 // a Peer. These are caches: restart reconciliation re-derives them from Paseo
@@ -4230,32 +4226,68 @@ export function getBoundLeadId() { return boundLeadId; }
 // Process memory is only a cache; restart reconciliation revalidates against
 // the same live facts. Fails closed on missing or conflicting identity.
 export async function verifyPartnerBinding(opts) {
-  const { claimedId, kind, selfId, taskId, env = process.env } = (opts ?? {});
+  const {
+    claimedId, kind, selfId, taskId, env = process.env,
+    expectedProvider, expectedRole, expectedRepoRoot, expectedWorkspaceId,
+  } = (opts ?? {});
   if (typeof claimedId !== "string" || claimedId.trim() === "") return { ok: false, error: "a bound partner id is required" };
   if (typeof selfId !== "string" || selfId.trim() === "") return { ok: false, error: "the current agent id is required to bind a partner" };
+  if (typeof expectedRole !== "string" || expectedRole === "") return { ok: false, error: "the expected partner role is required to bind" };
+  if (typeof taskId !== "string" || taskId.trim() === "") return { ok: false, error: "the exact task/assignment id is required to bind a partner" };
+  if (typeof expectedRepoRoot !== "string" || expectedRepoRoot === "") return { ok: false, error: "the exact repository root is required to bind a partner" };
   const observed = await observePaseoCurrentAgent(claimedId.trim(), { env });
   if (!observed.ok) return { ok: false, error: `partner inspection failed: ${observed.error}` };
-  const parent = observed.observation.parent_agent_id ?? null;
+  const obs = observed.observation;
+  const resRole = expectedRole === "lead" ? "Lead" : expectedRole === "supervisor" ? "Supervisor" : expectedRole;
+  if (resRole !== expectedRole && resRole !== "Lead" && resRole !== "Supervisor") {
+    return { ok: false, error: `unknown partner kind ${String(kind)}` };
+  }
+  if (kind !== expectedRole) return { ok: false, error: `partner kind ${kind} does not match the expected role ${expectedRole}` };
+  const expectedProviderLabel = expectedProvider;
+  if (typeof expectedProviderLabel === "string" && expectedProviderLabel !== ""
+      && obs.provider !== expectedProviderLabel) {
+    return { ok: false, error: `partner provider ${obs.provider} does not match the expected provider ${expectedProviderLabel}` };
+  }
+  // Root parentage from live inspection.
+  const parent = obs.parent_agent_id ?? null;
   if (parent !== null && parent !== "") return { ok: false, error: `the ${kind} partner must be a root agent; live inspection observes parent ${parent}` };
+  if (claimedId.trim() === selfId) return { ok: false, error: `a ${kind} cannot be bound to itself` };
+  // Repository applicability from live cwd (the partner must be in the expected repo).
+  if (typeof obs.cwd === "string" && obs.cwd !== "") {
+    const normCwd = obs.cwd.replace(/\/+$/, "");
+    if (normCwd !== expectedRepoRoot.replace(/\/+$/, "") && !normCwd.startsWith(expectedRepoRoot.replace(/\/+$/, "") + "/")) {
+      return { ok: false, error: `partner cwd ${obs.cwd} is outside the expected repository ${expectedRepoRoot}` };
+    }
+  } else {
+    return { ok: false, error: "partner repository applicability is not observable from live inspection" };
+  }
+  // Workspace applicability: the expected workspace id must be supplied as an
+  // exact binding fact; the live observation must surface it when observable.
+  if (typeof expectedWorkspaceId === "string" && expectedWorkspaceId !== ""
+      && obs.workspace_id !== null && obs.workspace_id !== expectedWorkspaceId) {
+    return { ok: false, error: `partner workspace ${obs.workspace_id} does not match the expected workspace ${expectedWorkspaceId}` };
+  }
   if (kind === "supervisor") {
-    if (claimedId === selfId) return { ok: false, error: "a Supervisor cannot be bound to itself" };
     boundSupervisorId = claimedId.trim();
   } else if (kind === "lead") {
-    if (claimedId === selfId) return { ok: false, error: "a Lead cannot be bound to itself" };
     boundLeadId = claimedId.trim();
   } else {
     return { ok: false, error: `unknown partner kind ${String(kind)}` };
   }
-  return { ok: true, partnerId: claimedId.trim(), taskId: taskId ?? null };
+  return { ok: true, partnerId: claimedId.trim(), taskId };
 }
 
-// Directional bounded event send. The recipient must be the exact verified
+// Directional bounded event delivery. The recipient must be the exact verified
 // bound partner for the direction, and the kind must be in the allowed set for
-// that direction. Delivery ambiguity is not auto-retried; a duplicate event_id
-// is idempotently ignored. Returns the validated bounded envelope or a
-// fail-closed error.
-export function sendBoundedEvent(opts) {
-  const { kind, recipientId, taskId, repoRoot, senderRole, senderAgentId, payload = {} } = (opts ?? {});
+// that direction. Delivery goes through a caller-injected Paseo transport/send
+// callback exactly once; ambiguity or a failed/absent transport returns an
+// explicit failure and is never auto-retried. A duplicate event_id is
+// idempotently ignored before delivery.
+export async function sendBoundedEvent(opts) {
+  const { kind, recipientId, taskId, repoRoot, senderRole, senderAgentId, payload = {}, send } = (opts ?? {});
+  if (typeof send !== "function") {
+    return { ok: false, error: "sendBoundedEvent requires an injected Paseo transport/send callback" };
+  }
   if (senderRole === "lead") {
     if (recipientId === null || recipientId !== boundSupervisorId) return { ok: false, error: "a Lead sends milestone events only to its verified bound Supervisor" };
     if (!EVENT_LEAD_MILESTONES.has(kind)) return { ok: false, error: `kind ${String(kind)} is not a Lead-to-Supervisor milestone` };
@@ -4273,7 +4305,18 @@ export function sendBoundedEvent(opts) {
   const envelope = built.envelope;
   if (envelope === undefined) return { ok: false, error: "event envelope body is missing" };
   if (eventDedupe(envelope.event_id)) return { ok: false, error: "duplicate event_id is ignored (idempotent)" };
-  return { ok: true, envelope };
+  // Deliver exactly once through the injected transport. Ambiguity (error,
+  // timeout, unconfirmed, or non-delivery) is an explicit failure with no retry.
+  let delivered;
+  try {
+    delivered = await Promise.resolve(send(envelope));
+  } catch (err) {
+    return { ok: false, error: `event delivery failed: ${err.message}` };
+  }
+  if (delivered === undefined || delivered === null || (typeof delivered === "object" && delivered.ok !== true)) {
+    return { ok: false, error: "event delivery was not confirmed; ambiguous send is NOT retried" };
+  }
+  return { ok: true, envelope, delivered: delivered === true || delivered.ok === true ? true : !!delivered };
 }
 
 export function bindExactPartner({ supervisorId = null, leadId = null }) {
@@ -4285,15 +4328,6 @@ export function bindExactPartner({ supervisorId = null, leadId = null }) {
 }
 
 
-export function getAuthority() {
-  if (currentAuthority === null) return null;
-  const p = currentAuthority;
-  return { source: p.source, agentId: p.agentId, taskId: p.taskId ?? null, repoRoot: p.repoRoot ?? null, base: p.base ?? null, parentLeadId: p.parentLeadId ?? null };
-}
-
-export function getAuthorityReason() {
-  return authorityReason;
-}
 
 export function getPeerReport() {
   return lastPeerReport === null ? null : structuredClone(lastPeerReport);
@@ -4528,7 +4562,7 @@ async function ensureToolPolicy(pi) {
   if (!observed.ok) return observed;
   const expected = lastAppliedTools ?? baseline;
   if (sameList(observed.tools, expected)) return { ok: true };
-  const allowed = effectiveTools(baseline, latch?.role ?? null, currentAuthority);
+  const allowed = effectiveTools(baseline, latch?.role ?? null);
   if (typeof pi.setActiveTools !== "function") return { ok: false, error: "active-tool policy cannot be re-applied" };
   try {
     pi.setActiveTools(allowed);
@@ -4578,18 +4612,7 @@ function blockWith(ctx, reason) {
   ctx.ui?.notify?.(`pi-paseo-orchestration blocked: ${reason}`, "error");
 }
 
-function createdAgentIdFromResult(event) {
-  const direct = event?.details?.structuredContent?.agentId ?? event?.details?.agentId;
-  if (typeof direct === "string" && direct.trim() !== "") return direct;
-  const blocks = Array.isArray(event?.content) ? event.content : [];
-  for (const block of blocks) {
-    const text = typeof block === "string" ? block : block?.text;
-    if (typeof text !== "string") continue;
-    const match = /"agentId"\s*:\s*"([^"]+)"/.exec(text);
-    if (match) return match[1];
-  }
-  return null;
-}
+
 
 function registerCommand(pi, name, definition) {
   pi.registerCommand(`ppo:${name}`, definition);
@@ -4646,14 +4669,11 @@ export default function (pi) {
   }
 
   pi.on("session_start", async (_event, ctx) => {
-    currentAuthority = null; // new/resumed/forked sessions inherit no authority
     boundSupervisorId = null;
     boundLeadId = null;
     inspectionParentAgentId = null;
-    createdPeerIds.clear();
     lastPeerReport = null;
     lastAcceptance = null;
-    authorityReason = null;
     baseline = null;
     lastAppliedTools = null;
     const env = envOf(ctx);
@@ -4690,11 +4710,11 @@ export default function (pi) {
       blockWith(ctx, source.error);
       return;
     }
-    // v0.2 live root/child topology evidence: observe the current agent's
-    // parent through the injected observer or CLI, then pass it into
-    // activation so a governed role with a proven parentage violation fails
-    // closed here, not only in doctor. When no live observer is available the
-    // observed parentage is undefined and doctor reports the environment ceiling.
+
+    // v0.2 live root/child topology evidence: a governed role must observe its
+    // own Paseo identity and parentage before activation. Try the injected
+    // observer first, then the installed Paseo CLI; if neither yields parentage,
+    // activation fails closed (no undefined-parent success path).
     let observedParentAgentId = ctx.observedParentAgentId;
     if (observedParentAgentId === undefined && typeof ctx.observeParentAgentId === "function") {
       try {
@@ -4702,6 +4722,10 @@ export default function (pi) {
       } catch {
         observedParentAgentId = undefined;
       }
+    }
+    if (observedParentAgentId === undefined) {
+      const selfObs = await observePaseoCurrentAgent((env[AGENT_ENV] ?? "").trim(), { env });
+      observedParentAgentId = selfObs.ok ? selfObs.observation.parent_agent_id : undefined;
     }
     const expectedParentLeadId = (env.PI_PASEO_ORCHESTRATION_PARENT_LEAD_ID ?? "").trim() || null;
     const result = await activate({
@@ -4754,13 +4778,11 @@ export default function (pi) {
     if (acceptance.ok && acceptance.acceptance !== null) {
       const chain = ctx.acceptanceChain;
       if (!chain || typeof chain !== "object") {
-        authorityReason = "local acceptance evidence chain is unavailable";
-        ctx.ui?.notify?.(`pi-paseo-orchestration: local acceptance blocked (${authorityReason})`, "error");
+        ctx.ui?.notify?.("pi-paseo-orchestration: local acceptance blocked (local acceptance evidence chain is unavailable)", "error");
         return { action: "handled" };
       }
       const checked = await validateAcceptance({ ...chain, acceptance: acceptance.acceptance });
       if (!checked.ok) {
-        authorityReason = checked.error;
         ctx.ui?.notify?.(`pi-paseo-orchestration: local acceptance blocked (${checked.error})`, "error");
         return { action: "handled" };
       }
@@ -4769,72 +4791,13 @@ export default function (pi) {
       return { action: "handled" };
     }
     if (!acceptance.ok && String(event.text ?? "").includes(ACCEPTANCE_BEGIN)) {
-      authorityReason = acceptance.error;
       ctx.ui?.notify?.(`pi-paseo-orchestration: local acceptance blocked (${acceptance.error})`, "error");
       return { action: "handled" };
     }
 
-    // v0.2 Human-authority capture: no envelope, marker, capability list,
-    // digest, scope parser, or grant token is written by the Human. The
-    // runtime captures the initial root Lead Human task as current-run
-    // authority; a verified child Peer derives attenuated authority from live
-    // Paseo parentage inspected at activation. Captured authority persists for
-    // the run (session_start clears it) and authorizes local reversible
-    // edit/test/commit/worktree.
-    authorityReason = null;
-    if (latch.role === "lead") {
-      if (currentAuthority === null && (event.source === "interactive" || event.source === "human")) {
-        if (event.text === undefined || String(event.text).trim() === "") {
-          authorityReason = "the root Lead task must be a direct Human message with a task";
-        } else {
-          const taskText = String(event.text).trim();
-          const repoRoot = await findRepoRoot();
-          const base = repoRoot === null ? null : await gitOut(repoRoot, ["rev-parse", "HEAD"]);
-          const captured = { source: "human", agentId: latch.agentId, taskText, repoRoot, base, spec_path: null, spec_digest: null };
-          const specMatch = /implement\s+(\S+\.md)(?:\s+as\s+(\S+))?/.exec(taskText);
-          if (specMatch) {
-            const specPath = specMatch[1];
-            try {
-              const st = await stat(specPath);
-              if (st.isFile()) {
-                const bytes = await readFile(specPath);
-                captured.spec_path = specPath;
-                captured.spec_digest = createHash("sha256").update(bytes).digest("hex");
-              }
-            } catch {
-              captured.spec_path = specPath;
-            }
-          }
-          currentAuthority = captured;
-        }
-      } else if (event.source === "extension") {
-        authorityReason = "extension relays cannot grant Human authority";
-      }
-    } else if (latch.role === "peer") {
-      if (currentAuthority === null) {
-        const inspectedParent = inspectionParentAgentId ?? boundLeadId;
-        if (inspectedParent === null || inspectedParent === "") {
-          authorityReason = "a Peer derives authority only from an inspected Paseo parent Lead; none is observed";
-        } else {
-          currentAuthority = { source: "lead", parentLeadId: inspectedParent, agentId: latch.agentId };
-        }
-      } else if (event.source === "extension") {
-        authorityReason = "extension relays cannot grant authority";
-      }
-    } else if (event.source === "extension") {
-      authorityReason = "extension relays cannot grant authority";
-    }
+
     return { action: "continue" };
-  });
-  pi.on("tool_result", (event) => {
-    // Accept canonical and adapter-prefixed create_agent forms through the
-    // same normalization used by policy, so both record the child id.
-    const createdOp = canonicalMcpOperation(event?.input?.server, event?.input?.tool);
-    if (latch?.role !== "lead" || event?.toolName !== "mcp" || createdOp !== "create_agent"
-        || event?.isError === true) return undefined;
-    const childId = createdAgentIdFromResult(event);
-    if (childId !== null) createdPeerIds.add(childId);
-    return undefined;
+
   });
 
   pi.on("agent_end", async (event, ctx) => {
@@ -4888,7 +4851,7 @@ export default function (pi) {
       blockWith(ctx, tools.error);
       return undefined;
     }
-    const allowed = effectiveTools(baseline, latch.role, currentAuthority);
+    const allowed = effectiveTools(baseline, latch.role);
     if (typeof pi.setActiveTools !== "function") {
       blockWith(ctx, "active-tool policy cannot be applied");
       return undefined;
@@ -4925,20 +4888,29 @@ export default function (pi) {
         return { block: true, reason: `pi-paseo-orchestration blocked: ${pin.error}` };
       }
     }
-    // Resolve the repository root for the peer read gate when no envelope
-    // carries one; the gate needs a root to resolve read targets.
-    let repoRoot = currentAuthority?.repoRoot ?? null;
+    // Resolve the repository root for the peer read gate; the gate needs a
+    // root to resolve read targets.
+    let repoRoot = null;
     if (repoRoot === null && latch.role === "peer" && PROTOCOL_READ_TOOLS.includes(event.toolName)) {
       repoRoot = await findRepoRoot();
     }
     // v0.2 live child reconciliation: a Lead lifecycle call toward a Peer
     // child is allowed only when live Paseo inspection proves the child's
-    // parent equals the current Lead and the target is pinned as a Peer.
+    // parent equals the current Lead, its provider, its workspace/repository
+    // applicability, and the exact task/assignment binding.
     let reconciledChildId = null;
     if (latch.role === "lead" && event.toolName === "mcp") {
       const op = canonicalMcpOperation(event?.input?.server, event?.input?.tool);
       if ([PASEO_CHILD_TOOLS.has(op)].some(Boolean) && typeof event?.input?.args?.agentId === "string") {
-        const rec = await reconcilePeerChild(event.input.args.agentId, { leadAgentId: latch.agentId, env: envOf(ctx) });
+        const args = event?.input?.args ?? {};
+        const reconRepo = protocolPin?.repoRoot ?? null;
+        const rec = await reconcilePeerChild(event.input.args.agentId, {
+          leadAgentId: latch.agentId,
+          env: envOf(ctx),
+          expectedRepoRoot: reconRepo,
+          expectedTaskId: typeof args.taskId === "string" ? args.taskId : "",
+          expectedAssignmentId: typeof args.assignmentId === "string" ? args.assignmentId : "",
+        });
         if (!rec.ok) {
           ctx.ui?.notify?.(`Blocked ${event.toolName}: ${rec.error}`, "error");
           return { block: true, reason: rec.error };
@@ -4947,7 +4919,7 @@ export default function (pi) {
       }
     }
 
-    const allowed = new Set(effectiveTools(baseline ?? [], latch.role, currentAuthority));
+    const allowed = new Set(effectiveTools(baseline ?? [], latch.role));
     const decision = checkToolCall(event.toolName, event.input, {
       role: latch.role,
       allowed,
@@ -4956,9 +4928,7 @@ export default function (pi) {
       peerRoutes: latch.settings.peer_routes,
       peerProviderAlias: latch.peerProviderAlias,
       currentAgentId: latch.agentId,
-      authorityActive: currentAuthority !== null,
       repoRoot,
-      createdPeerIds,
       reconciledChildId,
     });
     if (decision?.block) {

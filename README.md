@@ -2,7 +2,7 @@
 
 Governed multi-agent work for [Pi](https://github.com/earendil-works/pi) running through Paseo.
 
-The package gives each process one explicit role—**Supervisor**, **Lead**, or **Peer**—and keeps Paseo as the source of truth for agents, workspaces, parentage, and lifecycle. It adds policy guardrails, repository workflow rules, runtime-captured Human task authority, evidence-bearing handoffs, and local Git candidate acceptance. There is no coordinator: the Human creates the root Lead and root Supervisor directly.
+The package gives each process one explicit role—**Supervisor**, **Lead**, or **Peer**—and keeps Paseo as the source of truth for agents, workspaces, parentage, and lifecycle. It adds policy guardrails, repository workflow rules, direct bounded assignments for ordinary local work, evidence-bearing handoffs, and local Git candidate acceptance. There is no coordinator: the Human creates the root Lead and root Supervisor directly.
 
 ## Why subagents are not enough
 
@@ -58,7 +58,7 @@ The Lead delegates bounded assignments to Peer children and returns the final ca
 ## How it works
 
 1. Each process receives one durable Role Profile. The Lead also reads the repository's Workspace Protocol; each Peer receives only its bounded assignment. Keeping these layers separate avoids spending Peer attention on the whole organization manual.
-2. The initial root Lead task is captured by the runtime as the current-run Human task authority—including provenance, objective, repository, and requested local effects. The Human types only `implement <spec-path>` (or equivalent) once; no marker, JSON envelope, hash, agent ID, assignment ID, scope syntax, or capability name is written. The runtime mechanically attenuates that authority to the exact child Peer created by the bound Lead; attenuation never widens it.
+2. The initial root Lead task and each exact Peer assignment authorize ordinary local reversible repository work (inspect, edit, test, worktree, local commit) directly. The Human types only `implement <spec-path>` (or equivalent) once; no marker, JSON envelope, hash, agent ID, assignment ID, scope syntax, capability list, digest, or grant is ever written. Assignment, ownership, scope, and exclusions are workflow facts, not capability credentials.
 3. The Lead describes the outcome, constraints, known evidence, writable scope, exclusions, and verification—not a supposedly final implementation plan. One moving write scope has one owner; concurrent writers need disjoint scopes and isolated checkouts. The Lead prepares required isolated worktrees itself.
 4. A dirty caller checkout is evidence to classify, not an automatic blocker: untracked/read-only issue notes, specifications, research, generated logs, or unrelated documentation do not block an isolated worktree from a known clean commit. Only a real collision, overwrite risk, competing writer, or ambiguous base blocks work.
 5. A Peer ends its run with a correlated report: `HANDOFF`, `REOPEN_REQUEST`, `DEPENDENCY_REQUEST`, or `BLOCKED`. The Lead reacts to that event instead of polling and consuming coordination attention.
@@ -197,11 +197,10 @@ The extension also exposes `supervisor_notebook_append` only to an activated Sup
 ```
 Role Profile
   > Workspace Protocol
-  > runtime-captured Human task authority (Lead) / Lead-attenuated authority (Peer)
-  > task prose
+  > ordinary task prose
 ```
 
-A lower layer cannot widen a higher layer. The Human controls settings, exceptional grants, protocol changes, and final local acceptance; the SLP roles follow the responsibilities above. Human-only boundaries—push, merge, publish, deploy, protocol mutation, destructive/external effects, secrets/material cost, objective/irreversible decisions, and Local Acceptance—are preserved.
+A lower layer cannot widen a higher layer. Ordinary local reversible work for Lead and Peer is authorized by the initial Human task and the exact assignment; the Human controls settings, protocol changes, and final local acceptance; the Supervisor is observation-only and never edits project code. Human-only boundaries—push, merge, publish, deploy, protocol mutation, destructive/external effects, secrets/material cost, objective/irreversible decisions, and Local Acceptance—are preserved.
 
 Write work ends at an immutable local Git candidate. The package does not push, create pull requests, merge, deploy, or treat tests, lifecycle status, or agent prose as acceptance.
 
