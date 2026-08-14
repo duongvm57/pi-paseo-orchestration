@@ -115,3 +115,15 @@ The Human-facing Pi package source was temporarily switched from the main checko
 - Fix `cb0a877` defers topology observation to the first input: `session_start` marks activation pending when parentage is not yet observable; the `input` handler retries activation once, then runs the normal gates. Fail-closed semantics are unchanged — a retry that still cannot observe topology reports the exact reason.
 - Live verification (deepseek-v4-flash, ~$0.0005): fresh `ppo-lead` agent returned `PONG`; pre-fix it blocked with "governed lead activation requires live Paseo self/topology evidence". Regression test "fresh governed activation defers topology observation to first input" added; full suite 96/96 pass.
 - Main repo now carries the full v0.2 candidate (merge a820437); package source stays pointed at the main checkout.
+
+### DOGFOOD-014 — MCP connection drops after paseo restart; reconnect must wait for daemon ready
+
+- Mechanism: Paseo injects the `paseo` MCP server into Pi agents through a temporary `--mcp-config` file (the static `~/.pi/agent/mcp.json` is empty). The server connects to the daemon on `127.0.0.1:6767`; pi-mcp-adapter defaults to `lifecycle: lazy` (no auto-reconnect), so a daemon restart drops the connection.
+- Operating rule: after `paseo restart`, first wait until `paseo status` reports `running`/`reachable`, then call `mcp({ connect: "paseo" })`; if it fails with "Tool mcp not found", wait 5-10s and retry — the MCP gateway needs the daemon ready before it can reconnect. Do not fall back to the CLI silently without attempting this.
+
+
+- Root cause: fresh governed root agents failed closed during `session_start` when self/topology observation could not yet see the newly created Paseo agent, then the sticky block made the first input look like a silently spinning turn (`LastUsage: null`, zero activity).
+- Fix `50b4e97` surfaced every block as a machine-visible custom message (`pi-paseo-orchestration-blocked`), proving the block existed but was hidden.
+- Fix `cb0a877` defers topology observation to the first input: `session_start` marks activation pending when parentage is not yet observable; the `input` handler retries activation once, then runs the normal gates. Fail-closed semantics are unchanged — a retry that still cannot observe topology reports the exact reason.
+- Live verification (deepseek-v4-flash, ~$0.0005): fresh `ppo-lead` agent returned `PONG`; pre-fix it blocked with "governed lead activation requires live Paseo self/topology evidence". Regression test "fresh governed activation defers topology observation to first input" added; full suite 96/96 pass.
+- Main repo now carries the full v0.2 candidate (merge a820437); package source stays pointed at the main checkout.
