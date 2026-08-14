@@ -127,6 +127,15 @@ The Human-facing Pi package source was temporarily switched from the main checko
 - Conclusion: the MCP gate is working as designed; `deepseek-v4-flash` is too weak to drive the outer MCP protocol. Keep cheap models for Peer work; Lead/Supervisor orchestration needs a capable model (e.g. `gpt-5.6-luna`) or a better-described MCP contract for weak models.
 - Follow-up options: (a) retry E2E with Lead/Supervisor on a capable model, Peers cheap; (b) improve the extension prompt surface so weak models call the outer MCP gate correctly.
 
+### DOGFOOD-016 — Unrecorded operational friction from the live runs
+
+1. `paseo_cancel_agent` via MCP failed with `This operation was aborted / Expected parameters: agentId` even though `agentId` was supplied, while the agent had an active turn; the agent only returned to idle after minutes. No reliable cancel path when a turn is in flight.
+2. No signal distinguishes "thinking" from "hung": status stays `running` + `activeTurn`, activity 0, `LastUsage: null`. Needs a first-model-call marker or progress heartbeat for early detection.
+3. Sending a prompt while a turn is running is rejected silently — the failure appears only in the daemon log (`Agent … already has an active run`), not in the sender's response.
+4. `paseo_get_agent_activity` errors with `Working directory does not exist` once the workspace directory is removed; a stale temp dir must be recreated to inspect archived agents.
+5. Changing the package source has no effect until the daemon restarts, and each restart drops the MCP connection (DOGFOOD-014) — the root of the repeated restart loops. Would benefit from loading a new package without a full daemon restart.
+6. Archiving a workspace leaves its directory behind (`removedDirectory: false`); temp test dirs must be cleaned manually and are easy to miss.
+
 
 - Root cause: fresh governed root agents failed closed during `session_start` when self/topology observation could not yet see the newly created Paseo agent, then the sticky block made the first input look like a silently spinning turn (`LastUsage: null`, zero activity).
 - Fix `50b4e97` surfaced every block as a machine-visible custom message (`pi-paseo-orchestration-blocked`), proving the block existed but was hidden.
