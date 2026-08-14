@@ -493,7 +493,7 @@ const MCP_CONTRACT = {
     "`create_agent` with the exact Peer creation arguments above",
   ],
   supervisor: [
-    "`list_agents` with `{}`",
+    "`list_agents` with `{\"cwd\":\"<bound Lead repository root>\"}`",
     "`get_agent_status` with `{\"agentId\":\"<full Paseo agent ID>\"}`",
     "`get_agent_activity` with `{\"agentId\":\"<full Paseo agent ID>\"}`",
     "`send_agent_prompt` with `{\"agentId\":\"<full bound Lead ID>\",\"prompt\":\"<question or Human decision>\"}`",
@@ -721,8 +721,15 @@ export function checkToolCall(toolName, input, policy) {
       if (!["supervisor", "lead"].includes(policy.role) || !closedKeys(input.args ?? {}, [], ["includeArchived", "cwd", "sinceHours", "statuses", "limit"])) {
         return block("list_agents is restricted to bounded Supervisor observation or Lead duplicate/ownership checks");
       }
-      if (policy.role === "supervisor" && policy.reconciledListScope !== true) {
-        return block("list_agents is restricted to the Supervisor's bound Lead and project scope");
+      if (policy.role === "supervisor") {
+        if (policy.reconciledListScope !== true) {
+          return block("list_agents is restricted to the Supervisor's bound Lead and project scope");
+        }
+        const cwd = typeof input.args?.cwd === "string" ? input.args.cwd.replace(/\/+$/, "") : "";
+        const root = typeof policy.boundRepoRoot === "string" ? policy.boundRepoRoot.replace(/\/+$/, "") : "";
+        if (cwd === "" || root === "" || (cwd !== root && !cwd.startsWith(root + "/"))) {
+          return block("list_agents cwd must be the bound Lead repository");
+        }
       }
       return undefined;
     }
@@ -4478,9 +4485,13 @@ export async function verifyPartnerBinding(opts) {
       && obs.workspace_id !== null && obs.workspace_id !== expectedWorkspaceId) {
     return { ok: false, error: `partner workspace ${obs.workspace_id} does not match the expected workspace ${expectedWorkspaceId}` };
   }
+  const warnings = [];
   const liveTask = partnerTaskId(obs, null);
   if (liveTask !== null && liveTask !== taskId.trim()) {
     return { ok: false, error: `partner task ${liveTask} does not match the expected task ${taskId.trim()}` };
+  }
+  if (liveTask === null) {
+    warnings.push(`partner ${claimedId.trim()} carries no cooperative ${PPO_TASK_KEY} label; task-label correlation is unavailable, not a PASS`);
   }
   if (kind === "supervisor") {
     boundSupervisorId = claimedId.trim();
@@ -4493,7 +4504,7 @@ export async function verifyPartnerBinding(opts) {
   } else {
     return { ok: false, error: `unknown partner kind ${String(kind)}` };
   }
-  return { ok: true, partnerId: claimedId.trim(), taskId };
+  return { ok: true, partnerId: claimedId.trim(), taskId, warnings };
 }
 
 // Directional bounded event delivery is enforced before the MCP call: exact
@@ -4516,20 +4527,24 @@ export async function reconcileLeadEventRecipient(agentId, envelope, options) {
   if (!cwd || !root || (cwd !== root && !cwd.startsWith(root + "/"))) return { ok: false, error: "bounded event recipient is outside the pinned repository" };
   if (recipient.provider === "ppo-supervisor") {
     if (boundSupervisorId !== null && boundSupervisorId !== agentId) return { ok: false, error: "event recipient does not match the bound Supervisor" };
+    if (boundTaskId !== null && envelope.task_id !== boundTaskId) {
+      return { ok: false, error: `event task ${envelope.task_id} does not match the bound Lead task ${boundTaskId}` };
+    }
     if (boundSupervisorId !== agentId) {
       const verified = await verifyPartnerBinding({
         claimedId: agentId,
         kind: "supervisor",
         selfId: leadAgentId,
-        taskId: envelope.task_id,
+        taskId: boundTaskId ?? envelope.task_id,
         env,
         expectedRole: "supervisor",
         expectedProvider: "ppo-supervisor",
         expectedRepoRoot: repoRoot,
       });
       if (!verified.ok) return { ok: false, error: verified.error };
+      return { ok: true, recipientKind: "supervisor", warnings: verified.warnings ?? [] };
     }
-    return { ok: true, recipientKind: "supervisor" };
+    return { ok: true, recipientKind: "supervisor", warnings: [] };
   }
   if (envelope.kind !== "LEAD_FINISHED") return { ok: false, error: "a Human observer receives only LEAD_FINISHED" };
   if (recipient.provider !== "pi") return { ok: false, error: "the Human observer must be a root Pi agent" };
@@ -4544,47 +4559,6 @@ export function bindExactPartner({ supervisorId = null, leadId = null }) {
   if (supervisorId !== null) boundSupervisorId = supervisorId;
   if (leadId !== null) rememberBoundLead(leadId);
   return true;
-}
-
-const CLAIMED_SUPERVISOR = /(?:supervisor(?:\s+agent)?\s+id|bound supervisor)\s*[:=]\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
-const CLAIMED_LEAD = /(?:lead(?:\s+agent)?\s+id|bound lead)\s*[:=]\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
-const CLAIMED_TASK = /(?:task(?:\s+id)?)\s*[:=]\s*(\S+)/i;
-
-async function bindAnnouncedPartner(text, ctx) {
-  if (latch === null || typeof text !== "string" || text.trim() === "") return;
-  const env = envOf(ctx);
-  const repoRoot = protocolPin?.repoRoot ?? await findRepoRoot();
-  const taskMatch = CLAIMED_TASK.exec(text);
-  const taskId = taskMatch?.[1]?.replace(/["'`]/g, "") ?? boundTaskId ?? latch.agentId;
-  if (latch.role === "lead") {
-    const match = CLAIMED_SUPERVISOR.exec(text);
-    if (match === null) return;
-    await verifyPartnerBinding({
-      claimedId: match[1],
-      kind: "supervisor",
-      selfId: latch.agentId,
-      taskId,
-      env,
-      expectedRole: "supervisor",
-      expectedProvider: "ppo-supervisor",
-      expectedRepoRoot: repoRoot,
-    });
-    return;
-  }
-  if (latch.role === "supervisor") {
-    const match = CLAIMED_LEAD.exec(text);
-    if (match === null) return;
-    await verifyPartnerBinding({
-      claimedId: match[1],
-      kind: "lead",
-      selfId: latch.agentId,
-      taskId,
-      env,
-      expectedRole: "lead",
-      expectedProvider: env[LEAD_ALIAS_ENV] || "ppo-lead",
-      expectedRepoRoot: repoRoot,
-    });
-  }
 }
 
 export async function reconcileSupervisorObservation(agentId, options) {
@@ -5145,7 +5119,6 @@ export default function (pi) {
       reportBlockedInput(pi, blockedReason ?? "governed runtime verification failed");
       return { action: "handled" };
     }
-    await bindAnnouncedPartner(event.text ?? "", ctx);
     // Governed orchestration requires a valid pinned protocol for the Lead:
     // re-read and re-validate at every gate; drift blocks permanently.
     if (latch.role === "lead") {
@@ -5299,6 +5272,7 @@ export default function (pi) {
       if (op === "list_agents") {
         if (boundLeadIds.size === 0) return { block: true, reason: "list_agents is restricted to the Supervisor's bound Lead and project scope" };
         reconciledListScope = true;
+        repoRoot = protocolPin?.repoRoot ?? await findRepoRoot();
       } else if ((op === "get_agent_status" || op === "get_agent_activity") && typeof event?.input?.args?.agentId === "string") {
         const rec = await reconcileSupervisorObservation(event.input.args.agentId, {
           supervisorId: latch.agentId,
@@ -5329,6 +5303,9 @@ export default function (pi) {
           env: envOf(ctx),
         });
         if (!recipient.ok) return { block: true, reason: recipient.error };
+        for (const warning of recipient.warnings ?? []) {
+          ctx.ui?.notify?.(`${event.toolName}: ${warning}`, "info");
+        }
         if (eventDedupe(parsedEvent.envelope.event_id)) return { block: true, reason: "duplicate event_id is ignored (idempotent)" };
         reconciledEventRecipientId = event.input.args.agentId;
       } else if ([PASEO_CHILD_TOOLS.has(op)].some(Boolean) && typeof event?.input?.args?.agentId === "string") {
@@ -5363,6 +5340,7 @@ export default function (pi) {
       peerProviderAlias: latch.peerProviderAlias,
       currentAgentId: latch.agentId,
       repoRoot,
+      boundRepoRoot: repoRoot,
       reconciledChildId,
       reconciledEventRecipientId,
       reconciledLeadId,

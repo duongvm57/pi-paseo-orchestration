@@ -29,7 +29,7 @@ A Lead receives the Human task directly as a root agent. A Supervisor is created
 
 1. The Supervisor inspects itself and the bound Lead; both must be root agents.
 2. The Human announces the exact Supervisor agent ID to the Lead. The Supervisor may ask its bound Lead or relay a Human decision to that Lead only.
-3. The Lead inspects the claimed Supervisor and verifies role, root parentage, repository/workspace applicability, and task binding against live Paseo facts before accepting. Process memory is only a cache; restart recovery revalidates against Paseo facts.
+3. The first Lead milestone to that Supervisor is the canonical binder: the runtime verifies role, root parentage, repository/workspace applicability, and task binding against live Paseo facts before accepting. Process memory is only a cache; restart recovery revalidates against Paseo facts.
 
 ## Lead workflow
 

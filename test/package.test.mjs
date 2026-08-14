@@ -3818,8 +3818,11 @@ test("checkToolCall: Supervisor send and observation stay on bound Lead scope", 
   assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_send_agent_prompt", args: { agentId: "other", prompt: "Why this strategy?" } }, policy).block, true);
   assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_get_agent_status", args: { agentId: "lead-1" } }, policy), undefined);
   assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_get_agent_status", args: { agentId: "stranger" } }, policy).block, true);
-  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_list_agents", args: {} }, policy), undefined);
-  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_list_agents", args: {} }, { ...policy, reconciledListScope: false }).block, true);
+  const scoped = { ...policy, boundRepoRoot: "/tmp/repo" };
+  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_list_agents", args: {} }, scoped).block, true);
+  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_list_agents", args: { cwd: "/other/repo" } }, scoped).block, true);
+  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_list_agents", args: { cwd: "/tmp/repo" } }, scoped), undefined);
+  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_list_agents", args: { cwd: "/tmp/repo" } }, { ...scoped, reconciledListScope: false }).block, true);
 });
 
 test("checkToolCall: Peer mid-run message kinds are closed", () => {
@@ -3865,24 +3868,57 @@ test("peer_lead_message delivers a closed envelope to the process parent Lead", 
   }
 });
 
-test("verifyPartnerBinding is the production first-event binder and rejects task mismatch", async () => {
+test("first-milestone bind rejects an observable Supervisor task mismatch before any bind", async () => {
   const ext = await freshExtension();
-  const okBin = await fakePaseoBin({ rootAgent: true, provider: "ppo-supervisor", idEcho: true });
   const mismatchBin = await fakePaseoBin({
     rootAgent: true, provider: "ppo-supervisor", idEcho: true,
     labels: { "pi-paseo-orchestration.task-key": "task-other" },
   });
-  const base = { version: 1, event_id: "event-bind-1", task_id: "task-1", sender_agent_id: "lead-1", repository_root: "/tmp/repo", payload: {} };
   try {
-    const first = await ext.reconcileLeadEventRecipient("sup-1", { ...base, kind: "LEAD_STARTED", recipient_agent_id: "sup-1" }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: okBin } });
+    const mismatch = await ext.reconcileLeadEventRecipient("sup-1", {
+      version: 1, event_id: "event-mismatch-1", task_id: "task-1", sender_agent_id: "lead-1",
+      recipient_agent_id: "sup-1", repository_root: "/tmp/repo", kind: "LEAD_STARTED", payload: {},
+    }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: mismatchBin } });
+    assert.equal(mismatch.ok, false);
+    assert.match(mismatch.error, /does not match the expected task/);
+    assert.equal(ext.getBoundSupervisorId(), null);
+  } finally {
+    await rm(mismatchBin, { recursive: true, force: true });
+  }
+});
+
+test("first-milestone bind accepts a Supervisor whose live task label matches the envelope", async () => {
+  const ext = await freshExtension();
+  const labeled = await fakePaseoBin({
+    rootAgent: true, provider: "ppo-supervisor", idEcho: true,
+    labels: { "pi-paseo-orchestration.task-key": "task-1" },
+  });
+  try {
+    const first = await ext.reconcileLeadEventRecipient("sup-1", {
+      version: 1, event_id: "event-labeled-1", task_id: "task-1", sender_agent_id: "lead-1",
+      recipient_agent_id: "sup-1", repository_root: "/tmp/repo", kind: "LEAD_STARTED", payload: {},
+    }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: labeled } });
     assert.equal(first.ok, true, first.error);
     assert.equal(ext.getBoundSupervisorId(), "sup-1");
-    const mismatch = await ext.reconcileLeadEventRecipient("sup-2", { ...base, kind: "LEAD_STARTED", recipient_agent_id: "sup-2" }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: mismatchBin } });
-    assert.equal(mismatch.ok, false);
-    assert.match(mismatch.error, /does not match the bound Supervisor|does not match the expected task/);
+    assert.equal((first.warnings ?? []).length, 0);
   } finally {
-    await rm(okBin, { recursive: true, force: true });
-    await rm(mismatchBin, { recursive: true, force: true });
+    await rm(labeled, { recursive: true, force: true });
+  }
+});
+
+test("first-milestone bind warns when the Supervisor task label is unobservable", async () => {
+  const ext = await freshExtension();
+  const unlabeled = await fakePaseoBin({ rootAgent: true, provider: "ppo-supervisor", idEcho: true });
+  try {
+    const first = await ext.reconcileLeadEventRecipient("sup-1", {
+      version: 1, event_id: "event-unlabeled-1", task_id: "task-1", sender_agent_id: "lead-1",
+      recipient_agent_id: "sup-1", repository_root: "/tmp/repo", kind: "LEAD_STARTED", payload: {},
+    }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: unlabeled } });
+    assert.equal(first.ok, true, first.error);
+    assert.equal(ext.getBoundSupervisorId(), "sup-1");
+    assert.equal(Array.isArray(first.warnings) && first.warnings.some((warning) => /task-key|task label/.test(warning)), true, JSON.stringify(first.warnings));
+  } finally {
+    await rm(unlabeled, { recursive: true, force: true });
   }
 });
 
