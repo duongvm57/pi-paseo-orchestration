@@ -107,3 +107,11 @@ The Human-facing Pi package source was temporarily switched from the main checko
   - Sending an overlapping prompt to a baseline agent completed with `SECOND_DONE`; prompt replacement alone does not reproduce the failure.
 - Ranked remaining cause: the candidate performs fail-closed self-observation during `session_start` while the newly created Paseo agent may not yet be inspectable, then keeps the activation failure sticky. Because `blockWith` reports only through `ctx.ui.notify`, headless Paseo exposes no reason and the handled initial input looks like an indefinitely running turn. A missing active `mcp` tool at the same startup seam is the secondary possibility; current evidence cannot distinguish it because the block reason was not persisted.
 - Required correction before another team run: make governed startup failure terminal and machine-observable (exact block reason in Paseo activity/status), and add a fresh-agent integration check that fails when first input is silently handled with `LastUsage: null`. Do not retry or silently weaken fail-closed identity checks.
+
+### DOGFOOD-013 — Startup race fixed and verified live (commit cb0a877)
+
+- Root cause: fresh governed root agents failed closed during `session_start` when self/topology observation could not yet see the newly created Paseo agent, then the sticky block made the first input look like a silently spinning turn (`LastUsage: null`, zero activity).
+- Fix `50b4e97` surfaced every block as a machine-visible custom message (`pi-paseo-orchestration-blocked`), proving the block existed but was hidden.
+- Fix `cb0a877` defers topology observation to the first input: `session_start` marks activation pending when parentage is not yet observable; the `input` handler retries activation once, then runs the normal gates. Fail-closed semantics are unchanged — a retry that still cannot observe topology reports the exact reason.
+- Live verification (deepseek-v4-flash, ~$0.0005): fresh `ppo-lead` agent returned `PONG`; pre-fix it blocked with "governed lead activation requires live Paseo self/topology evidence". Regression test "fresh governed activation defers topology observation to first input" added; full suite 96/96 pass.
+- Main repo now carries the full v0.2 candidate (merge a820437); package source stays pointed at the main checkout.
