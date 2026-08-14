@@ -202,7 +202,7 @@ test("declared resources and private profiles are nonempty files", async () => {
   assert.match(orchestrationSkill, /one writer per moving scope/);
   assert.match(orchestrationSkill, /no \/ppo:bootstrap|Human creates the root Lead/);
   assert.match(orchestrationSkill, /binds one exact Lead|root agent/);
-  assert.match(await readFile(join(root, "profiles/supervisor.md"), "utf8"), /binds one exact Lead agent ID and Human task/);
+  assert.match(await readFile(join(root, "profiles/supervisor.md"), "utf8"), /one or more Lead agent IDs/);
   assert.doesNotMatch(orchestrationSkill, /full-topology-test|scripts\/run\.mjs/);
   assert.match(guide, /^# Workspace Protocol Authoring Guide\n/);
   assert.deepEqual(guide.match(/^## \d+\..+$/gm), [
@@ -224,7 +224,15 @@ test("declared resources and private profiles are nonempty files", async () => {
   assert.match(guide, /Human is the sole Local Accepter|Sole accepter through a direct canonical Human acceptance block/);
   assert.match(guide, /optional `Anti-patterns` section/);
   assert.doesNotMatch(guide, /[^\x00-\x7F]/);
-  assert.match(await readFile(join(root, "profiles/peer.md"), "utf8"), /classify material premises as supported, partial, or failed/);
+  const peerProfile = await readFile(join(root, "profiles/peer.md"), "utf8");
+  const supervisorProfile = await readFile(join(root, "profiles/supervisor.md"), "utf8");
+  assert.match(peerProfile, /classify material premises as supported, partial, or failed/);
+  assert.match(peerProfile, /injected `ParentAgentId` fact/);
+  assert.doesNotMatch(peerProfile, /inspect the Peer and your parent through Paseo/);
+  assert.match(supervisorProfile, /low-frequency heartbeat used only as a safety net/);
+  assert.match(orchestrationSkill, /kind":"REOPEN_REQUEST"/);
+  assert.match(orchestrationSkill, /kind":"DEPENDENCY_REQUEST"/);
+  assert.match(orchestrationSkill, /kind":"BLOCKED"/);
 });
 
 
@@ -687,6 +695,9 @@ test("checkToolCall: closed per-role gates, outer MCP validation, git publicatio
 
   for (const cmd of ["git commit -m x", "git status", "git log --oneline", "git diff", "git branch -a", "git fetch origin", "ls -la", "npm test", "git checkout -b feature", "git stash list"]) {
     assert.equal(extension.checkToolCall("bash", { command: cmd }, peerPolicy), undefined, `must pass: ${cmd}`);
+  }
+  for (const cmd of ["paseo inspect peer-1 --json", "paseo send lead-1 --prompt hi", "PATH=/usr/bin paseo status"]) {
+    assert.equal(extension.checkToolCall("bash", { command: cmd }, peerPolicy).block, true, `must block: ${cmd}`);
   }
 });
 
@@ -3762,7 +3773,8 @@ test("wiring: per-role MCP call contract is injected into the agent prompt (DOGF
     assert.match(before.systemPrompt, /short IDs are display-only/);
     assert.doesNotMatch(before.systemPrompt, /paseo_get_agent_status|"agent_id"\s*:|prefixed/);
     if (role === "supervisor") {
-      assert.doesNotMatch(before.systemPrompt, /send_agent_prompt|list_workspaces|list_providers/);
+      assert.match(before.systemPrompt, /`send_agent_prompt` with `\{"agentId":"<full bound Lead ID>","prompt":"<question or Human decision>"\}`/);
+      assert.doesNotMatch(before.systemPrompt, /list_workspaces|list_providers/);
       assert.doesNotMatch(before.systemPrompt, /## Peer creation/);
     } else {
       assert.match(before.systemPrompt, /`list_workspaces` with `\{\}`/);
@@ -3788,6 +3800,134 @@ test("wiring: per-role MCP call contract is injected into the agent prompt (DOGF
     fakePeer.ctx,
   );
   assert.doesNotMatch(beforePeer.systemPrompt, /## Paseo calls/);
+  assert.match(beforePeer.systemPrompt, /peer_lead_message/);
   await rm(profiles, { recursive: true, force: true });
   await rm(dir, { recursive: true, force: true });
+});
+
+test("checkToolCall: Supervisor send and observation stay on bound Lead scope", () => {
+  const policy = {
+    role: "supervisor",
+    allowed: ["mcp"],
+    mcpTargets: { paseo: new Set(["list_agents", "get_agent_status", "get_agent_activity", "send_agent_prompt"]) },
+    reconciledLeadId: "lead-1",
+    reconciledObservationIds: ["lead-1", "peer-1"],
+    reconciledListScope: true,
+  };
+  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_send_agent_prompt", args: { agentId: "lead-1", prompt: "Why this strategy?" } }, policy), undefined);
+  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_send_agent_prompt", args: { agentId: "other", prompt: "Why this strategy?" } }, policy).block, true);
+  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_get_agent_status", args: { agentId: "lead-1" } }, policy), undefined);
+  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_get_agent_status", args: { agentId: "stranger" } }, policy).block, true);
+  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_list_agents", args: {} }, policy), undefined);
+  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_list_agents", args: {} }, { ...policy, reconciledListScope: false }).block, true);
+});
+
+test("checkToolCall: Peer mid-run message kinds are closed", () => {
+  const policy = { role: "peer", allowed: ["read", "bash"] };
+  assert.equal(extension.checkToolCall("peer_lead_message", { kind: "question", task_id: "task-1", payload: { text: "need a decision" } }, policy), undefined);
+  assert.equal(extension.checkToolCall("peer_lead_message", { kind: "handoff", task_id: "task-1", payload: {} }, policy).block, true);
+  assert.equal(extension.checkToolCall("peer_lead_message", { kind: "question", task_id: "task-1", payload: {} }, { role: "lead", allowed: ["mcp"] }).block, true);
+});
+
+test("peer_lead_message delivers a closed envelope to the process parent Lead", async () => {
+  const ext = await freshExtension();
+  const profiles = await profileDirFixture();
+  const dir = await mkdtemp(join(tmpdir(), "ppo-peer-msg-"));
+  const bin = await mkdtemp(join(tmpdir(), "ppo-peer-send-"));
+  await writeSettings(dir, validDoc);
+  const log = join(bin, "sent.log");
+  await writeFile(join(bin, "paseo"), `#!/bin/sh\nif [ "$1" = "send" ]; then printf '%s\n' "$*" > "${log}"; exit 0; fi\necho unknown >&2; exit 1\n`, { mode: 0o755 });
+  try {
+    const fake = fakePi({
+      activeTools: ["read", "bash"],
+      env: { PI_PASEO_ORCHESTRATION_ROLE: "peer", PI_PASEO_ORCHESTRATION_PEER_ALIAS: "ppo-peer", PASEO_AGENT_ID: "peer-7", PI_CODING_AGENT_DIR: dir, PI_PASEO_ORCHESTRATION_PROFILES_DIR: profiles, PATH: `${bin}:${process.env.PATH ?? ""}` },
+    });
+    fake.pi.setActiveTools = (tools) => { fake.holder.activeTools = [...tools]; };
+    fake.pi.getActiveTools = () => [...fake.holder.activeTools];
+    ext.default(fake.pi);
+    const registry = fake.ctx.modelRegistry;
+    fake.ctx.model = registry.find("openai", "gpt-5");
+    fake.ctx.thinkingLevel = "off";
+    fake.ctx.modelRegistry = { ...registry };
+    await fake.handlers.get("session_start")({ reason: "startup" }, fake.ctx);
+    await fake.handlers.get("before_agent_start")({ prompt: "hi", systemPrompt: "base", systemPromptOptions: { selectedTools: ["read", "bash"] } }, fake.ctx);
+    const delivered = await ext.deliverPeerLeadMessage({ kind: "question", taskId: "task-1", payload: { text: "need a decision" }, env: fake.ctx.env, repoRoot: "/tmp/repo" });
+    assert.equal(delivered.ok, true, delivered.error);
+    assert.equal(delivered.recipientId, "lead-7");
+    assert.equal(delivered.envelope.kind, "question");
+    const sent = await readFile(log, "utf8");
+    assert.match(sent, /send lead-7 --prompt/);
+    assert.match(sent, /event="v1"/);
+  } finally {
+    await rm(bin, { recursive: true, force: true });
+    await rm(profiles, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("verifyPartnerBinding is the production first-event binder and rejects task mismatch", async () => {
+  const ext = await freshExtension();
+  const okBin = await fakePaseoBin({ rootAgent: true, provider: "ppo-supervisor", idEcho: true });
+  const mismatchBin = await fakePaseoBin({
+    rootAgent: true, provider: "ppo-supervisor", idEcho: true,
+    labels: { "pi-paseo-orchestration.task-key": "task-other" },
+  });
+  const base = { version: 1, event_id: "event-bind-1", task_id: "task-1", sender_agent_id: "lead-1", repository_root: "/tmp/repo", payload: {} };
+  try {
+    const first = await ext.reconcileLeadEventRecipient("sup-1", { ...base, kind: "LEAD_STARTED", recipient_agent_id: "sup-1" }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: okBin } });
+    assert.equal(first.ok, true, first.error);
+    assert.equal(ext.getBoundSupervisorId(), "sup-1");
+    const mismatch = await ext.reconcileLeadEventRecipient("sup-2", { ...base, kind: "LEAD_STARTED", recipient_agent_id: "sup-2" }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: mismatchBin } });
+    assert.equal(mismatch.ok, false);
+    assert.match(mismatch.error, /does not match the bound Supervisor|does not match the expected task/);
+  } finally {
+    await rm(okBin, { recursive: true, force: true });
+    await rm(mismatchBin, { recursive: true, force: true });
+  }
+});
+
+test("reconcileSupervisorObservation accepts bound Lead and that Lead's child only", async () => {
+  const ext = await freshExtension();
+  ext.bindExactPartner({ leadId: "lead-9" });
+  const leadBin = await fakePaseoBin({ rootAgent: true, provider: "ppo-lead", idEcho: true });
+  const childBin = await fakePaseoBin({ rootAgent: false, provider: "ppo-peer", idEcho: true });
+  const strangerBin = await fakePaseoBin({ rootAgent: true, provider: "pi", idEcho: true });
+  try {
+    const lead = await ext.reconcileSupervisorObservation("lead-9", { supervisorId: "sup-1", env: { ...process.env, PATH: leadBin }, repoRoot: "/tmp/repo" });
+    assert.equal(lead.ok, true, lead.error);
+    const child = await ext.reconcileSupervisorObservation("peer-1", { supervisorId: "sup-1", env: { ...process.env, PATH: childBin }, repoRoot: "/tmp/repo" });
+    assert.equal(child.ok, true, child.error);
+    const stranger = await ext.reconcileSupervisorObservation("other-1", { supervisorId: "sup-1", env: { ...process.env, PATH: strangerBin }, repoRoot: "/tmp/repo" });
+    assert.equal(stranger.ok, false);
+  } finally {
+    await rm(leadBin, { recursive: true, force: true });
+    await rm(childBin, { recursive: true, force: true });
+    await rm(strangerBin, { recursive: true, force: true });
+  }
+});
+
+test("Doctor EVENT_CAPABILITIES checks outer MCP send_agent_prompt", async () => {
+  const repo = await gitRepoFixture();
+  const profiles = await profileDirFixture();
+  const settingsDir = await mkdtemp(join(tmpdir(), "ppo-doctor-event-"));
+  try {
+    await writeSettings(settingsDir, validDoc);
+    const ext = await freshExtension();
+    const fake = fakePi({
+      activeTools: ["read", "bash", "mcp"],
+      env: { PI_CODING_AGENT_DIR: settingsDir, PI_PASEO_ORCHESTRATION_ROLE: "lead", PASEO_AGENT_ID: "lead-1", PI_PASEO_ORCHESTRATION_PROFILES_DIR: profiles, PATH: "/nonexistent-ppo-path" },
+    });
+    fake.ctx.cwd = repo.dir;
+    ext.default(fake.pi);
+    await fake.handlers.get("session_start")({}, fake.ctx);
+    const report = await ext.buildDoctorReport({ ctx: fake.ctx, pi: fake.pi, now: "2026-01-01T00:00:00.000Z", reportId: "doctor-event" });
+    const event = report.checks.find((check) => check.code === "EVENT_CAPABILITIES");
+    assert.equal(event.status, "PASS");
+    assert.match(event.expected, /send_agent_prompt/);
+    assert.doesNotMatch(JSON.stringify(event), /sendEvent/);
+  } finally {
+    await rm(settingsDir, { recursive: true, force: true });
+    await rm(profiles, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+  }
 });

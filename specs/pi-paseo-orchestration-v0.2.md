@@ -7,7 +7,7 @@ Target package version: 0.2.0
 
 ## Objective
 
-Replace coordinator-based bootstrap with a Human-created Paseo team. The Human creates a root Lead and a root Supervisor directly; the Lead creates bounded Peer children. Communication is event-driven and bounded; no coordinator, daemon, continuous polling, or automatic heartbeat is introduced.
+Replace coordinator-based bootstrap with a Human-created Paseo team. The Human creates a root Lead and a root Supervisor directly; the Lead creates bounded Peer children. Communication is event-driven and bounded; no coordinator, daemon, or continuous polling loop is introduced. A low-frequency heartbeat is only a safety net.
 
 ## Human-created topology
 
@@ -20,7 +20,7 @@ Human
 
 - Lead and Supervisor require `ParentAgentId = null`; a parented lead/supervisor fails closed before governed work.
 - A Peer requires `ParentAgentId = <exact Lead agent ID>`; a root Peer or a Peer of another parent completes as `BLOCKED`.
-- The Supervisor observes exactly one bound Lead per active assignment; it does not direct Peers or issue project acceptance.
+- The Supervisor observes one or more assigned Leads, projects, or workspaces; it does not direct Peers or issue project acceptance.
 
 ## Resolved Human model for ordinary local work
 
@@ -30,7 +30,7 @@ The initial Human root task and the exact Lead assignment authorize ordinary loc
 
 - Peer → Lead: narrow parent-scoped kinds `question`, `blocked`, `dependency`, `progress`, `handoff`, resolved from Paseo parentage.
 - Lead → Supervisor: milestone events `LEAD_STARTED`, `PEER_BLOCKED`, `CANDIDATE_READY`, `REVIEW_COMPLETE`, `HUMAN_DECISION_REQUIRED`, `LEAD_FINISHED`.
-- Supervisor → Human/Notebook: evidence-backed observation; Supervisor has no agent-send tool.
+- Supervisor → bound Lead: ask why a strategy was chosen, or relay a recorded Human decision. Supervisor → Human/Notebook: evidence-backed observation.
 - One bounded versioned event envelope; duplicate `event_id` is idempotently ignored; receipt is an attention signal, not acceptance, and carries no authority.
 
 ## Cooperative task/assignment label contract

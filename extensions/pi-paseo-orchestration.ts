@@ -155,10 +155,13 @@ export const CEILINGS = {
 // canonicalMcpOperation before any policy decision, so prefixed and canonical
 // forms are identical.
 export const MCP_TARGETS = {
-  supervisor: { paseo: new Set(["list_agents", "get_agent_status", "get_agent_activity"]) },
+  supervisor: { paseo: new Set(["list_agents", "get_agent_status", "get_agent_activity", "send_agent_prompt"]) },
   lead: { paseo: new Set(["list_workspaces", "list_providers", "list_agents", "create_agent", "send_agent_prompt", "get_agent_status", "get_agent_activity", "cancel_agent", "archive_agent"]) },
   peer: {},
 };
+
+export const PEER_LEAD_MESSAGE_TOOL = "peer_lead_message";
+export const PEER_LEAD_MESSAGE_KINDS = new Set(["question", "blocked", "dependency", "progress"]);
 
 // MCP operation normalization: one explicit alias map canonicalizes
 // adapter-prefixed operation names to canonical form. Server identity must be
@@ -493,6 +496,7 @@ const MCP_CONTRACT = {
     "`list_agents` with `{}`",
     "`get_agent_status` with `{\"agentId\":\"<full Paseo agent ID>\"}`",
     "`get_agent_activity` with `{\"agentId\":\"<full Paseo agent ID>\"}`",
+    "`send_agent_prompt` with `{\"agentId\":\"<full bound Lead ID>\",\"prompt\":\"<question or Human decision>\"}`",
   ],
 };
 
@@ -544,7 +548,10 @@ function createAgentPolicyPrompt(activeLatch) {
   if (activeLatch.role === "supervisor") {
     return mcpContractPrompt("supervisor");
   }
-  return "Paseo create_agent is unavailable for this run (only the Lead mints Peer children).";
+  return [
+    "Message your parent Lead through the peer_lead_message tool using kinds question, blocked, dependency, or progress.",
+    "End the run with the assignment's terminal Peer Report contract.",
+  ].join(" ");
 }
 
 function validateCreateAgentArgs(args, policy) {
@@ -616,6 +623,20 @@ export function checkToolCall(toolName, input, policy) {
   if (toolName === "mcp_script") {
     return block("mcp_script is unavailable to every governed role");
   }
+  if (toolName === PEER_LEAD_MESSAGE_TOOL) {
+    if (policy.role !== "peer") return block("peer_lead_message is restricted to the peer role");
+    if (!closedKeys(input ?? {}, ["kind", "task_id", "payload"])) {
+      return block("peer_lead_message arguments must contain exactly kind, task_id, payload");
+    }
+    if (!PEER_LEAD_MESSAGE_KINDS.has(input.kind)) {
+      return block(`peer_lead_message kind ${JSON.stringify(input.kind)} is not an allowed mid-run kind`);
+    }
+    if (typeof input.task_id !== "string" || input.task_id.trim() === "") {
+      return block("peer_lead_message task_id must be a nonempty string");
+    }
+    if (!isRecord(input.payload)) return block("peer_lead_message payload must be a JSON object");
+    return undefined;
+  }
   // Peer read gate: the repository-wide Workspace Protocol is Lead governance
   // material. Reading the full protocol is a governance violation for the peer
   // role — assignment-relevant constraints arrive via the prompt, not the
@@ -659,9 +680,27 @@ export function checkToolCall(toolName, input, policy) {
       return validateCreateAgentArgs(input.args, policy);
     }
     if (input.server === "paseo" && PASEO_CHILD_TOOLS.has(op)) {
-      if (policy.role === "supervisor" && (op === "get_agent_status" || op === "get_agent_activity")) {
-        if (!closedKeys(input.args, ["agentId"])) return block(`${op} arguments must contain exactly agentId`);
-        return undefined;
+      if (policy.role === "supervisor") {
+        if (op === "get_agent_status" || op === "get_agent_activity") {
+          if (!closedKeys(input.args, ["agentId"])) return block(`${op} arguments must contain exactly agentId`);
+          if (!Array.isArray(policy.reconciledObservationIds) || !policy.reconciledObservationIds.includes(input.args.agentId)) {
+            return block(`${op} target is not reconciled to a bound Lead or that Lead's project scope`);
+          }
+          return undefined;
+        }
+        if (op === "send_agent_prompt") {
+          if (!closedKeys(input.args, ["agentId", "prompt"], ["background", "notifyOnFinish"])) {
+            return block("send_agent_prompt arguments are not the closed Supervisor-to-Lead shape");
+          }
+          if (typeof input.args.prompt !== "string" || input.args.prompt.trim() === "") {
+            return block("send_agent_prompt prompt must be nonempty");
+          }
+          if (policy.reconciledLeadId !== input.args.agentId) {
+            return block("send_agent_prompt target is not the exact bound Lead of this Supervisor");
+          }
+          return undefined;
+        }
+        return block(`${op} is restricted to the Lead role`);
       }
       if (policy.role !== "lead") return block(`${op} is restricted to the Lead role`);
       if (!closedKeys(input.args, ["agentId"], op === "send_agent_prompt" ? ["prompt", "background", "notifyOnFinish"] : [])) {
@@ -682,6 +721,9 @@ export function checkToolCall(toolName, input, policy) {
       if (!["supervisor", "lead"].includes(policy.role) || !closedKeys(input.args ?? {}, [], ["includeArchived", "cwd", "sinceHours", "statuses", "limit"])) {
         return block("list_agents is restricted to bounded Supervisor observation or Lead duplicate/ownership checks");
       }
+      if (policy.role === "supervisor" && policy.reconciledListScope !== true) {
+        return block("list_agents is restricted to the Supervisor's bound Lead and project scope");
+      }
       return undefined;
     }
     if (input.server === "paseo" && (op === "list_workspaces" || op === "list_providers")) {
@@ -694,6 +736,9 @@ export function checkToolCall(toolName, input, policy) {
   }
   if (toolName === "bash") {
     if (typeof input?.command !== "string") return block("bash call without a command string");
+    if (policy.role === "peer" && /\bpaseo\b/.test(input.command)) {
+      return block("paseo CLI is unavailable to the peer role");
+    }
     for (const pattern of PUBLICATION) {
       if (pattern.test(input.command)) return block("publication route is always blocked");
     }
@@ -3808,21 +3853,23 @@ export async function buildDoctorReport(options = {}) {
   checks.push(doctorCheck("TOOL_POLICY", "baseline, role ceiling, and effective tools", toolStatus, role ? "actual tools equal the baseline intersected with the role ceiling and local implementation tools" : "passive mode does not shape tools", JSON.stringify({ baseline: toolReport.base, ceiling: CEILINGS[role] ?? [], requested: toolReport.requested, effective: toolReport.actual }), [{ kind: "memory", source: "Pi active-tool API", output: JSON.stringify(toolReport.effective) }], { owner: "human", action: "Restore the Human-selected baseline and rerun the governed process; doctor never re-enables tools.", applicable: role !== null, required: role !== null }));
 
 
-  // v0.2 binding evidence: a bound Supervisor for the Lead, a bound Lead for
+  // v0.2 binding evidence: a bound Supervisor for the Lead, bound Lead(s) for
   // the Peer/Supervisor, and event capability presence. Missing binding is
   // BLOCKED only for governed roles that must bind; WARN otherwise.
   const leadNeedsSupervisor = role === "lead";
   const supervisorNeedsLead = role === "supervisor";
   const peerNeedsLead = role === "peer";
-  const peerParentStatus = role === "peer" ? (boundLeadId !== null ? (paseo.observation?.parent_agent_id && boundLeadId !== paseo.observation.parent_agent_id ? "BLOCKED" : "PASS") : "BLOCKED") : "WARN";
-  checks.push(doctorCheck("PEER_PARENT_BINDING", "Peer → exact Lead parent binding", peerParentStatus, "the Peer's Paseo parent equals its bound Lead", peerNeedsLead ? (boundLeadId ?? "no bound Lead") : "not applicable", [{ kind: "memory", source: "process binding cache", output: boundLeadId }], { owner: "lead", action: "Bind the Peer to its exact Paseo parent Lead; a root or wrong-parent Peer must be recreated.", applicable: role !== null, required: peerNeedsLead }));
+  const boundLeads = boundLeadIds.size > 0 ? [...boundLeadIds] : (boundLeadId !== null ? [boundLeadId] : []);
+  const peerParentStatus = role === "peer" ? (boundLeads.length > 0 ? (paseo.observation?.parent_agent_id && !boundLeads.includes(paseo.observation.parent_agent_id) ? "BLOCKED" : "PASS") : "BLOCKED") : "WARN";
+  checks.push(doctorCheck("PEER_PARENT_BINDING", "Peer → exact Lead parent binding", peerParentStatus, "the Peer's Paseo parent equals its bound Lead", peerNeedsLead ? (boundLeads.join(",") || "no bound Lead") : "not applicable", [{ kind: "memory", source: "process binding cache", output: boundLeads.join(",") || null }], { owner: "lead", action: "Bind the Peer to its exact Paseo parent Lead; a root or wrong-parent Peer must be recreated.", applicable: role !== null, required: peerNeedsLead }));
 
-  const leadSupervisorStatus = (leadNeedsSupervisor || supervisorNeedsLead) ? ((leadNeedsSupervisor ? boundSupervisorId : boundLeadId) !== null ? "PASS" : "BLOCKED") : "WARN";
-  checks.push(doctorCheck("LEAD_SUPERVISOR_BINDING", "Lead ↔ bound Supervisor binding", leadSupervisorStatus, "one exact Supervisor bound to a Lead and revalidated from Paseo facts", (leadNeedsSupervisor || supervisorNeedsLead) ? (leadNeedsSupervisor ? (boundSupervisorId ?? "no Supervisor bound") : (boundLeadId ?? "no bound Lead")) : "not applicable", [{ kind: "memory", source: "process binding cache", output: leadNeedsSupervisor ? boundSupervisorId : boundLeadId }], { owner: "human", action: "Bind exactly one Supervisor to this Lead through live Paseo inspection before governed work.", applicable: role !== null, required: leadNeedsSupervisor || supervisorNeedsLead }));
+  const leadSupervisorStatus = (leadNeedsSupervisor || supervisorNeedsLead) ? ((leadNeedsSupervisor ? boundSupervisorId : boundLeads[0]) != null ? "PASS" : "BLOCKED") : "WARN";
+  checks.push(doctorCheck("LEAD_SUPERVISOR_BINDING", "Lead ↔ bound Supervisor binding", leadSupervisorStatus, "bound Supervisor and Lead identities revalidated from Paseo facts", (leadNeedsSupervisor || supervisorNeedsLead) ? (leadNeedsSupervisor ? (boundSupervisorId ?? "no Supervisor bound") : (boundLeads.join(",") || "no bound Lead")) : "not applicable", [{ kind: "memory", source: "process binding cache", output: leadNeedsSupervisor ? boundSupervisorId : (boundLeads.join(",") || null) }], { owner: "human", action: "Bind Supervisor and Lead identities through live Paseo inspection before governed work.", applicable: role !== null, required: leadNeedsSupervisor || supervisorNeedsLead }));
 
-  const eventCapability = role === "lead" && typeof pi?.sendEvent === "function";
+  const mcpActive = toolReport.actual.includes("mcp") || (baseline ?? []).includes("mcp");
+  const eventCapability = role === "lead" && MCP_TARGETS.lead.paseo.has("send_agent_prompt") && mcpActive;
   const eventStatus = role === "lead" ? (eventCapability ? "PASS" : "BLOCKED") : (role ? "PASS" : "WARN");
-  checks.push(doctorCheck("EVENT_CAPABILITIES", "bounded event transport capability", eventStatus, role === "lead" ? "Lead can emit bounded milestone events with idempotency" : "Supervisor and Peer have no outbound event transport requirement", role === "lead" ? (eventCapability ? "event transport present" : "no event transport capability is observable") : "not applicable", [{ kind: "api", source: "Pi extension API", output: eventCapability ? "present" : "absent" }], { owner: "operator", action: "Expose a bounded event transport before governed Lead milestone delivery.", applicable: role === "lead", required: role === "lead" }));
+  checks.push(doctorCheck("EVENT_CAPABILITIES", "bounded event transport capability", eventStatus, role === "lead" ? "Lead can emit bounded milestone events through outer MCP send_agent_prompt" : "Supervisor and Peer have no outbound milestone-event transport requirement", role === "lead" ? (eventCapability ? "outer MCP send_agent_prompt present" : "outer MCP send_agent_prompt is not observable") : "not applicable", [{ kind: "api", source: "outer MCP send_agent_prompt", output: eventCapability ? "present" : "absent" }], { owner: "operator", action: "Expose outer MCP send_agent_prompt before governed Lead milestone delivery.", applicable: role === "lead", required: role === "lead" }));
 
   checks.sort((left, right) => left.code.localeCompare(right.code));
   const overall = checks.reduce((worst, check) => DOCTOR_STATUS_RANK[check.status] > DOCTOR_STATUS_RANK[worst] ? check.status : worst, role === null ? "WARN" : "PASS");
@@ -4351,20 +4398,34 @@ let protocolPin = null;
 // only; no mailbox, registry, or durable workflow state is created.
 let lastPeerReport = null;
 let lastAcceptance = null;
-// v0.2 binding state (process-local cache only). The exact single Supervisor
-// bound to a Lead, the exact Lead bound to a Supervisor, and the bound Lead for
-// a Peer. These are caches: restart reconciliation re-derives them from Paseo
-// facts, never from process memory alone. A bound Supervisor observes exactly
-// one Lead per active assignment.
+// v0.2 binding state (process-local cache only). The exact Supervisor bound
+// to a Lead, the assigned Lead(s) bound to a Supervisor, and the bound Lead
+// for a Peer. These are caches: restart reconciliation re-derives them from
+// Paseo facts, never from process memory alone.
 let boundSupervisorId = null;
 let boundLeadId = null;
+const boundLeadIds = new Set();
 let boundObserverId = null;
+let boundTaskId = null;
+let boundWorkspaceId = null;
 
 let inspectionParentAgentId = null;
 
 export function getInspectionParentAgentId() { return inspectionParentAgentId; }
 export function getBoundSupervisorId() { return boundSupervisorId; }
 export function getBoundLeadId() { return boundLeadId; }
+export function getBoundLeadIds() { return [...boundLeadIds]; }
+
+function rememberBoundLead(id) {
+  const trimmed = typeof id === "string" ? id.trim() : "";
+  if (trimmed === "") return;
+  boundLeadId = trimmed;
+  boundLeadIds.add(trimmed);
+}
+
+function partnerTaskId(obs, fallback) {
+  return labelKeyOf(obs?.labels, PPO_TASK_KEY) ?? (typeof fallback === "string" && fallback.trim() !== "" ? fallback.trim() : null);
+}
 
 // Records the exact bound Supervisor for a Lead or the exact bound Lead for a
 // Supervisor/Peer after live Paseo inspection validates it. Returns false when
@@ -4417,10 +4478,18 @@ export async function verifyPartnerBinding(opts) {
       && obs.workspace_id !== null && obs.workspace_id !== expectedWorkspaceId) {
     return { ok: false, error: `partner workspace ${obs.workspace_id} does not match the expected workspace ${expectedWorkspaceId}` };
   }
+  const liveTask = partnerTaskId(obs, null);
+  if (liveTask !== null && liveTask !== taskId.trim()) {
+    return { ok: false, error: `partner task ${liveTask} does not match the expected task ${taskId.trim()}` };
+  }
   if (kind === "supervisor") {
     boundSupervisorId = claimedId.trim();
+    boundTaskId = taskId.trim();
+    if (typeof expectedWorkspaceId === "string" && expectedWorkspaceId.trim() !== "") boundWorkspaceId = expectedWorkspaceId.trim();
   } else if (kind === "lead") {
-    boundLeadId = claimedId.trim();
+    rememberBoundLead(claimedId.trim());
+    boundTaskId = taskId.trim();
+    if (typeof expectedWorkspaceId === "string" && expectedWorkspaceId.trim() !== "") boundWorkspaceId = expectedWorkspaceId.trim();
   } else {
     return { ok: false, error: `unknown partner kind ${String(kind)}` };
   }
@@ -4447,7 +4516,19 @@ export async function reconcileLeadEventRecipient(agentId, envelope, options) {
   if (!cwd || !root || (cwd !== root && !cwd.startsWith(root + "/"))) return { ok: false, error: "bounded event recipient is outside the pinned repository" };
   if (recipient.provider === "ppo-supervisor") {
     if (boundSupervisorId !== null && boundSupervisorId !== agentId) return { ok: false, error: "event recipient does not match the bound Supervisor" };
-    boundSupervisorId = agentId;
+    if (boundSupervisorId !== agentId) {
+      const verified = await verifyPartnerBinding({
+        claimedId: agentId,
+        kind: "supervisor",
+        selfId: leadAgentId,
+        taskId: envelope.task_id,
+        env,
+        expectedRole: "supervisor",
+        expectedProvider: "ppo-supervisor",
+        expectedRepoRoot: repoRoot,
+      });
+      if (!verified.ok) return { ok: false, error: verified.error };
+    }
     return { ok: true, recipientKind: "supervisor" };
   }
   if (envelope.kind !== "LEAD_FINISHED") return { ok: false, error: "a Human observer receives only LEAD_FINISHED" };
@@ -4461,8 +4542,96 @@ export function bindExactPartner({ supervisorId = null, leadId = null }) {
   if (supervisorId !== null && (typeof supervisorId !== "string" || supervisorId.trim() === "")) return false;
   if (leadId !== null && (typeof leadId !== "string" || leadId.trim() === "")) return false;
   if (supervisorId !== null) boundSupervisorId = supervisorId;
-  if (leadId !== null) boundLeadId = leadId;
+  if (leadId !== null) rememberBoundLead(leadId);
   return true;
+}
+
+const CLAIMED_SUPERVISOR = /(?:supervisor(?:\s+agent)?\s+id|bound supervisor)\s*[:=]\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
+const CLAIMED_LEAD = /(?:lead(?:\s+agent)?\s+id|bound lead)\s*[:=]\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
+const CLAIMED_TASK = /(?:task(?:\s+id)?)\s*[:=]\s*(\S+)/i;
+
+async function bindAnnouncedPartner(text, ctx) {
+  if (latch === null || typeof text !== "string" || text.trim() === "") return;
+  const env = envOf(ctx);
+  const repoRoot = protocolPin?.repoRoot ?? await findRepoRoot();
+  const taskMatch = CLAIMED_TASK.exec(text);
+  const taskId = taskMatch?.[1]?.replace(/["'`]/g, "") ?? boundTaskId ?? latch.agentId;
+  if (latch.role === "lead") {
+    const match = CLAIMED_SUPERVISOR.exec(text);
+    if (match === null) return;
+    await verifyPartnerBinding({
+      claimedId: match[1],
+      kind: "supervisor",
+      selfId: latch.agentId,
+      taskId,
+      env,
+      expectedRole: "supervisor",
+      expectedProvider: "ppo-supervisor",
+      expectedRepoRoot: repoRoot,
+    });
+    return;
+  }
+  if (latch.role === "supervisor") {
+    const match = CLAIMED_LEAD.exec(text);
+    if (match === null) return;
+    await verifyPartnerBinding({
+      claimedId: match[1],
+      kind: "lead",
+      selfId: latch.agentId,
+      taskId,
+      env,
+      expectedRole: "lead",
+      expectedProvider: env[LEAD_ALIAS_ENV] || "ppo-lead",
+      expectedRepoRoot: repoRoot,
+    });
+  }
+}
+
+export async function reconcileSupervisorObservation(agentId, options) {
+  const { supervisorId, env = process.env, repoRoot = null } = options ?? {};
+  const id = typeof agentId === "string" ? agentId.trim() : "";
+  if (id === "") return { ok: false, error: "no observation target to reconcile" };
+  if (boundLeadIds.size === 0) return { ok: false, error: "Supervisor observation requires a bound Lead" };
+  if (boundLeadIds.has(id)) return { ok: true, scope: "lead" };
+  const observed = await observePaseoCurrentAgent(id, { env });
+  if (!observed.ok) return { ok: false, error: `observation target inspection failed: ${observed.error}` };
+  const obs = observed.observation;
+  if (obs.parent_agent_id && boundLeadIds.has(obs.parent_agent_id)) {
+    const root = repoRoot?.replace(/\/+$/, "");
+    const cwd = obs.cwd?.replace(/\/+$/, "");
+    if (root && cwd && cwd !== root && !cwd.startsWith(root + "/")) {
+      return { ok: false, error: "observation target is outside the bound Lead repository" };
+    }
+    return { ok: true, scope: "child" };
+  }
+  return { ok: false, error: `observation target ${id} is outside the bound Lead/project scope of Supervisor ${supervisorId}` };
+}
+
+export async function deliverPeerLeadMessage({ kind, taskId, payload, env = process.env, repoRoot = null }) {
+  if (latch?.role !== "peer") return { ok: false, error: "peer_lead_message is restricted to the peer role" };
+  const parentId = inspectionParentAgentId;
+  if (typeof parentId !== "string" || parentId.trim() === "") {
+    return { ok: false, error: "Peer parent Lead is not observable from process parentage" };
+  }
+  const built = buildEventEnvelope({
+    kind,
+    taskId,
+    senderAgentId: latch.agentId,
+    recipientAgentId: parentId,
+    repoRoot: repoRoot ?? process.cwd(),
+    payload,
+  });
+  if (!built.ok) return { ok: false, error: built.error };
+  const directed = validateEventEnvelope(built.envelope, { direction: "lead_peer" });
+  if (!directed.ok) return { ok: false, error: directed.error };
+  if (eventDedupe(built.envelope.event_id)) return { ok: false, error: "duplicate event_id is ignored (idempotent)" };
+  const text = `${EVENT_ENVELOPE_BEGIN}${JSON.stringify(built.envelope)}${EVENT_ENVELOPE_END}`;
+  try {
+    await execFileAsync("paseo", ["send", parentId, "--prompt", text, "--no-wait"], { env, timeout: 15000 });
+  } catch (err) {
+    return { ok: false, error: `peer_lead_message delivery failed: ${err.message}` };
+  }
+  return { ok: true, envelope: built.envelope, recipientId: parentId };
 }
 
 
@@ -4811,6 +4980,9 @@ async function activateGovernedSession(pi, ctx, { deferUnavailableTopology = fal
   }
   latch = result.latch;
   inspectionParentAgentId = observedParentAgentId;
+  if (latch.role === "peer" && typeof observedParentAgentId === "string" && observedParentAgentId.trim() !== "") {
+    rememberBoundLead(observedParentAgentId);
+  }
   const tools = requireBaselineTools(baseline, latch.role);
   if (!tools.ok) {
     blockWith(ctx, tools.error);
@@ -4880,12 +5052,43 @@ export default function (pi) {
         return { content: [{ type: "text", text: "status" in result ? `Notebook entry ${result.status}.` : "Notebook entry appended." }], details: {} };
       },
     });
+    pi.registerTool({
+      name: PEER_LEAD_MESSAGE_TOOL,
+      label: "Peer to Lead message",
+      description: "Send one mid-run question, blocked, dependency, or progress message to the parent Lead",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["kind", "task_id", "payload"],
+        properties: {
+          kind: { type: "string" },
+          task_id: { type: "string" },
+          payload: { type: "object" },
+        },
+      },
+      isEnabled: () => latch?.role === "peer" && blockedReason === null,
+      execute: async (_toolCallId, params) => {
+        const delivered = await deliverPeerLeadMessage({
+          kind: params.kind,
+          taskId: params.task_id,
+          payload: params.payload ?? {},
+        });
+        if (delivered.ok !== true) {
+          throw new Error(delivered.error ?? "peer_lead_message failed");
+        }
+        const text = `${EVENT_ENVELOPE_BEGIN}${JSON.stringify(delivered.envelope)}${EVENT_ENVELOPE_END}`;
+        return { content: [{ type: "text", text }], details: { recipient_agent_id: delivered.recipientId } };
+      },
+    });
   }
 
   pi.on("session_start", async (_event, ctx) => {
     boundSupervisorId = null;
     boundLeadId = null;
+    boundLeadIds.clear();
     boundObserverId = null;
+    boundTaskId = null;
+    boundWorkspaceId = null;
     inspectionParentAgentId = null;
     lastPeerReport = null;
     lastAcceptance = null;
@@ -4942,6 +5145,7 @@ export default function (pi) {
       reportBlockedInput(pi, blockedReason ?? "governed runtime verification failed");
       return { action: "handled" };
     }
+    await bindAnnouncedPartner(event.text ?? "", ctx);
     // Governed orchestration requires a valid pinned protocol for the Lead:
     // re-read and re-validate at every gate; drift blocks permanently.
     if (latch.role === "lead") {
@@ -5087,6 +5291,32 @@ export default function (pi) {
     // rederives the child from Paseo facts.
     let reconciledChildId = null;
     let reconciledEventRecipientId = null;
+    let reconciledLeadId = null;
+    let reconciledObservationIds = null;
+    let reconciledListScope = false;
+    if (latch.role === "supervisor" && event.toolName === "mcp") {
+      const op = canonicalMcpOperation(event?.input?.server, event?.input?.tool);
+      if (op === "list_agents") {
+        if (boundLeadIds.size === 0) return { block: true, reason: "list_agents is restricted to the Supervisor's bound Lead and project scope" };
+        reconciledListScope = true;
+      } else if ((op === "get_agent_status" || op === "get_agent_activity") && typeof event?.input?.args?.agentId === "string") {
+        const rec = await reconcileSupervisorObservation(event.input.args.agentId, {
+          supervisorId: latch.agentId,
+          env: envOf(ctx),
+          repoRoot: protocolPin?.repoRoot ?? await findRepoRoot(),
+        });
+        if (!rec.ok) return { block: true, reason: rec.error };
+        reconciledObservationIds = [event.input.args.agentId];
+      } else if (op === "send_agent_prompt" && typeof event?.input?.args?.agentId === "string") {
+        if (!boundLeadIds.has(event.input.args.agentId)) {
+          return { block: true, reason: "send_agent_prompt target is not the exact bound Lead of this Supervisor" };
+        }
+        const observed = await observePaseoCurrentAgent(event.input.args.agentId, { env: envOf(ctx) });
+        if (!observed.ok) return { block: true, reason: `bound Lead inspection failed: ${observed.error}` };
+        if (observed.observation.parent_agent_id !== null) return { block: true, reason: "Supervisor send target must be a root Lead" };
+        reconciledLeadId = event.input.args.agentId;
+      }
+    }
     if (latch.role === "lead" && event.toolName === "mcp") {
       const op = canonicalMcpOperation(event?.input?.server, event?.input?.tool);
       const eventText = op === "send_agent_prompt" ? event?.input?.args?.prompt : null;
@@ -5135,6 +5365,9 @@ export default function (pi) {
       repoRoot,
       reconciledChildId,
       reconciledEventRecipientId,
+      reconciledLeadId,
+      reconciledObservationIds,
+      reconciledListScope,
     });
     if (decision?.block) {
       ctx.ui?.notify?.(`Blocked ${event.toolName}: ${decision.reason}`, "error");
