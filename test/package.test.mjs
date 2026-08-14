@@ -50,7 +50,7 @@ const fakePi = (ctxOverrides = {}) => {
   const commands = new Map();
   const tools = new Map();
   const notifications = [];
-  const holder = { activeTools: [...(ctxOverrides.activeTools ?? [])], modelCalls: [], thinking: runtimeThinking };
+  const holder = { activeTools: [...(ctxOverrides.activeTools ?? [])], modelCalls: [], sentMessages: [], thinking: runtimeThinking };
   const ui = {
     select: async () => null,
     confirm: async () => false,
@@ -82,6 +82,7 @@ const fakePi = (ctxOverrides = {}) => {
       setModel: (model) => { holder.modelCalls.push(["setModel", model.provider, model.id]); return true; },
       setThinkingLevel: (level) => { holder.modelCalls.push(["setThinkingLevel", level]); holder.thinking = level; },
       getThinkingLevel: () => holder.thinking,
+      sendMessage: (message, options) => { holder.sentMessages.push([message, options]); },
       sendUserMessage: (message) => { holder.sentUserMessage = message; },
     },
     ctx: {
@@ -1102,6 +1103,12 @@ test("wiring: missing read or outer mcp baseline blocks a governed lead", async 
     const blockedInput = await fakeNoMcp.handlers.get("input")({ text: "hi" }, fakeNoMcp.ctx);
     assert.deepEqual(blockedInput, { action: "handled" });
     assert.equal(fakeNoMcp.notifications.some(([msg]) => /outer mcp tool is not active/.test(msg)), true);
+    assert.deepEqual(fakeNoMcp.holder.sentMessages, [[{
+      customType: "pi-paseo-orchestration-blocked",
+      content: "pi-paseo-orchestration blocked: outer mcp tool is not active for the lead role",
+      display: true,
+      details: { reason: "outer mcp tool is not active for the lead role" },
+    }, undefined]]);
 
     // Peer without read: blocked too.
     const ext2 = await freshExtension();

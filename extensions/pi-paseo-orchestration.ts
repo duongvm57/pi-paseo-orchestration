@@ -4705,6 +4705,20 @@ function blockWith(ctx, reason) {
   ctx.ui?.notify?.(`pi-paseo-orchestration blocked: ${reason}`, "error");
 }
 
+function reportBlockedInput(pi, reason) {
+  const content = `pi-paseo-orchestration blocked: ${reason}`;
+  try {
+    pi.sendMessage?.({
+      customType: "pi-paseo-orchestration-blocked",
+      content,
+      display: true,
+      details: { reason },
+    });
+  } catch {
+    // The gate remains fail closed even when the host cannot persist the report.
+  }
+}
+
 
 
 function registerCommand(pi, name, definition) {
@@ -4855,15 +4869,20 @@ export default function (pi) {
     if (latch === null && blockedReason === null) return { action: "continue" };
     if (blockedReason !== null) {
       ctx.ui?.notify?.(`pi-paseo-orchestration blocked: ${blockedReason}`, "error");
+      reportBlockedInput(pi, blockedReason);
       return { action: "handled" };
     }
-    if (!(await verifyOrBlock(ctx, configDir(envOf(ctx)), pi))) return { action: "handled" };
+    if (!(await verifyOrBlock(ctx, configDir(envOf(ctx)), pi))) {
+      reportBlockedInput(pi, blockedReason ?? "governed runtime verification failed");
+      return { action: "handled" };
+    }
     // Governed orchestration requires a valid pinned protocol for the Lead:
     // re-read and re-validate at every gate; drift blocks permanently.
     if (latch.role === "lead") {
       const pin = await ensureProtocolPin();
       if (!pin.ok) {
         blockWith(ctx, pin.error);
+        reportBlockedInput(pi, pin.error);
         return { action: "handled" };
       }
     }
