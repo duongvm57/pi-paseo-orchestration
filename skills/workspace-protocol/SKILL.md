@@ -45,7 +45,7 @@ Use exactly the guide's closed frontmatter and H2 schema. The required H2 sectio
 
 Optional H2 sections are limited to `Project criticality`, `Review and council rules` (or `Review and council`), `Anti-patterns`, and `Supervisor hints`. Include project characteristics only when they change routing or proof. Include anti-patterns only when causal evidence makes them repository-specific; record each as bold text plus signal, evidence required, open question, and allowed response, never as a nested heading. Keep model and thinking selection outside the v0.1 protocol; Human-owned role settings are the operative source. Record only repository-specific allocations and constraints; do not restate the Role Profiles or this authoring workflow.
 
-The Workspace Protocol may narrow workflow and permit tiny Lead self-work, but it cannot grant `edit`, `local_commit`, recovery, or any other Capability. Preserve **Role Profile > Workspace Protocol > current-run Task Authority Envelope > ordinary task prose**. Omission grants nothing.
+The Workspace Protocol may narrow workflow and permit tiny Lead self-work; it cannot grant `edit`, `local_commit`, recovery, or any Capability, because ordinary local reversible work is authorized directly by the initial Human task and the exact assignment. Preserve **Role Profile > Workspace Protocol > ordinary task prose**. There is no Task Authority Envelope or hidden authority state. Omission grants nothing.
 
 ## Confirm and write
 
