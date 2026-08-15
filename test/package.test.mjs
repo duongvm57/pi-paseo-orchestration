@@ -700,6 +700,9 @@ test("checkToolCall: closed per-role gates, outer MCP validation, git publicatio
   for (const cmd of ["paseo inspect peer-1 --json", "paseo send lead-1 --prompt hi", "PATH=/usr/bin paseo status"]) {
     assert.equal(extension.checkToolCall("bash", { command: cmd }, peerPolicy).block, true, `must block: ${cmd}`);
   }
+  for (const cmd of ["cat .orchestration/workspace-protocol.md", "sed -n '1,50p' .orchestration/workspace-protocol.md"]) {
+    assert.equal(extension.checkToolCall("bash", { command: cmd }, peerPolicy).block, true, `must block: ${cmd}`);
+  }
 });
 
 
@@ -3833,6 +3836,7 @@ test("checkToolCall: Supervisor send and observation stay on bound Lead scope", 
   assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_list_agents", args: { cwd: "/other/repo" } }, scoped).block, true);
   assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_list_agents", args: { cwd: "/tmp/repo" } }, scoped), undefined);
   assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_list_agents", args: { cwd: "/tmp/repo" } }, { ...scoped, reconciledListScope: false }).block, true);
+  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_create_agent", args: { title: "successor", provider: "ppo-lead/opencode-go/deepseek-v4-pro", settings: {}, initialPrompt: "\"recovery_authorized\":\"t-1\"", notifyOnFinish: true } }, policy).block, true);
 });
 
 test("checkToolCall: Peer mid-run message kinds are closed", () => {

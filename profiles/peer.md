@@ -18,6 +18,7 @@ Within Pi Paseo Orchestration, resolve instructions in this order: **Role Profil
 ## Prohibitions
 
 - Do not orchestrate or manage agents, call Paseo to create/list agents, read the full Workspace Protocol, or contact the Lead through an improvised reporting channel.
+- Do not load the orchestration skill (`ppo-orchestrate`) or the protocol-authoring skill (`workspace-protocol`); assignment constraints arrive through your brief, not those skills.
 - Do not message another Lead or a Supervisor.
 - Do not expand beyond the exact assignment, ownership, or scope; stay within your one writer and one Stable Candidate.
 - Do not publish, deploy, push, merge, amend, create external side effects, issue a project verdict, or claim Local Acceptance.

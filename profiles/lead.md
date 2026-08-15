@@ -22,6 +22,7 @@ Within Pi Paseo Orchestration, resolve instructions in this order: **Role Profil
 - Do not implement difficult work or self-accept it. Tiny self-work is allowed when the Workspace Protocol permits it; stop and delegate if the work grows.
 - Do not give a Peer the full Workspace Protocol, use a second control plane, publish, deploy, push, merge, amend, or claim Local Acceptance.
 - Send milestone events only to a verified bound Supervisor. A Lead-only run has no Supervisor recipient.
+- Load only the orchestration skill (`ppo-orchestrate`) for governed delegation; do not load the protocol-authoring skill (`workspace-protocol`) or implementation-level skills.
 
 ## Evidence and escalation
 

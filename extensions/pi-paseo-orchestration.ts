@@ -158,7 +158,7 @@ export const CEILINGS = {
 // canonicalMcpOperation before any policy decision, so prefixed and canonical
 // forms are identical.
 export const MCP_TARGETS = {
-  supervisor: { paseo: new Set(["list_agents", "list_workspaces", "get_agent_status", "get_agent_activity", "send_agent_prompt", "create_agent"]) },
+  supervisor: { paseo: new Set(["list_agents", "list_workspaces", "get_agent_status", "get_agent_activity", "send_agent_prompt"]) },
   lead: { paseo: new Set(["list_workspaces", "list_providers", "list_agents", "create_agent", "send_agent_prompt", "get_agent_status", "get_agent_activity", "cancel_agent", "archive_agent"]) },
   peer: {},
 };
@@ -502,7 +502,6 @@ const MCP_CONTRACT = {
     "`get_agent_status` with `{\"agentId\":\"<full Paseo agent ID>\"}`",
     "`get_agent_activity` with `{\"agentId\":\"<full Paseo agent ID>\"}`",
     "`send_agent_prompt` with `{\"agentId\":\"<full bound Lead ID>\",\"prompt\":\"<question or Human decision>\"}`",
-    "`create_agent` with a Human-authorized successor-Lead recovery prompt",
   ],
 };
 
@@ -563,22 +562,6 @@ function createAgentPolicyPrompt(activeLatch) {
 
 function validateCreateAgentArgs(args, policy) {
   const block = (reason) => ({ block: true, reason });
-  if (policy.role === "supervisor") {
-    if (typeof policy.recoveryAuthorizedTaskId !== "string" || policy.recoveryAuthorizedTaskId.trim() === "") {
-      return block("Supervisor create_agent requires an explicit recovery_authorized binding in the current Human input");
-    }
-    const required = ["title", "provider", "settings", "initialPrompt", "notifyOnFinish"];
-    if (!closedKeys(args, required, ["labels"])) return block("create_agent arguments are not the closed recovery shape");
-    if (typeof args.initialPrompt !== "string" || args.initialPrompt.trim() === "") {
-      return block("create_agent initialPrompt must be a nonempty string");
-    }
-    const authorized = [...args.initialPrompt.matchAll(/\"recovery_authorized\"\s*:\s*\"([^\"]*)\"/g)];
-    if (authorized.length !== 1 || authorized[0][1] !== policy.recoveryAuthorizedTaskId) {
-      return block("Supervisor create_agent prompt must bind recovery_authorized to the current Human authorization");
-    }
-    if (args.notifyOnFinish !== true) return block("create_agent must request the native finish notification");
-    return undefined;
-  }
   if (policy.role !== "lead") {
     return block("create_agent is restricted to the Lead minting Peer children");
   }
@@ -779,6 +762,9 @@ export function checkToolCall(toolName, input, policy) {
     if (typeof input?.command !== "string") return block("bash call without a command string");
     if (policy.role === "peer" && /\bpaseo\b/.test(input.command)) {
       return block("paseo CLI is unavailable to the peer role");
+    }
+    if (policy.role === "peer" && /(?:\.orchestration|workspace-protocol\.md)/.test(input.command)) {
+      return block("reading the workspace protocol is a governance violation for the peer role");
     }
     if (/\bgit\b[^\n;&|]*\bcommit\b/.test(input.command) && !GIT_AMEND.test(input.command)) {
       if (policy.role === "lead" && policy.allowLeadWrite !== true) return block("Lead local commit requires protocol opt-in for Lead self-work");
@@ -4466,8 +4452,6 @@ let boundObserverId = null;
 let boundTaskId = null;
 let boundWorkspaceId = null;
 let writeModeBound = false;
-let recoveryAuthorizedTaskId = null;
-
 let inspectionParentAgentId = null;
 
 export function getInspectionParentAgentId() { return inspectionParentAgentId; }
@@ -5200,7 +5184,6 @@ export default function (pi) {
     boundTaskId = null;
     boundWorkspaceId = null;
     writeModeBound = false;
-    recoveryAuthorizedTaskId = null;
     inspectionParentAgentId = null;
     lastPeerReport = null;
     lastAcceptance = null;
@@ -5293,10 +5276,6 @@ export default function (pi) {
         blockWith(ctx, "error" in bound && typeof bound.error === "string" ? bound.error : "partner binding failed");
         reportBlockedInput(pi, blockedReason);
         return { action: "handled" };
-      }
-      const recovery = closedBinding(event.text ?? "", "recovery_authorized");
-      if (latch.role === "supervisor" && recovery.length === 1 && recovery[0].trim() !== "") {
-        recoveryAuthorizedTaskId = recovery[0].trim();
       }
     }
     if (latch.role === "lead") {
@@ -5530,7 +5509,6 @@ export default function (pi) {
       reconciledLeadId,
       reconciledObservationIds,
       reconciledListScope,
-      recoveryAuthorizedTaskId,
     });
     if (decision?.block) {
       ctx.ui?.notify?.(`Blocked ${event.toolName}: ${decision.reason}`, "error");
