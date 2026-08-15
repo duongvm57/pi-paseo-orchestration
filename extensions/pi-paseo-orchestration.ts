@@ -3893,15 +3893,16 @@ export async function buildDoctorReport(options = {}) {
   // v0.2 binding evidence: a bound Supervisor for the Lead, bound Lead(s) for
   // the Peer/Supervisor, and event capability presence. Missing binding is
   // BLOCKED only for governed roles that must bind; WARN otherwise.
-  const leadNeedsSupervisor = role === "lead";
   const supervisorNeedsLead = role === "supervisor";
   const peerNeedsLead = role === "peer";
   const boundLeads = boundLeadIds.size > 0 ? [...boundLeadIds] : (boundLeadId !== null ? [boundLeadId] : []);
   const peerParentStatus = role === "peer" ? (boundLeads.length > 0 ? (paseo.observation?.parent_agent_id && !boundLeads.includes(paseo.observation.parent_agent_id) ? "BLOCKED" : "PASS") : "BLOCKED") : "WARN";
   checks.push(doctorCheck("PEER_PARENT_BINDING", "Peer → exact Lead parent binding", peerParentStatus, "the Peer's Paseo parent equals its bound Lead", peerNeedsLead ? (boundLeads.join(",") || "no bound Lead") : "not applicable", [{ kind: "memory", source: "process binding cache", output: boundLeads.join(",") || null }], { owner: "lead", action: "Bind the Peer to its exact Paseo parent Lead; a root or wrong-parent Peer must be recreated.", applicable: role !== null, required: peerNeedsLead }));
 
-  const leadSupervisorStatus = (leadNeedsSupervisor || supervisorNeedsLead) ? ((leadNeedsSupervisor ? boundSupervisorId : boundLeads[0]) != null ? "PASS" : "BLOCKED") : "WARN";
-  checks.push(doctorCheck("LEAD_SUPERVISOR_BINDING", "Lead ↔ bound Supervisor binding", leadSupervisorStatus, "bound Supervisor and Lead identities revalidated from Paseo facts", (leadNeedsSupervisor || supervisorNeedsLead) ? (leadNeedsSupervisor ? (boundSupervisorId ?? "no Supervisor bound") : (boundLeads.join(",") || "no bound Lead")) : "not applicable", [{ kind: "memory", source: "process binding cache", output: leadNeedsSupervisor ? boundSupervisorId : (boundLeads.join(",") || null) }], { owner: "human", action: "Bind Supervisor and Lead identities through live Paseo inspection before governed work.", applicable: role !== null, required: leadNeedsSupervisor || supervisorNeedsLead }));
+  const leadSupervisorStatus = role === "lead"
+    ? (boundSupervisorId != null ? "PASS" : "WARN")
+    : supervisorNeedsLead ? (boundLeads[0] != null ? "PASS" : "BLOCKED") : "WARN";
+  checks.push(doctorCheck("LEAD_SUPERVISOR_BINDING", "Lead ↔ bound Supervisor binding", leadSupervisorStatus, role === "lead" ? "a Supervisor is optional; bind only when assigned or the task class warrants it" : "bound Lead identities revalidated from Paseo facts", role === "lead" ? (boundSupervisorId ?? "no Supervisor bound") : (supervisorNeedsLead ? (boundLeads.join(",") || "no bound Lead") : "not applicable"), [{ kind: "memory", source: "process binding cache", output: role === "lead" ? boundSupervisorId : (boundLeads.join(",") || null) }], { owner: "human", action: role === "lead" ? "Bind a Supervisor only when the Human assigns one or the task class warrants it." : "Bind the Supervisor to its assigned Lead through live Paseo inspection before governed work.", applicable: role !== null, required: supervisorNeedsLead }));
 
   const mcpActive = toolReport.actual.includes("mcp") || (baseline ?? []).includes("mcp");
   const eventCapability = role === "lead" && MCP_TARGETS.lead.paseo.has("send_agent_prompt") && mcpActive;

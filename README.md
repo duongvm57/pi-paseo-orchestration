@@ -166,7 +166,7 @@ Doctor is observation-only. It reports the current Pi, Git, role, settings, prot
 
 ### 4. Start work
 
-Follow the one supported startup flow above: the Human creates the root Lead with the task, then the root Supervisor bound to that Lead; the Lead creates Peer children and returns the final candidate to the Human for local acceptance.
+Follow the one supported startup flow above: the Human creates the root Lead with the task, and a root Supervisor only when warranted; the Lead creates Peer children and returns the final candidate to the Human for local acceptance.
 
 ### Supervisor Notebook
 

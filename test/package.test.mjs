@@ -3967,6 +3967,10 @@ test("Doctor EVENT_CAPABILITIES checks outer MCP send_agent_prompt", async () =>
     assert.equal(event.status, "PASS");
     assert.match(event.expected, /send_agent_prompt/);
     assert.doesNotMatch(JSON.stringify(event), /sendEvent/);
+    const binding = report.checks.find((check) => check.code === "LEAD_SUPERVISOR_BINDING");
+    assert.equal(binding.status, "WARN");
+    assert.equal(binding.required, false);
+    assert.match(binding.observed, /no Supervisor bound/);
   } finally {
     await rm(settingsDir, { recursive: true, force: true });
     await rm(profiles, { recursive: true, force: true });

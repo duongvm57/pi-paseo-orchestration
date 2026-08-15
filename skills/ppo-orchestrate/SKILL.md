@@ -1,6 +1,6 @@
 ---
 name: ppo-orchestrate
-description: Run governed Pi Paseo work through a Human-created root Lead, a root Supervisor, and bounded Peer assignments. Use when a PPO Lead must classify, delegate, follow up, review, and hand work back to the Human.
+description: Run governed Pi Paseo work through a Human-created root Lead, an optional root Supervisor when warranted, and bounded Peer assignments. Use when a PPO Lead must classify, delegate, follow up, review, and hand work back to the Human.
 compatibility: Requires the paseo MCP server, configured PPO role aliases, and a repository Workspace Protocol.
 ---
 
