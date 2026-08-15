@@ -165,3 +165,69 @@ The Human-facing Pi package source was temporarily switched from the main checko
 - Finding A closed: after the Human binding message, the Lead sent exactly one `LEAD_STARTED` closed envelope through the outer `mcp` `paseo_send_agent_prompt` to the Supervisor; the gate allowed it (no block), the Supervisor received the event, performed one bounded observation pass confirming Lead health and exactly-once delivery, and returned idle. No CLI `paseo send` was used.
 - Finding B closed: on a second prompt, the Lead sent one `LEAD_FINISHED` envelope (verdict READY) to the root Pi observer through the same MCP route; the gate allowed it ("No block reason") and the observer harness actually received the envelope as its next input.
 - Both smoke agents returned idle; no daemon restart was needed because only new agent processes load the package source.
+
+### DOGFOOD-020 — Deep Dive conformance gap audit (v0.2 vs normative source)
+
+- Baseline: plan.md:17-43 fixes Deep Dive as the normative source; only distribution and local-only publication are intentional deltas. Anything else is a real divergence.
+- Verdict: 8 confirmed gaps, 3 partial, 1 not-a-gap, plus 8 new gaps. 97/97 tests + typecheck pass but prove helpers/design in isolation; they catch none of these wiring/conformance gaps.
+
+Confirmed gaps:
+- G1 Peer Paseo-awareness: Deep Dive "Peer không cần biết Paseo", "không biết hoặc không dùng Paseo" (deep-dive.md:21-23,557-566); profiles/peer.md:11-16 forces Peer to self-inspect through Paseo.
+- G2 Peer ceiling vs profile: Peer has no MCP (extension:145-160), only the Notebook tool is registered (extension:4848-4876), but Bash does not block `paseo inspect/send` (extension:695-701) — the instruction in practice forces CLI fallback.
+- G6 Supervisor send capability: Deep Dive authority "hỏi Lead", "relay owner decision" (deep-dive.md:338-347; plan:457-471); current MCP targets are list/status/activity only (extension:157-160). v0.2 spec self-contradicts: exact-target Lead communication allowed at .scratch/.../spec.md:102,286-290.
+- G7 1:1 cardinality: Deep Dive "một hoặc nhiều project/workspace", cardinality linh hoạt (deep-dive.md:340,1218-1229); profiles/supervisor.md:3,11-13 locks one Lead. Runtime does not enforce 1:1 strictly and allows inspecting any agent — mismatch in the opposite direction.
+- G9 Heartbeat: Deep Dive low-frequency heartbeat as safety net (deep-dive.md:727-735), Plan bounded watchdog (plan:1372-1407); profiles/supervisor.md:21 bans automatic heartbeat.
+- G10 Gated recovery removed: Deep Dive + Plan Human-authorized Lead recovery (deep-dive.md:338-347; plan:496-508); v0.2 removed supervisor_recovery grants (specs/v0.2.md:48-50) while protocol still says "Recovery remains grant-bound" (workspace-protocol.md:37-42) — dead prose.
+- G11 Model/effort principles: required in protocol (deep-dive.md:775-788; plan:1681-1697) but the authoring skill excludes them (skills/workspace-protocol/SKILL.md:37-48). Partial on discovery: Lead still has list_providers and runtime checks the exact model tuple, so "live discovery deleted entirely" is too strong.
+- G12 Lead write/edit capability: Plan requires protocol explicit opt-in (plan:862-878); effectiveTools() grants write/edit to every Lead (extension:837-847) and Bash allows local commit; protocol permits no tiny case and still demands the deleted envelope (workspace-protocol.md:68-75).
+
+Partial gaps:
+- G4 Milestone push: event-driven monitoring fits Deep Dive (deep-dive.md:727-735); six events are not a violation per se. The gap is they became the exclusive Lead-controlled wake-up path and hard-code observation strategy outside the Workspace Protocol.
+- G5 Human-Supervisor channel: Deep Dive says "Human có thể trao đổi chủ yếu với Supervisor" and calls it an attention strategy, not a prohibition (deep-dive.md:306-317). v0.2 merely cannot support the preferred relay route because of G6.
+- G8 Observation scope: Supervisor does see more than milestones (list_agents/get_agent_status/get_agent_activity exist, extension:157-160). Correct part: it is only ever woken by the Lead and lacks list_workspaces/cross-workflow observation contract.
+
+Not a gap:
+- G3 Human announcement: "Input tối thiểu" is not a closed schema; Deep Dive says Human is not forbidden from talking to the Lead (deep-dive.md:306-310). Announcement is a valid provisional binding mechanism — but the implementation wiring is broken, see N2.
+
+New gaps:
+- N1 Fixed mandatory Supervisor topology: every governed task requires root Lead + root Supervisor + exact binding (specs/v0.2.md:10-23; profiles/lead.md:13). Violates tiny topology without Supervisor (deep-dive.md:1171-1177) and "smallest-useful topology, no fixed ceremony" (plan:580-602,2742-2757).
+- N2 Binding/restart reconciliation exists only as helper/test: verifyPartnerBinding() has an implementation (extension:4378-4427) but no production caller; grep shows zero callers anywhere including tests. Process caches reset per session; Doctor reads that same cache (extension:3811-3825,4354-4361). First event can self-bind any root ppo-supervisor in the same repo (extension:4435-4451) without checking the task binding from the Human announcement.
+- N3 Peer→Lead transport not implemented: EVENT_PEER_MESSAGE_KINDS is only a schema (extension:1063-1069). No Peer MCP, no custom parent-scoped tool, only the Notebook tool registered; mid-run question/blocked/dependency/progress have no supported route. The acceptance item "Peer communication" does not actually exist yet.
+- N4 Every Peer disposition gets write/edit/commit: detailed spec grants local write only to verified Engineer Peer, but profiles/peer.md:7 grants to every assignment, effectiveTools() grants write/edit to every Peer, Bash allows git commit, and there is no runtime Engineer/Architect/Reviewer/Scout distinction. "Read-only Reviewer/Architect" is prose only (plan:884-912,2764-2771).
+- N5 Workspace Protocol is stale beyond recovery: still uses current-run Task Authority Envelope (workspace-protocol.md:16-17), separate Human authority envelope for Lead self-work (:68-75), "new Human grant" (:89-92), and envelope-based authority evidence (:189-198) — all machinery v0.2 claims removed. The Lead pins a protocol that contradicts its own Role Profile and spec.
+- N6 Supervisor observation scope unbounded in code: profile says exactly one Lead, but list_agents is near-global, status/activity accept any agentId, no reconciliation against the bound Lead/project (extension:661-685). Contract too narrow, guardrail too wide.
+- N7 Doctor checks the wrong event transport: EVENT_CAPABILITIES requires pi.sendEvent (extension:3823-3825) while the actual transport is outer MCP send_agent_prompt; sendEvent appears nowhere else in the package. Doctor can report BLOCKED while live MCP delivery works.
+- N8 Strict report schema not fully supplied to Peer: runtime requires distinct payloads for REOPEN_REQUEST/DEPENDENCY_REQUEST/BLOCKED (extension:888-905) but the shipped skill only gives the HANDOFF template (skills/ppo-orchestrate/SKILL.md:60-70). A blocked Peer must guess the schema and risks parser rejection.
+
+Root causes (4):
+1. Peer–control-plane seam leaked and unfinished — G1, G2, N3, N8.
+2. Supervisor reduced to mandatory 1:1 Lead-triggered sink — G4-G10, N1.
+3. Repository policy/authority pulled up into package-wide defaults — G11, G12, N4, N5.
+4. Implementation helpers never wired end-to-end — N2, N6, N7.
+
+Not-gaps (confirmed to avoid re-litigating): council/reviewer not mandatory, no need to copy the 17 anti-patterns, protocol filename is an implementation detail, protocol write requires Human-confirmed diff.
+
+### DOGFOOD-021 — Independent committee review of candidate 0c67500: PARTIAL (not conformant)
+
+- Committee of 3 contrasting-provider agents reviewed candidate `8277004..0c67500` (worktree /tmp/ppo-v02-conformance-a1) against ref-docs/agent-orchestration-deep-dive.md, read-only, with no-edits suffix. Members: deepseek-v4-pro (ab053c27), grok-4.6 (d36102ee), gpt-5.6-sol (e9ef0b16, retry — first codex attempt 29ae9950 failed by spawning the broken pi-task subagent).
+- Verdict: PARTIAL — 3/3. Closed: G2,G5,G9,G11,N1,N7,N8 (clean) + G1,G12,N3,N5 (closed-with-residual). Partial: G4,G6,G7,G8,G10,N2,N4,N6.
+
+Blocker (3/3 independent): Supervisor-side binding unwired — `boundLeadIds` populated only by Peer-activation (ext:4990) and dead helpers `verifyPartnerBinding(kind:"lead")`/`bindExactPartner`; no production path for a Supervisor. Supervisor send_agent_prompt/list_agents/get_agent_status/get_agent_activity all fail closed; observation went from unbounded-but-working to dead. Regresses G5/G6/G8; keeps N2/N6 partial.
+
+Converged findings:
+1. Blocker above (3/3).
+2. G10: no executable recovery route — Supervisor has no create_agent; skill says "The Supervisor does not create agents" (B+C).
+3. N4: write_mode mutable from any later input (ext:5184-5208) — a Reviewer can be elevated to writer without a new assignment (A+B+C flagged).
+4. G4: six milestone kinds hardcoded in control plane (ext:1144), observation rhythm not in the Workspace Protocol (3/3).
+5. G7/N6: multi-Lead declarative only; scalar boundTaskId/boundWorkspaceId cannot hold multiple bindings (B+C).
+6. N3: transport reuses the banned `paseo send` CLI seam (ext:4636) + no receive-side gate for Peer→Lead envelopes (A+B).
+7. G12: lead.md:7 + README grant Lead write/commit directly, contradicting the runtime opt-in (B).
+
+Single-member findings:
+- C: CONTEXT.md:15-17,27-32 still defines Task Authority Envelope / Authority Grant as active — stale domain model (A+B only diffed the worktree).
+- A: stale CEILINGS comment (ext:143-145).
+- B: first-milestone bind ignores the Human-announced Supervisor ID (binds on task-label match OR unobservable).
+
+Divergences (minor): G1 (C partial — profile still "exact Paseo parent"), G10 (A closed, B+C partial), G12 (B partial — README contradiction). No verdict/blocker disagreement.
+
+Implication: candidate 0c67500 is NOT ready for LOCAL_ACCEPT. The in-flow Lead+Reviewer+Supervisor missed the binding gap because they verified surface, not runtime wiring of boundLeadIds.
