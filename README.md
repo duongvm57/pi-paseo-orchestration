@@ -58,7 +58,7 @@ The Lead delegates bounded assignments to Peer children and returns the final ca
 ## How it works
 
 1. Each process receives one durable Role Profile. The Lead also reads the repository's Workspace Protocol; each Peer receives only its bounded assignment. Keeping these layers separate avoids spending Peer attention on the whole organization manual.
-2. The initial root Lead task and each exact Peer assignment authorize ordinary local reversible repository work (inspect, edit, test, worktree, local commit) directly. The Human types only `implement <spec-path>` (or equivalent) once; no marker, JSON envelope, hash, agent ID, assignment ID, scope syntax, capability list, digest, or grant is ever written. Assignment, ownership, scope, and exclusions are workflow facts, not capability credentials.
+2. The initial root Lead task and each exact Peer assignment authorize ordinary local reversible inspect, test, and worktree work. Lead write/edit/commit requires Workspace Protocol opt-in; Peer write/edit/commit requires an Engineer `write_mode` binding. The Human types only `implement <spec-path>` (or equivalent) once; no marker, JSON envelope, hash, agent ID, assignment ID, scope syntax, capability list, digest, or grant is ever written. Assignment, ownership, scope, and exclusions are workflow facts, not capability credentials.
 3. The Lead describes the outcome, constraints, known evidence, writable scope, exclusions, and verification—not a supposedly final implementation plan. One moving write scope has one owner; concurrent writers need disjoint scopes and isolated checkouts. The Lead prepares required isolated worktrees itself.
 4. A dirty caller checkout is evidence to classify, not an automatic blocker: untracked/read-only issue notes, specifications, research, generated logs, or unrelated documentation do not block an isolated worktree from a known clean commit. Only a real collision, overwrite risk, competing writer, or ambiguous base blocks work.
 5. A Peer ends its run with a correlated report: `HANDOFF`, `REOPEN_REQUEST`, `DEPENDENCY_REQUEST`, or `BLOCKED`. The Lead reacts to that event instead of polling and consuming coordination attention.
@@ -200,7 +200,7 @@ Role Profile
   > ordinary task prose
 ```
 
-A lower layer cannot widen a higher layer. Ordinary local reversible work for Lead and Peer is authorized by the initial Human task and the exact assignment; the Human controls settings, protocol changes, and final local acceptance; the Supervisor is observation-only and never edits project code. Human-only boundaries—push, merge, publish, deploy, protocol mutation, destructive/external effects, secrets/material cost, objective/irreversible decisions, and Local Acceptance—are preserved.
+A lower layer cannot widen a higher layer. Ordinary inspect/test/worktree work is authorized by the initial Human task and the exact assignment; Lead write/edit/commit requires protocol opt-in and Peer write requires Engineer write_mode. The Human controls settings, protocol changes, and final local acceptance; the Supervisor is observation-only and never edits project code. Human-only boundaries—push, merge, publish, deploy, protocol mutation, destructive/external effects, secrets/material cost, objective/irreversible decisions, and Local Acceptance—are preserved.
 
 Write work ends at an immutable local Git candidate. The package does not push, create pull requests, merge, deploy, or treat tests, lifecycle status, or agent prose as acceptance.
 

@@ -140,10 +140,10 @@ const COOPERATIVE_LABEL_PREFIX = "pi-paseo-orchestration.";
 const PPO_TASK_KEY = `${COOPERATIVE_LABEL_PREFIX}task-key`;
 const PPO_ASSIGNMENT_KEY = `${COOPERATIVE_LABEL_PREFIX}assignment-key`;
 
-// Closed role ceilings: Peer is read+Bash; Supervisor and Lead add the outer
-// mcp tool (whose inner targets are validated separately). write/edit are never
-// in a ceiling — they are enabled for the implementation roles (Lead and Peer)
-// that perform local reversible repository work from the exact assignment.
+// Closed role ceilings: Peer is read+Bash plus outer mcp for parent-only
+// send_agent_prompt. Supervisor and Lead add the rest of their MCP targets.
+// write/edit are never in a ceiling — they are granted only when a Lead
+// protocol opts into self-work or a Peer assignment binds write_mode write.
 // mcp_script is in no ceiling.
 export const CEILINGS = {
   supervisor: ["read", "bash", "mcp"],
@@ -158,7 +158,7 @@ export const CEILINGS = {
 // canonicalMcpOperation before any policy decision, so prefixed and canonical
 // forms are identical.
 export const MCP_TARGETS = {
-  supervisor: { paseo: new Set(["list_agents", "list_workspaces", "get_agent_status", "get_agent_activity", "send_agent_prompt"]) },
+  supervisor: { paseo: new Set(["list_agents", "list_workspaces", "get_agent_status", "get_agent_activity", "send_agent_prompt", "create_agent"]) },
   lead: { paseo: new Set(["list_workspaces", "list_providers", "list_agents", "create_agent", "send_agent_prompt", "get_agent_status", "get_agent_activity", "cancel_agent", "archive_agent"]) },
   peer: {},
 };
@@ -502,6 +502,7 @@ const MCP_CONTRACT = {
     "`get_agent_status` with `{\"agentId\":\"<full Paseo agent ID>\"}`",
     "`get_agent_activity` with `{\"agentId\":\"<full Paseo agent ID>\"}`",
     "`send_agent_prompt` with `{\"agentId\":\"<full bound Lead ID>\",\"prompt\":\"<question or Human decision>\"}`",
+    "`create_agent` with a Human-authorized successor-Lead recovery prompt",
   ],
 };
 
@@ -562,6 +563,22 @@ function createAgentPolicyPrompt(activeLatch) {
 
 function validateCreateAgentArgs(args, policy) {
   const block = (reason) => ({ block: true, reason });
+  if (policy.role === "supervisor") {
+    if (typeof policy.recoveryAuthorizedTaskId !== "string" || policy.recoveryAuthorizedTaskId.trim() === "") {
+      return block("Supervisor create_agent requires an explicit recovery_authorized binding in the current Human input");
+    }
+    const required = ["title", "provider", "settings", "initialPrompt", "notifyOnFinish"];
+    if (!closedKeys(args, required, ["labels"])) return block("create_agent arguments are not the closed recovery shape");
+    if (typeof args.initialPrompt !== "string" || args.initialPrompt.trim() === "") {
+      return block("create_agent initialPrompt must be a nonempty string");
+    }
+    const authorized = [...args.initialPrompt.matchAll(/\"recovery_authorized\"\s*:\s*\"([^\"]*)\"/g)];
+    if (authorized.length !== 1 || authorized[0][1] !== policy.recoveryAuthorizedTaskId) {
+      return block("Supervisor create_agent prompt must bind recovery_authorized to the current Human authorization");
+    }
+    if (args.notifyOnFinish !== true) return block("create_agent must request the native finish notification");
+    return undefined;
+  }
   if (policy.role !== "lead") {
     return block("create_agent is restricted to the Lead minting Peer children");
   }
@@ -4444,9 +4461,12 @@ let lastAcceptance = null;
 let boundSupervisorId = null;
 let boundLeadId = null;
 const boundLeadIds = new Set();
+const boundLeadBindings = new Map();
 let boundObserverId = null;
 let boundTaskId = null;
 let boundWorkspaceId = null;
+let writeModeBound = false;
+let recoveryAuthorizedTaskId = null;
 
 let inspectionParentAgentId = null;
 
@@ -4455,11 +4475,24 @@ export function getBoundSupervisorId() { return boundSupervisorId; }
 export function getBoundLeadId() { return boundLeadId; }
 export function getBoundLeadIds() { return [...boundLeadIds]; }
 
-function rememberBoundLead(id) {
+function rememberBoundLead(id, taskId = null, workspaceId = null) {
   const trimmed = typeof id === "string" ? id.trim() : "";
   if (trimmed === "") return;
   boundLeadId = trimmed;
   boundLeadIds.add(trimmed);
+  const prior = boundLeadBindings.get(trimmed) ?? {};
+  boundLeadBindings.set(trimmed, {
+    leadId: trimmed,
+    taskId: typeof taskId === "string" && taskId.trim() !== "" ? taskId.trim() : (prior.taskId ?? null),
+    workspaceId: typeof workspaceId === "string" && workspaceId.trim() !== "" ? workspaceId.trim() : (prior.workspaceId ?? null),
+  });
+  if (boundLeadBindings.get(trimmed).taskId) boundTaskId = boundLeadBindings.get(trimmed).taskId;
+  if (boundLeadBindings.get(trimmed).workspaceId) boundWorkspaceId = boundLeadBindings.get(trimmed).workspaceId;
+}
+
+function closedBinding(text, key) {
+  if (typeof text !== "string") return [];
+  return [...text.matchAll(new RegExp(`\\"${key}\\"\\s*:\\s*\\"([^\\"]*)\\"`, "g"))].map((match) => match[1]);
 }
 
 function partnerTaskId(obs, fallback) {
@@ -4495,7 +4528,7 @@ export async function verifyPartnerBinding(opts) {
   if (kind !== expectedRole) return { ok: false, error: `partner kind ${kind} does not match the expected role ${expectedRole}` };
   const expectedProviderLabel = expectedProvider;
   if (typeof expectedProviderLabel === "string" && expectedProviderLabel !== ""
-      && obs.provider !== expectedProviderLabel) {
+      && obs.provider !== expectedProviderLabel && obs.provider !== "ppo-lead" && obs.provider !== "ppo-supervisor") {
     return { ok: false, error: `partner provider ${obs.provider} does not match the expected provider ${expectedProviderLabel}` };
   }
   // Root parentage from live inspection.
@@ -4530,9 +4563,7 @@ export async function verifyPartnerBinding(opts) {
     boundTaskId = taskId.trim();
     if (typeof expectedWorkspaceId === "string" && expectedWorkspaceId.trim() !== "") boundWorkspaceId = expectedWorkspaceId.trim();
   } else if (kind === "lead") {
-    rememberBoundLead(claimedId.trim());
-    boundTaskId = taskId.trim();
-    if (typeof expectedWorkspaceId === "string" && expectedWorkspaceId.trim() !== "") boundWorkspaceId = expectedWorkspaceId.trim();
+    rememberBoundLead(claimedId.trim(), taskId, expectedWorkspaceId);
   } else {
     return { ok: false, error: `unknown partner kind ${String(kind)}` };
   }
@@ -4558,23 +4589,10 @@ export async function reconcileLeadEventRecipient(agentId, envelope, options) {
   const root = repoRoot?.replace(/\/+$/, "");
   if (!cwd || !root || (cwd !== root && !cwd.startsWith(root + "/"))) return { ok: false, error: "bounded event recipient is outside the pinned repository" };
   if (recipient.provider === "ppo-supervisor") {
-    if (boundSupervisorId !== null && boundSupervisorId !== agentId) return { ok: false, error: "event recipient does not match the bound Supervisor" };
+    if (boundSupervisorId === null) return { ok: false, error: "Lead milestone requires a Human-announced Supervisor binding" };
+    if (boundSupervisorId !== agentId) return { ok: false, error: "event recipient does not match the bound Supervisor" };
     if (boundTaskId !== null && envelope.task_id !== boundTaskId) {
       return { ok: false, error: `event task ${envelope.task_id} does not match the bound Lead task ${boundTaskId}` };
-    }
-    if (boundSupervisorId !== agentId) {
-      const verified = await verifyPartnerBinding({
-        claimedId: agentId,
-        kind: "supervisor",
-        selfId: leadAgentId,
-        taskId: boundTaskId ?? envelope.task_id,
-        env,
-        expectedRole: "supervisor",
-        expectedProvider: "ppo-supervisor",
-        expectedRepoRoot: repoRoot,
-      });
-      if (!verified.ok) return { ok: false, error: verified.error };
-      return { ok: true, recipientKind: "supervisor", warnings: verified.warnings ?? [] };
     }
     return { ok: true, recipientKind: "supervisor", warnings: [] };
   }
@@ -4591,6 +4609,52 @@ export function bindExactPartner({ supervisorId = null, leadId = null }) {
   if (supervisorId !== null) boundSupervisorId = supervisorId;
   if (leadId !== null) rememberBoundLead(leadId);
   return true;
+}
+
+export async function bindClosedPartnerFromText(text, ctx) {
+  if (latch === null || typeof text !== "string" || text.trim() === "") return { ok: true };
+  const env = envOf(ctx);
+  const repoRoot = protocolPin?.repoRoot ?? await findRepoRoot();
+  const taskIds = closedBinding(text, "task_id");
+  const workspaceIds = closedBinding(text, "workspace_id");
+  const taskId = taskIds[0] ?? boundTaskId ?? latch.agentId;
+  const workspaceId = workspaceIds[0] ?? boundWorkspaceId ?? null;
+  if (latch.role === "supervisor") {
+    const leadIds = closedBinding(text, "bound_lead_agent_id");
+    if (leadIds.length === 0) return { ok: true };
+    for (const claimedId of leadIds) {
+      const verified = await verifyPartnerBinding({
+        claimedId,
+        kind: "lead",
+        selfId: latch.agentId,
+        taskId,
+        env,
+        expectedRole: "lead",
+        expectedProvider: env[LEAD_ALIAS_ENV] || "ppo-lead",
+        expectedRepoRoot: repoRoot,
+        expectedWorkspaceId: workspaceId,
+      });
+      if (!verified.ok) return verified;
+    }
+    return { ok: true };
+  }
+  if (latch.role === "lead") {
+    const supervisorIds = closedBinding(text, "bound_supervisor_agent_id");
+    if (supervisorIds.length === 0) return { ok: true };
+    if (supervisorIds.length !== 1) return { ok: false, error: "Lead binding must name exactly one Supervisor" };
+    return verifyPartnerBinding({
+      claimedId: supervisorIds[0],
+      kind: "supervisor",
+      selfId: latch.agentId,
+      taskId,
+      env,
+      expectedRole: "supervisor",
+      expectedProvider: "ppo-supervisor",
+      expectedRepoRoot: repoRoot,
+      expectedWorkspaceId: workspaceId,
+    });
+  }
+  return { ok: true };
 }
 
 export async function reconcileSupervisorObservation(agentId, options) {
@@ -4631,13 +4695,21 @@ export async function deliverPeerLeadMessage({ kind, taskId, payload, env = proc
   const directed = validateEventEnvelope(built.envelope, { direction: "lead_peer" });
   if (!directed.ok) return { ok: false, error: directed.error };
   if (eventDedupe(built.envelope.event_id)) return { ok: false, error: "duplicate event_id is ignored (idempotent)" };
-  const text = `${EVENT_ENVELOPE_BEGIN}${JSON.stringify(built.envelope)}${EVENT_ENVELOPE_END}`;
-  try {
-    await execFileAsync("paseo", ["send", parentId, "--prompt", text, "--no-wait"], { env, timeout: 15000 });
-  } catch (err) {
-    return { ok: false, error: `peer_lead_message delivery failed: ${err.message}` };
+  return { ok: true, envelope: built.envelope, recipientId: parentId, transport: "mcp_send_agent_prompt" };
+}
+
+export function receivePeerLeadEnvelope(text, options) {
+  const { leadAgentId, env = process.env, repoRoot = null } = options ?? {};
+  const parsed = parseEventEnvelopeText(text);
+  if (!parsed.ok) return parsed;
+  if (parsed.envelope === null) return { ok: true, envelope: null };
+  const directed = validateEventEnvelope(parsed.envelope, { direction: "lead_peer" });
+  if (!directed.ok) return directed;
+  if (parsed.envelope.recipient_agent_id !== leadAgentId) {
+    return { ok: false, error: "Peer event recipient does not match the current Lead" };
   }
-  return { ok: true, envelope: built.envelope, recipientId: parentId };
+  if (eventDedupe(parsed.envelope.event_id)) return { ok: false, error: "duplicate event_id is ignored (idempotent)" };
+  return { ok: true, envelope: parsed.envelope, senderId: parsed.envelope.sender_agent_id, env, repoRoot };
 }
 
 
@@ -5092,9 +5164,12 @@ export default function (pi) {
     boundSupervisorId = null;
     boundLeadId = null;
     boundLeadIds.clear();
+    boundLeadBindings.clear();
     boundObserverId = null;
     boundTaskId = null;
     boundWorkspaceId = null;
+    writeModeBound = false;
+    recoveryAuthorizedTaskId = null;
     inspectionParentAgentId = null;
     lastPeerReport = null;
     lastAcceptance = null;
@@ -5181,7 +5256,26 @@ export default function (pi) {
       ctx.ui?.notify?.(`pi-paseo-orchestration: local acceptance blocked (${acceptance.error})`, "error");
       return { action: "handled" };
     }
-    if (latch.role === "peer") {
+    if (latch.role === "supervisor" || latch.role === "lead") {
+      const bound = await bindClosedPartnerFromText(event.text ?? "", ctx);
+      if (bound.ok !== true) {
+        blockWith(ctx, "error" in bound && typeof bound.error === "string" ? bound.error : "partner binding failed");
+        reportBlockedInput(pi, blockedReason);
+        return { action: "handled" };
+      }
+      const recovery = closedBinding(event.text ?? "", "recovery_authorized");
+      if (latch.role === "supervisor" && recovery.length === 1 && recovery[0].trim() !== "") {
+        recoveryAuthorizedTaskId = recovery[0].trim();
+      }
+    }
+    if (latch.role === "lead") {
+      const incoming = receivePeerLeadEnvelope(event.text ?? "", { leadAgentId: latch.agentId, env: envOf(ctx), repoRoot: protocolPin?.repoRoot ?? null });
+      if (incoming.ok !== true) {
+        ctx.ui?.notify?.(`pi-paseo-orchestration: Peer event rejected (${"error" in incoming && typeof incoming.error === "string" ? incoming.error : "invalid envelope"})`, "error");
+        return { action: "continue" };
+      }
+    }
+    if (latch.role === "peer" && writeModeBound !== true) {
       const bindings = [...String(event.text ?? "").matchAll(/\"write_mode\"\s*:\s*\"([^\"]*)\"/g)];
       if (bindings.length > 1) {
         blockWith(ctx, "Peer assignment brief must bind write_mode at most once");
@@ -5195,17 +5289,16 @@ export default function (pi) {
           reportBlockedInput(pi, blockedReason);
           return { action: "handled" };
         }
-        if (latch.writeMode !== mode) {
-          latch = { ...latch, writeMode: mode };
-          lastAppliedTools = null;
-          const tools = await ensureToolPolicy(pi);
-          if (tools.ok !== true) {
-            blockWith(ctx, "error" in tools && typeof tools.error === "string" ? tools.error : "active tools are not observable");
-            reportBlockedInput(pi, blockedReason);
-            return { action: "handled" };
-          }
+        latch = { ...latch, writeMode: mode };
+        lastAppliedTools = null;
+        const tools = await ensureToolPolicy(pi);
+        if (tools.ok !== true) {
+          blockWith(ctx, "error" in tools && typeof tools.error === "string" ? tools.error : "active tools are not observable");
+          reportBlockedInput(pi, blockedReason);
+          return { action: "handled" };
         }
       }
+      writeModeBound = true;
     }
 
     return { action: "continue" };
@@ -5406,6 +5499,7 @@ export default function (pi) {
       reconciledLeadId,
       reconciledObservationIds,
       reconciledListScope,
+      recoveryAuthorizedTaskId,
     });
     if (decision?.block) {
       ctx.ui?.notify?.(`Blocked ${event.toolName}: ${decision.reason}`, "error");

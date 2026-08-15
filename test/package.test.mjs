@@ -229,7 +229,7 @@ test("declared resources and private profiles are nonempty files", async () => {
   assert.match(peerProfile, /classify material premises as supported, partial, or failed/);
   assert.match(peerProfile, /injected `ParentAgentId` fact/);
   assert.doesNotMatch(peerProfile, /inspect the Peer and your parent through Paseo/);
-  assert.match(supervisorProfile, /low-frequency heartbeat used only as a safety net/);
+  assert.match(supervisorProfile, /Workspace Protocol's observation rhythm/);
   assert.match(orchestrationSkill, /kind":"REOPEN_REQUEST"/);
   assert.match(orchestrationSkill, /kind":"DEPENDENCY_REQUEST"/);
   assert.match(orchestrationSkill, /kind":"BLOCKED"/);
@@ -952,6 +952,7 @@ test("handler: a normal Lead child lifecycle op reconciles through the integrate
     const eventScript = `#!/bin/sh\nif [ "$1" = "inspect" ]; then\n  printf '{"Id":"sup-1","Provider":"ppo-supervisor","Status":"idle","Cwd":"${repo.dir}","ParentAgentId":""}'\n  exit 0\nfi\nexit 1\n`;
     await writeFile(join(eventBin, "paseo"), eventScript, { mode: 0o755 });
     try {
+      ext.bindExactPartner({ supervisorId: "sup-1" });
       const event = buildEventEnvelope({ kind: "CANDIDATE_READY", taskId: "task-1", senderAgentId: "lead-9", recipientAgentId: "sup-1", repoRoot: repo.dir });
       assert.equal(event.ok, true);
       const prompt = `<pi-paseo-orchestration event="v1">${JSON.stringify(event.envelope)}</pi-paseo-orchestration>`;
@@ -3845,14 +3846,11 @@ test("peer_lead_message delivers a closed envelope to the process parent Lead", 
   const ext = await freshExtension();
   const profiles = await profileDirFixture();
   const dir = await mkdtemp(join(tmpdir(), "ppo-peer-msg-"));
-  const bin = await mkdtemp(join(tmpdir(), "ppo-peer-send-"));
   await writeSettings(dir, validDoc);
-  const log = join(bin, "sent.log");
-  await writeFile(join(bin, "paseo"), `#!/bin/sh\nif [ "$1" = "send" ]; then printf '%s\n' "$*" > "${log}"; exit 0; fi\necho unknown >&2; exit 1\n`, { mode: 0o755 });
   try {
     const fake = fakePi({
       activeTools: ["read", "bash"],
-      env: { PI_PASEO_ORCHESTRATION_ROLE: "peer", PI_PASEO_ORCHESTRATION_PEER_ALIAS: "ppo-peer", PASEO_AGENT_ID: "peer-7", PI_CODING_AGENT_DIR: dir, PI_PASEO_ORCHESTRATION_PROFILES_DIR: profiles, PATH: `${bin}:${process.env.PATH ?? ""}` },
+      env: { PI_PASEO_ORCHESTRATION_ROLE: "peer", PI_PASEO_ORCHESTRATION_PEER_ALIAS: "ppo-peer", PASEO_AGENT_ID: "peer-7", PI_CODING_AGENT_DIR: dir, PI_PASEO_ORCHESTRATION_PROFILES_DIR: profiles },
     });
     fake.pi.setActiveTools = (tools) => { fake.holder.activeTools = [...tools]; };
     fake.pi.getActiveTools = () => [...fake.holder.activeTools];
@@ -3867,67 +3865,35 @@ test("peer_lead_message delivers a closed envelope to the process parent Lead", 
     assert.equal(delivered.ok, true, delivered.error);
     assert.equal(delivered.recipientId, "lead-7");
     assert.equal(delivered.envelope.kind, "question");
-    const sent = await readFile(log, "utf8");
-    assert.match(sent, /send lead-7 --prompt/);
-    assert.match(sent, /event="v1"/);
+    assert.equal(delivered.transport, "mcp_send_agent_prompt");
   } finally {
-    await rm(bin, { recursive: true, force: true });
     await rm(profiles, { recursive: true, force: true });
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test("first-milestone bind rejects an observable Supervisor task mismatch before any bind", async () => {
-  const ext = await freshExtension();
-  const mismatchBin = await fakePaseoBin({
-    rootAgent: true, provider: "ppo-supervisor", idEcho: true,
-    labels: { "pi-paseo-orchestration.task-key": "task-other" },
-  });
-  try {
-    const mismatch = await ext.reconcileLeadEventRecipient("sup-1", {
-      version: 1, event_id: "event-mismatch-1", task_id: "task-1", sender_agent_id: "lead-1",
-      recipient_agent_id: "sup-1", repository_root: "/tmp/repo", kind: "LEAD_STARTED", payload: {},
-    }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: mismatchBin } });
-    assert.equal(mismatch.ok, false);
-    assert.match(mismatch.error, /does not match the expected task/);
-    assert.equal(ext.getBoundSupervisorId(), null);
-  } finally {
-    await rm(mismatchBin, { recursive: true, force: true });
-  }
-});
-
-test("first-milestone bind accepts a Supervisor whose live task label matches the envelope", async () => {
+test("first-milestone bind requires a Human-announced Supervisor", async () => {
   const ext = await freshExtension();
   const labeled = await fakePaseoBin({
     rootAgent: true, provider: "ppo-supervisor", idEcho: true,
     labels: { "pi-paseo-orchestration.task-key": "task-1" },
   });
   try {
-    const first = await ext.reconcileLeadEventRecipient("sup-1", {
+    const missing = await ext.reconcileLeadEventRecipient("sup-1", {
       version: 1, event_id: "event-labeled-1", task_id: "task-1", sender_agent_id: "lead-1",
+      recipient_agent_id: "sup-1", repository_root: "/tmp/repo", kind: "LEAD_STARTED", payload: {},
+    }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: labeled } });
+    assert.equal(missing.ok, false);
+    assert.match(missing.error, /Human-announced Supervisor/);
+    ext.bindExactPartner({ supervisorId: "sup-1" });
+    const first = await ext.reconcileLeadEventRecipient("sup-1", {
+      version: 1, event_id: "event-labeled-2", task_id: "task-1", sender_agent_id: "lead-1",
       recipient_agent_id: "sup-1", repository_root: "/tmp/repo", kind: "LEAD_STARTED", payload: {},
     }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: labeled } });
     assert.equal(first.ok, true, first.error);
     assert.equal(ext.getBoundSupervisorId(), "sup-1");
-    assert.equal((first.warnings ?? []).length, 0);
   } finally {
     await rm(labeled, { recursive: true, force: true });
-  }
-});
-
-test("first-milestone bind warns when the Supervisor task label is unobservable", async () => {
-  const ext = await freshExtension();
-  const unlabeled = await fakePaseoBin({ rootAgent: true, provider: "ppo-supervisor", idEcho: true });
-  try {
-    const first = await ext.reconcileLeadEventRecipient("sup-1", {
-      version: 1, event_id: "event-unlabeled-1", task_id: "task-1", sender_agent_id: "lead-1",
-      recipient_agent_id: "sup-1", repository_root: "/tmp/repo", kind: "LEAD_STARTED", payload: {},
-    }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: unlabeled } });
-    assert.equal(first.ok, true, first.error);
-    assert.equal(ext.getBoundSupervisorId(), "sup-1");
-    assert.equal(Array.isArray(first.warnings) && first.warnings.some((warning) => /task-key|task label/.test(warning)), true, JSON.stringify(first.warnings));
-  } finally {
-    await rm(unlabeled, { recursive: true, force: true });
   }
 });
 
@@ -4035,4 +4001,72 @@ test("Supervisor list_workspaces is a bounded empty-args discovery target", () =
   const policy = { role: "supervisor", allowed: ["mcp"], mcpTargets: { paseo: new Set(["list_workspaces"]) } };
   assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_list_workspaces", args: {} }, policy), undefined);
   assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_list_workspaces", args: { unexpected: true } }, policy).block, true);
+});
+
+test("Supervisor input binds assigned Lead(s) through live verification", async () => {
+  const ext = await freshExtension();
+  const profiles = await profileDirFixture();
+  const dir = await mkdtemp(join(tmpdir(), "ppo-sup-bind-"));
+  const bin = await mkdtemp(join(tmpdir(), "ppo-sup-bind-bin-"));
+  const inspectCwd = process.cwd();
+  await writeFile(join(bin, "paseo"), `#!/bin/sh\nif [ "$1" = "inspect" ]; then printf '{"Id":"%s","Provider":"ppo-lead","Model":"claude-sonnet-4-5","Thinking":"medium","Status":"running","Cwd":${JSON.stringify(inspectCwd)},"ParentAgentId":""}' "$2"; exit 0; fi\nexit 1\n`, { mode: 0o755 });
+  await writeSettings(dir, validDoc);
+  try {
+    const fake = fakePi({
+      activeTools: ["read", "bash", "mcp"],
+      env: {
+        PI_PASEO_ORCHESTRATION_ROLE: "supervisor",
+        PASEO_AGENT_ID: "sup-1",
+        PI_CODING_AGENT_DIR: dir,
+        PI_PASEO_ORCHESTRATION_PROFILES_DIR: profiles,
+        PATH: `${bin}:${process.env.PATH ?? ""}`,
+      },
+    });
+    fake.pi.setActiveTools = (tools) => { fake.holder.activeTools = [...tools]; };
+    fake.pi.getActiveTools = () => [...fake.holder.activeTools];
+    ext.default(fake.pi);
+    const registry = fake.ctx.modelRegistry;
+    fake.ctx.model = registry.find("anthropic", "claude-sonnet-4-5");
+    fake.ctx.thinkingLevel = "high";
+    fake.ctx.modelRegistry = { ...registry };
+    await fake.handlers.get("session_start")({ reason: "startup" }, fake.ctx);
+    assert.deepEqual(ext.getBoundLeadIds(), []);
+    const continued = await fake.handlers.get("input")({
+      text: 'Bind "bound_lead_agent_id":"lead-9" with "task_id":"task-1".',
+    }, fake.ctx);
+    assert.equal(continued.action, "continue", JSON.stringify(fake.notifications));
+    assert.deepEqual(ext.getBoundLeadIds(), ["lead-9"]);
+    const listed = await fake.handlers.get("tool_call")({
+      toolName: "mcp",
+      input: { server: "paseo", tool: "paseo_list_agents", args: { cwd: process.cwd() } },
+    }, fake.ctx);
+    assert.equal(listed, undefined, JSON.stringify(listed));
+  } finally {
+    await rm(bin, { recursive: true, force: true });
+    await rm(profiles, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("peer write_mode cannot change after the first input", async () => {
+  const ext = await freshExtension();
+  const env = await governedFixture(ext, { activeTools: ["read", "bash", "write", "edit"] });
+  try {
+    await env.fake.handlers.get("before_agent_start")(
+      { prompt: "hi", systemPrompt: "base", systemPromptOptions: { selectedTools: ["read", "bash", "write", "edit"] } },
+      env.fake.ctx,
+    );
+    const first = await env.fake.handlers.get("input")({ text: 'Use "model_route":"fast" and bind "parent_lead_agent_id":"lead-7" with "write_mode":"read-only".' }, env.fake.ctx);
+    assert.deepEqual(first, { action: "continue" });
+    const blocked = await env.fake.handlers.get("tool_call")({ toolName: "write", input: { path: "src/x.go" } }, env.fake.ctx);
+    assert.equal(blocked.block, true);
+    const second = await env.fake.handlers.get("input")({ text: 'Elevate with "write_mode":"write".' }, env.fake.ctx);
+    assert.deepEqual(second, { action: "continue" });
+    const stillBlocked = await env.fake.handlers.get("tool_call")({ toolName: "write", input: { path: "src/x.go" } }, env.fake.ctx);
+    assert.equal(stillBlocked.block, true);
+    assert.deepEqual(env.fake.holder.activeTools, ["read", "bash"]);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+  }
 });
