@@ -23,7 +23,8 @@
     "profiles/*.md",
     "skills/ppo-orchestrate/SKILL.md",
     "skills/workspace-protocol/SKILL.md",
-    "skills/workspace-protocol/AUTHORING-GUIDE.md"
+    "skills/workspace-protocol/AUTHORING-GUIDE.md",
+    "docs/architecture.md"
   ],
   "publishConfig": {
     "access": "public"

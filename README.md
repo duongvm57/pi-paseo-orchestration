@@ -2,7 +2,9 @@
 
 Governed multi-agent work for [Pi](https://github.com/earendil-works/pi) running through Paseo.
 
-The package gives each process one explicit role—**Supervisor**, **Lead**, or **Peer**—and keeps Paseo as the source of truth for agents, workspaces, parentage, and lifecycle. It adds policy guardrails, repository workflow rules, direct bounded assignments for ordinary local work, evidence-bearing handoffs, and local Git candidate acceptance. There is no coordinator: the Human creates the root Lead, and creates a root Supervisor only when the task class warrants one.
+The package gives each process one explicit role—**Supervisor**, **Lead**, or **Peer**—and keeps Paseo as the source of truth for agents, workspaces, parentage, and lifecycle. It adds policy guardrails, repository workflow rules, direct bounded assignments for ordinary local work, evidence-bearing handoffs, and local Git candidate acceptance. The Human creates the root Lead, and creates a root Supervisor only when the task class warrants one.
+
+For the full architecture — role model, instruction layers, runtime gates, acceptance model, and the anti-pattern catalog — see [docs/architecture.md](docs/architecture.md).
 
 ## Why subagents are not enough
 
@@ -20,7 +22,7 @@ More agents can therefore increase confidence and activity without increasing co
 
 ## Why Supervisor–Lead–Peer
 
-This package applies the Deep Dive's **Supervisor–Lead–Peer (SLP)** model by separating kinds of judgment instead of building a rigid `Supervisor > Lead > Peer` hierarchy:
+This package applies the **Supervisor–Lead–Peer (SLP)** model by separating kinds of judgment instead of building a rigid `Supervisor > Lead > Peer` hierarchy:
 
 ```
                          Human
@@ -46,7 +48,7 @@ This separation preserves independent judgment: the author proves its work, an i
 
 ## One supported startup flow
 
-The Human creates the team directly; there is no coordinator and no `/ppo:bootstrap`.
+The Human creates the team directly.
 
 1. **Create the Lead.** From a Human shell without `PASEO_AGENT_ID`, or through the Paseo UI, create a `ppo-lead` agent in the intended repository/workspace and supply the Human task as its initial prompt. The Lead is a root agent.
 2. **Create the Supervisor when needed.** After obtaining the exact Lead agent ID, create a `ppo-supervisor` root agent only when the Human assigns one or the task class warrants it. Tiny/bounded tasks may skip this step and run Lead-only. Supply an assignment binding the exact Lead agent ID, the exact Human task/task ID, the exact repository root, and the expected workspace binding.
@@ -234,6 +236,7 @@ extensions/pi-paseo-orchestration.ts
 profiles/{supervisor,lead,peer}.md
 skills/ppo-orchestrate/SKILL.md
 skills/workspace-protocol/{SKILL.md,AUTHORING-GUIDE.md}
+docs/architecture.md
 ```
 
 Tests, specifications, reference documents, scratch state, and development dependencies are excluded. The manifest exposes one extension and two skills. Role Profiles are private package data and are not independently discoverable Pi prompts or skills.

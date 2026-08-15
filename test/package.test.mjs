@@ -147,6 +147,7 @@ test("npm tarball is public, versioned, and contains only runtime package resour
     "skills/ppo-orchestrate/SKILL.md",
     "skills/workspace-protocol/SKILL.md",
     "skills/workspace-protocol/AUTHORING-GUIDE.md",
+    "docs/architecture.md",
   ]);
 
   const { stdout } = await execFile("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], { cwd: root });
@@ -155,6 +156,7 @@ test("npm tarball is public, versioned, and contains only runtime package resour
   assert.equal(packed.version, manifest.version);
   assert.deepEqual(packed.files.map(({ path }) => path).sort(), [
     "README.md",
+    "docs/architecture.md",
     "extensions/pi-paseo-orchestration.ts",
     "package.json",
     "profiles/lead.md",
