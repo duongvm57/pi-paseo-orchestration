@@ -1,6 +1,6 @@
 ---
 status: active
-version: 3
+version: 4
 last_reviewed: 2026-08-15
 project_id: pi-paseo-orchestration
 repository_root: .
@@ -37,6 +37,10 @@ ordinary task prose.
 - **Supervisor:** observes and proposes. It may inspect evidence, request
   clarification, pause affected work, escalate, and draft protocol revisions.
   It does not route ordinary project work or direct Peers as a substitute Lead.
+  Observation is event-triggered: one bounded observation pass per Lead
+  milestone or low-frequency safety-net heartbeat, then idle; the six
+  Lead→Supervisor milestone kinds are a transport contract, not an observation
+  strategy.
   Recovery is gated: the Supervisor may propose a successor Lead with evidence
   and a bounded handoff, but creating one requires an explicit per-incident
   Human authorization; it never self-grants recovery. The Supervisor may write
