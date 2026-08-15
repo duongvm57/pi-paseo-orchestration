@@ -140,11 +140,11 @@ const COOPERATIVE_LABEL_PREFIX = "pi-paseo-orchestration.";
 const PPO_TASK_KEY = `${COOPERATIVE_LABEL_PREFIX}task-key`;
 const PPO_ASSIGNMENT_KEY = `${COOPERATIVE_LABEL_PREFIX}assignment-key`;
 
-// Closed role ceilings: Peer is read+Bash plus outer mcp for parent-only
-// send_agent_prompt. Supervisor and Lead add the rest of their MCP targets.
-// write/edit are never in a ceiling — they are granted only when a Lead
-// protocol opts into self-work or a Peer assignment binds write_mode write.
-// mcp_script is in no ceiling.
+// Closed role ceilings: Peer is read+Bash. The peer_lead_message custom tool
+// performs the parent-scoped send through the runtime, not via a Peer MCP
+// target. Supervisor and Lead add the outer mcp tool. write/edit are never in
+// a ceiling — they are granted only when a Lead protocol opts into self-work
+// or a Peer assignment binds write_mode write. mcp_script is in no ceiling.
 export const CEILINGS = {
   supervisor: ["read", "bash", "mcp"],
   lead: ["read", "bash", "mcp"],
@@ -4695,7 +4695,16 @@ export async function deliverPeerLeadMessage({ kind, taskId, payload, env = proc
   const directed = validateEventEnvelope(built.envelope, { direction: "lead_peer" });
   if (!directed.ok) return { ok: false, error: directed.error };
   if (eventDedupe(built.envelope.event_id)) return { ok: false, error: "duplicate event_id is ignored (idempotent)" };
-  return { ok: true, envelope: built.envelope, recipientId: parentId, transport: "mcp_send_agent_prompt" };
+  const text = `${EVENT_ENVELOPE_BEGIN}${JSON.stringify(built.envelope)}${EVENT_ENVELOPE_END}`;
+  // Runtime-internal Peer→Lead transport. The Peer only calls peer_lead_message;
+  // this process then delivers the closed envelope. This is not the Lead's
+  // banned milestone CLI fallback and not a Peer-invoked Paseo command.
+  try {
+    await execFileAsync("paseo", ["send", parentId, "--prompt", text, "--no-wait"], { env, timeout: 15000 });
+  } catch (err) {
+    return { ok: false, error: `peer_lead_message delivery failed: ${err.message}` };
+  }
+  return { ok: true, envelope: built.envelope, recipientId: parentId, transport: "runtime_paseo_send" };
 }
 
 export function receivePeerLeadEnvelope(text, options) {

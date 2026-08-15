@@ -3846,11 +3846,14 @@ test("peer_lead_message delivers a closed envelope to the process parent Lead", 
   const ext = await freshExtension();
   const profiles = await profileDirFixture();
   const dir = await mkdtemp(join(tmpdir(), "ppo-peer-msg-"));
+  const bin = await mkdtemp(join(tmpdir(), "ppo-peer-send-"));
   await writeSettings(dir, validDoc);
+  const log = join(bin, "sent.log");
+  await writeFile(join(bin, "paseo"), `#!/bin/sh\nprintf '%s\n' "$*" > "${log}"; exit 0\n`, { mode: 0o755 });
   try {
     const fake = fakePi({
       activeTools: ["read", "bash"],
-      env: { PI_PASEO_ORCHESTRATION_ROLE: "peer", PI_PASEO_ORCHESTRATION_PEER_ALIAS: "ppo-peer", PASEO_AGENT_ID: "peer-7", PI_CODING_AGENT_DIR: dir, PI_PASEO_ORCHESTRATION_PROFILES_DIR: profiles },
+      env: { PI_PASEO_ORCHESTRATION_ROLE: "peer", PI_PASEO_ORCHESTRATION_PEER_ALIAS: "ppo-peer", PASEO_AGENT_ID: "peer-7", PI_CODING_AGENT_DIR: dir, PI_PASEO_ORCHESTRATION_PROFILES_DIR: profiles, PATH: `${bin}:${process.env.PATH ?? ""}` },
     });
     fake.pi.setActiveTools = (tools) => { fake.holder.activeTools = [...tools]; };
     fake.pi.getActiveTools = () => [...fake.holder.activeTools];
@@ -3865,8 +3868,12 @@ test("peer_lead_message delivers a closed envelope to the process parent Lead", 
     assert.equal(delivered.ok, true, delivered.error);
     assert.equal(delivered.recipientId, "lead-7");
     assert.equal(delivered.envelope.kind, "question");
-    assert.equal(delivered.transport, "mcp_send_agent_prompt");
+    const sent = await readFile(log, "utf8");
+    assert.match(sent, /^send lead-7 --prompt /);
+    assert.match(sent, /--no-wait/);
+    assert.match(sent, /event="v1"/);
   } finally {
+    await rm(bin, { recursive: true, force: true });
     await rm(profiles, { recursive: true, force: true });
     await rm(dir, { recursive: true, force: true });
   }
