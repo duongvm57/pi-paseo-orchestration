@@ -5300,7 +5300,7 @@ export default function (pi) {
       }
     }
     if (latch.role === "lead") {
-      const incoming = await receivePeerLeadEnvelope(event.text ?? "", { leadAgentId: latch.agentId, env: envOf(ctx), repoRoot: protocolPin?.repoRoot ?? null });
+      const incoming = await receivePeerLeadEnvelope(event.text ?? "", { leadAgentId: latch.agentId, expectedProvider: latch.peerProviderAlias ?? "", env: envOf(ctx), repoRoot: protocolPin?.repoRoot ?? null });
       if (incoming.ok !== true) {
         ctx.ui?.notify?.(`pi-paseo-orchestration: Peer event rejected (${"error" in incoming && typeof incoming.error === "string" ? incoming.error : "invalid envelope"})`, "error");
         return { action: "continue" };
