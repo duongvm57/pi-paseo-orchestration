@@ -2132,6 +2132,7 @@ const OPTIONAL_PROTOCOL_SECTIONS = new Set([
   "review and council",
   "anti-patterns",
   "supervisor hints",
+  "model and effort routing",
 ]);
 
 export function protocolPath(repoRoot) {

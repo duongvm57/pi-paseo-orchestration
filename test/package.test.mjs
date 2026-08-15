@@ -1478,10 +1478,13 @@ test("validateProtocol: every required core section is enforced; optional sectio
   assert.equal(noMustAsk.ok, false);
   assert.match(noMustAsk.error, /must-ask boundaries/);
 
-  // Optional sections may be absent; model/effort routing is outside the closed schema.
+  // Optional sections may be absent; Model and effort routing is advisory and grants nothing.
   const withOptionals = `${coreBody()}\n\n## Project criticality\n\nHigh.\n\n## Review and council\n\nA council appears only for genuinely independent decisions.\n\n## Anti-patterns\n\nNo ceremony for tiny work.\n\n## Supervisor hints\n\nObserve, do not implement.`;
   assert.equal(validateProtocol(protocolText({}, withOptionals)).ok, true, "closed optional sections must validate");
-  assert.equal(validateProtocol(`${withOptionals}\n\n## Model routing\n\nReserved for a later version.`).ok, false, "model routing must be rejected");
+  const withRouting = validateProtocol(protocolText({}, `${withOptionals}\n\n## Model and effort routing\n\nPrefer cheaper models for bounded work; keep concrete tuples in role settings.`));
+  assert.equal(withRouting.ok, true, withRouting.error ?? "Model and effort routing must validate");
+  assert.equal(withRouting.allowsLeadTiny, true);
+  assert.equal(validateProtocol(protocolText({}, `${withOptionals}\n\n## Model routing\n\nReserved for a later version.`)).ok, false, "unknown model routing heading must be rejected");
 
   const emptyCore = coreBody(coreSections.map(([heading, body]) => [heading, heading === "ownership and isolation" ? "" : body]));
   const empty = validateProtocol(protocolText({}, emptyCore));

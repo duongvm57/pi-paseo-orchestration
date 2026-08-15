@@ -91,7 +91,7 @@ Define revision authority, Human confirmation, versioning, review triggers, and 
 ```
 <!-- canonical-protocol-skeleton:end -->
 
-The only optional H2 headings are `Project criticality`, `Review and council rules` (or `Review and council`), `Anti-patterns`, and `Supervisor hints`. Omit an optional section when it does not change repository behavior. Do not create other headings.
+The only optional H2 headings are `Project criticality`, `Review and council rules` (or `Review and council`), `Anti-patterns`, `Supervisor hints`, and `Model and effort routing`. Omit an optional section when it does not change repository behavior. Do not create other headings.
 
 ### 3.1 Identity and applicability
 
