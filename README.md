@@ -2,7 +2,7 @@
 
 Governed multi-agent work for [Pi](https://github.com/earendil-works/pi) running through Paseo.
 
-The package gives each process one explicit role—**Supervisor**, **Lead**, or **Peer**—and keeps Paseo as the source of truth for agents, workspaces, parentage, and lifecycle. It adds policy guardrails, repository workflow rules, direct bounded assignments for ordinary local work, evidence-bearing handoffs, and local Git candidate acceptance. There is no coordinator: the Human creates the root Lead and root Supervisor directly.
+The package gives each process one explicit role—**Supervisor**, **Lead**, or **Peer**—and keeps Paseo as the source of truth for agents, workspaces, parentage, and lifecycle. It adds policy guardrails, repository workflow rules, direct bounded assignments for ordinary local work, evidence-bearing handoffs, and local Git candidate acceptance. There is no coordinator: the Human creates the root Lead, and creates a root Supervisor only when the task class warrants one.
 
 ## Why subagents are not enough
 
@@ -49,8 +49,8 @@ This separation preserves independent judgment: the author proves its work, an i
 The Human creates the team directly; there is no coordinator and no `/ppo:bootstrap`.
 
 1. **Create the Lead.** From a Human shell without `PASEO_AGENT_ID`, or through the Paseo UI, create a `ppo-lead` agent in the intended repository/workspace and supply the Human task as its initial prompt. The Lead is a root agent.
-2. **Create the Supervisor.** After obtaining the exact Lead agent ID, create a `ppo-supervisor` root agent and supply an assignment binding the exact Lead agent ID, the exact Human task/task ID, the exact repository root, and the expected workspace binding.
-3. **Bind Supervisor and Lead.** The Human announces the exact Supervisor agent ID to the Lead. The first Lead milestone to that Supervisor is the canonical binder: the runtime verifies role, root parentage, repository/workspace applicability, and task binding before accepting it. The Supervisor may ask that bound Lead or relay a Human decision to it.
+2. **Create the Supervisor when needed.** After obtaining the exact Lead agent ID, create a `ppo-supervisor` root agent only when the Human assigns one or the task class warrants it. Tiny/bounded tasks may skip this step and run Lead-only. Supply an assignment binding the exact Lead agent ID, the exact Human task/task ID, the exact repository root, and the expected workspace binding.
+3. **Bind Supervisor and Lead.** When a Supervisor exists, the Human announces the exact Supervisor agent ID to the Lead. The first Lead milestone to that Supervisor is the canonical binder: the runtime verifies role, root parentage, repository/workspace applicability, and task binding before accepting it. The Supervisor may ask that bound Lead or relay a Human decision to it.
 4. **The Lead creates Peer children** through `paseo_create_agent`. Every Peer has `ParentAgentId` equal to the Lead and receives one bounded assignment.
 
 The Lead delegates bounded assignments to Peer children and returns the final candidate to the Human for local acceptance. Lead and Supervisor must both be root agents (`ParentAgentId = null`); a parented Lead or Supervisor fails closed before governed work, and a root or wrong-parent Peer is `BLOCKED`. Root launch does not automatically subscribe another Pi harness to completion: when a harness must receive the result, it sends one bounded prompt after launch containing its exact root Pi observer agent ID and callback contract. The Lead sends only the terminal `LEAD_FINISHED` event to that observer; milestones go to the verified root Supervisor. Both routes use a closed event envelope through `paseo_send_agent_prompt`; CLI `paseo send` is not a fallback. An interactive Human may instead observe the root agents in Paseo.

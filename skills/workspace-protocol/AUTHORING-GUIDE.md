@@ -187,10 +187,12 @@ Use Git history as the change record. Do not create a parallel protocol changelo
 
 ## 4. Content to leave out
 
+Record model and effort selection principles when they change routing. Keep concrete provider, model, and thinking tuples in Human-owned role settings.
+
 Keep these outside the protocol:
 
 - complete global role behavior already owned by Role Profiles;
-- model IDs or thinking settings;
+- concrete provider/model/thinking tuples;
 - task-specific file lists;
 - secrets or credentials;
 - instructions requiring a Peer to understand Paseo topology;

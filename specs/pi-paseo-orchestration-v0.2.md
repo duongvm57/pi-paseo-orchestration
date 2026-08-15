@@ -7,7 +7,7 @@ Target package version: 0.2.0
 
 ## Objective
 
-Replace coordinator-based bootstrap with a Human-created Paseo team. The Human creates a root Lead and a root Supervisor directly; the Lead creates bounded Peer children. Communication is event-driven and bounded; no coordinator, daemon, or continuous polling loop is introduced. A low-frequency heartbeat is only a safety net.
+Replace coordinator-based bootstrap with a Human-created Paseo team. The Human creates a root Lead and, when the task class warrants it, a root Supervisor; the Lead creates bounded Peer children. Tiny/bounded tasks may run Lead-only. Communication is event-driven and bounded; no coordinator, daemon, or continuous polling loop is introduced. A low-frequency heartbeat is only a safety net.
 
 ## Human-created topology
 
@@ -15,12 +15,12 @@ Replace coordinator-based bootstrap with a Human-created Paseo team. The Human c
 Human
 ├── Lead (root Paseo agent)
 │   └── Peer(s) (Paseo child agents)
-└── Supervisor (root Paseo agent bound to one Lead)
+└── Supervisor (optional root Paseo agent bound to assigned Lead(s))
 ```
 
 - Lead and Supervisor require `ParentAgentId = null`; a parented lead/supervisor fails closed before governed work.
 - A Peer requires `ParentAgentId = <exact Lead agent ID>`; a root Peer or a Peer of another parent completes as `BLOCKED`.
-- The Supervisor observes one or more assigned Leads, projects, or workspaces; it does not direct Peers or issue project acceptance.
+- A Supervisor is optional per task class. The Lead binds a Supervisor only when the Human assigns one or the task class warrants it. When present, the Supervisor observes one or more assigned Leads, projects, or workspaces; it does not direct Peers or issue project acceptance.
 
 ## Resolved Human model for ordinary local work
 
@@ -35,7 +35,7 @@ The initial Human root task and the exact Lead assignment authorize ordinary loc
 
 ## Cooperative task/assignment label contract
 
-When a Lead adds cooperative task/assignment correlation labels to a new `create_agent` call, the `labels` object is closed and namespaced under `pi-paseo-orchestration.`. The only recognized keys are `pi-paseo-orchestration.task-key` and `pi-paseo-orchestration.assignment-key`; any other key is rejected drift. Labels are correlation metadata only (never authentication), and the child still inherits the exact workspace and Paseo-supplied parentage — `labels` never carries or overwrites `workspaceId`/parentage. Rejecting an unknown label key leaves the session unscathed (block the call, reuse the old closed `create_agent` shape which omits `labels`). The reconciliation side reads these labels from live inspection only when the observer supplies them; caller-supplied task/assignment values are never accepted as validation.
+When a Lead adds cooperative task/assignment correlation labels to a new `create_agent` call, the `labels` object is closed and namespaced under `pi-paseo-orchestration.`. The recognized keys are `pi-paseo-orchestration.task-key`, `pi-paseo-orchestration.assignment-key`, and `pi-paseo-orchestration.write-mode` (`read-only` or `write`). Any other key is rejected drift. Omitted write-mode is read-only. Labels are correlation metadata only (never authentication), and the child still inherits the exact workspace and Paseo-supplied parentage — `labels` never carries or overwrites `workspaceId`/parentage. Rejecting an unknown label key leaves the session unscathed (block the call, reuse the old closed `create_agent` shape which omits `labels`). The reconciliation side reads these labels from live inspection only when the observer supplies them; caller-supplied task/assignment values are never accepted as validation.
 
 ## MCP operation normalization
 

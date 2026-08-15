@@ -136,6 +136,10 @@ export const PEER_ALIAS_ENV = "PI_PASEO_ORCHESTRATION_PEER_ALIAS";
 export const SUPERVISOR_ALIAS_ENV = "PI_PASEO_ORCHESTRATION_SUPERVISOR_ALIAS";
 export const LEAD_ALIAS_ENV = "PI_PASEO_ORCHESTRATION_LEAD_ALIAS";
 export const AGENT_ENV = "PASEO_AGENT_ID";
+const COOPERATIVE_LABEL_PREFIX = "pi-paseo-orchestration.";
+const PPO_TASK_KEY = `${COOPERATIVE_LABEL_PREFIX}task-key`;
+const PPO_ASSIGNMENT_KEY = `${COOPERATIVE_LABEL_PREFIX}assignment-key`;
+const PPO_WRITE_MODE_KEY = `${COOPERATIVE_LABEL_PREFIX}write-mode`;
 
 // Closed role ceilings: Peer is read+Bash; Supervisor and Lead add the outer
 // mcp tool (whose inner targets are validated separately). write/edit are never
@@ -155,7 +159,7 @@ export const CEILINGS = {
 // canonicalMcpOperation before any policy decision, so prefixed and canonical
 // forms are identical.
 export const MCP_TARGETS = {
-  supervisor: { paseo: new Set(["list_agents", "get_agent_status", "get_agent_activity", "send_agent_prompt"]) },
+  supervisor: { paseo: new Set(["list_agents", "list_workspaces", "get_agent_status", "get_agent_activity", "send_agent_prompt"]) },
   lead: { paseo: new Set(["list_workspaces", "list_providers", "list_agents", "create_agent", "send_agent_prompt", "get_agent_status", "get_agent_activity", "cancel_agent", "archive_agent"]) },
   peer: {},
 };
@@ -408,6 +412,7 @@ export async function activate({ env, dir, profileDir, models, setModel, setThin
     selectedModel: { provider: sel.provider, id: sel.model },
     selectedThinking: sel.thinking,
     selectedPeerRoute: selectedRoute,
+    writeMode: roleCheck.role === "peer" ? ((env.PI_PASEO_ORCHESTRATION_WRITE_MODE ?? "").trim() || "read-only") : null,
   };
   return { ok: true, latch };
 }
@@ -494,6 +499,7 @@ const MCP_CONTRACT = {
   ],
   supervisor: [
     "`list_agents` with `{\"cwd\":\"<bound Lead repository root>\"}`",
+    "`list_workspaces` with `{}`",
     "`get_agent_status` with `{\"agentId\":\"<full Paseo agent ID>\"}`",
     "`get_agent_activity` with `{\"agentId\":\"<full Paseo agent ID>\"}`",
     "`send_agent_prompt` with `{\"agentId\":\"<full bound Lead ID>\",\"prompt\":\"<question or Human decision>\"}`",
@@ -539,7 +545,7 @@ function createAgentPolicyPrompt(activeLatch) {
       `- Bind this full Lead ID once in \`initialPrompt\` as \"parent_lead_agent_id\":\"${activeLatch.agentId}\".`,
       "- Set a trimmed nonempty `title` (maximum 60 characters), a nonempty `initialPrompt`, and `notifyOnFinish: true`.",
       "- Let Paseo inherit workspace and parentage; the argument shape excludes `workspaceId`.",
-      "- Labels are optional. When present, use only `pi-paseo-orchestration.task-key` and `pi-paseo-orchestration.assignment-key`, each with a trimmed nonempty value.",
+      "- Labels are optional. When present, use only `pi-paseo-orchestration.task-key`, `pi-paseo-orchestration.assignment-key`, and `pi-paseo-orchestration.write-mode` (`read-only` or `write`).",
       "The call is ready when one route and one parent Lead are bound, route settings match, notification is enabled, and every supplied key matches this shape.",
       "",
       mcpContractPrompt("lead"),
@@ -601,16 +607,19 @@ function validateCreateAgentArgs(args, policy) {
   // Labels are correlation metadata, never authentication; workspaceId is never
   // accepted here so inherited parentage/workspace placement is preserved.
   if (args.labels !== undefined) {
-    const allowedLabels = new Set([PPO_TASK_KEY, PPO_ASSIGNMENT_KEY]);
+    const allowedLabels = new Set([PPO_TASK_KEY, PPO_ASSIGNMENT_KEY, PPO_WRITE_MODE_KEY]);
     if (!isRecord(args.labels) || Object.keys(args.labels).length === 0) {
       return block("create_agent labels, when supplied, must be a nonempty closed object of namespaced correlation keys");
     }
     for (const [key, val] of Object.entries(args.labels)) {
       if (!allowedLabels.has(key)) {
-        return block(`create_agent labels key ${JSON.stringify(key)} is not an allowed namespaced correlation key; labels are closed to ${PPO_TASK_KEY} and ${PPO_ASSIGNMENT_KEY}`);
+        return block(`create_agent labels key ${JSON.stringify(key)} is not an allowed namespaced correlation key; labels are closed to ${PPO_TASK_KEY}, ${PPO_ASSIGNMENT_KEY}, and ${PPO_WRITE_MODE_KEY}`);
       }
       if (typeof val !== "string" || val.trim() === "" || val !== val.trim()) {
         return block(`create_agent labels value for ${JSON.stringify(key)} must be a trimmed nonempty string`);
+      }
+      if (key === PPO_WRITE_MODE_KEY && val !== "read-only" && val !== "write") {
+        return block(`${PPO_WRITE_MODE_KEY} must be exactly read-only or write`);
       }
     }
   }
@@ -734,6 +743,12 @@ export function checkToolCall(toolName, input, policy) {
       return undefined;
     }
     if (input.server === "paseo" && (op === "list_workspaces" || op === "list_providers")) {
+      if (op === "list_workspaces") {
+        if (!["supervisor", "lead"].includes(policy.role) || !closedKeys(input.args ?? {}, [])) {
+          return block("list_workspaces is restricted to argument-free Supervisor or Lead discovery");
+        }
+        return undefined;
+      }
       if (policy.role !== "lead" || !closedKeys(input.args ?? {}, [])) {
         return block(`${op} is restricted to argument-free Lead discovery`);
       }
@@ -746,6 +761,10 @@ export function checkToolCall(toolName, input, policy) {
     if (policy.role === "peer" && /\bpaseo\b/.test(input.command)) {
       return block("paseo CLI is unavailable to the peer role");
     }
+    if (/\bgit\b[^\n;&|]*\bcommit\b/.test(input.command) && !GIT_AMEND.test(input.command)) {
+      if (policy.role === "lead" && policy.allowLeadWrite !== true) return block("Lead local commit requires protocol opt-in for Lead self-work");
+      if (policy.role === "peer" && policy.writeMode !== "write") return block("peer local commit requires write-mode write");
+    }
     for (const pattern of PUBLICATION) {
       if (pattern.test(input.command)) return block("publication route is always blocked");
     }
@@ -754,6 +773,8 @@ export function checkToolCall(toolName, input, policy) {
   }
   if (toolName === "write" || toolName === "edit") {
     if (policy.role === "supervisor") return block("write/edit is unavailable to the observation-only Supervisor role");
+    if (policy.role === "lead" && policy.allowLeadWrite !== true) return block("Lead write/edit requires protocol opt-in for Lead self-work");
+    if (policy.role === "peer" && policy.writeMode !== "write") return block("peer write/edit requires write-mode write");
     return undefined;
   }
   return undefined;
@@ -892,10 +913,14 @@ export async function validateScope(repoRoot, scope, exclusions = []) {
 // reversible work from the exact assignment - no authority state, envelope,
 // capability list, or grant gates them. The observation-only Supervisor gets
 // neither write nor edit. Tools outside the baseline are never re-enabled.
-export function effectiveTools(baseline, role) {
+export function effectiveTools(baseline, role, opts) {
   if (!Array.isArray(baseline)) return [];
   const ceiling = CEILINGS[role] ?? [];
-  const localWrite = role === "lead" || role === "peer" ? ["write", "edit"] : [];
+  const allowLeadWrite = opts != null && opts.allowLeadWrite === true;
+  const writeMode = opts != null ? opts.writeMode : undefined;
+  const leadWrite = role === "lead" && allowLeadWrite;
+  const peerWrite = role === "peer" && writeMode === "write";
+  const localWrite = leadWrite || peerWrite ? ["write", "edit"] : [];
   return baseline.filter((tool) => ceiling.includes(tool) || localWrite.includes(tool));
 }
 function gitOut(repoRoot, args, trim = true) {
@@ -3563,10 +3588,6 @@ const REQUIRED_REMOTE_OPERATIONS = ["create_agent", "list_agents", "get_agent_st
 // task-key is reconciled against the independently observed bound Lead task;
 // assignment-key is never validated as auth here (Peer report/handoff keeps
 // its own mandatory assignment correlation).
-const COOPERATIVE_LABEL_PREFIX = "pi-paseo-orchestration.";
-const PPO_TASK_KEY = `${COOPERATIVE_LABEL_PREFIX}task-key`;
-const PPO_ASSIGNMENT_KEY = `${COOPERATIVE_LABEL_PREFIX}assignment-key`;
-
 function labelKeyOf(labels, key) {
   return isRecord(labels) && typeof labels[key] === "string" && labels[key].trim() !== "" ? labels[key].trim() : null;
 }
@@ -3676,12 +3697,19 @@ function doctorPiCapabilities(pi) {
   return { missing, observed: required.filter((name) => typeof pi?.[name] === "function") };
 }
 
+function writePolicyOf(activeLatch) {
+  return {
+    allowLeadWrite: activeLatch?.role === "lead" && protocolPin?.allowsLeadTiny === true,
+    writeMode: activeLatch?.role === "peer" ? (activeLatch.writeMode === "write" ? "write" : "read-only") : undefined,
+  };
+}
+
 function doctorEffectiveToolReport(pi, role) {
   const observed = readActiveTools(pi);
   const actual = observed.ok ? observed.tools : [];
   const base = baseline ?? [];
-  const expected = role ? effectiveTools(base, role) : [];
-  const requested = role === "lead" || role === "peer" ? ["write", "edit"] : [];
+  const expected = role ? effectiveTools(base, role, writePolicyOf(latch)) : [];
+  const requested = (role === "lead" && protocolPin?.allowsLeadTiny === true) || (role === "peer" && latch?.writeMode === "write") ? ["write", "edit"] : [];
   const names = [...new Set([...base, ...CEILINGS[role] ?? [], "mcp_script", "write", "edit"])].sort();
   const effective = names.map((name) => {
     const active = actual.includes(name);
@@ -4843,7 +4871,7 @@ async function ensureToolPolicy(pi) {
   if (!observed.ok) return observed;
   const expected = lastAppliedTools ?? baseline;
   if (sameList(observed.tools, expected)) return { ok: true };
-  const allowed = effectiveTools(baseline, latch?.role ?? null);
+  const allowed = effectiveTools(baseline, latch?.role ?? null, writePolicyOf(latch));
   if (typeof pi.setActiveTools !== "function") return { ok: false, error: "active-tool policy cannot be re-applied" };
   try {
     pi.setActiveTools(allowed);
@@ -5206,7 +5234,7 @@ export default function (pi) {
       blockWith(ctx, tools.error);
       return undefined;
     }
-    const allowed = effectiveTools(baseline, latch.role);
+    const allowed = effectiveTools(baseline, latch.role, writePolicyOf(latch));
     if (typeof pi.setActiveTools !== "function") {
       blockWith(ctx, "active-tool policy cannot be applied");
       return undefined;
@@ -5330,7 +5358,8 @@ export default function (pi) {
       }
     }
 
-    const allowed = new Set(effectiveTools(baseline ?? [], latch.role));
+    const policyOpts = writePolicyOf(latch);
+    const allowed = new Set(effectiveTools(baseline ?? [], latch.role, policyOpts));
     const decision = checkToolCall(event.toolName, event.input, {
       role: latch.role,
       allowed,
@@ -5339,6 +5368,8 @@ export default function (pi) {
       peerRoutes: latch.settings.peer_routes,
       peerProviderAlias: latch.peerProviderAlias,
       currentAgentId: latch.agentId,
+      allowLeadWrite: policyOpts.allowLeadWrite,
+      writeMode: policyOpts.writeMode,
       repoRoot,
       boundRepoRoot: repoRoot,
       reconciledChildId,

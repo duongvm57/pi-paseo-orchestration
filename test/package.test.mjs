@@ -693,8 +693,9 @@ test("checkToolCall: closed per-role gates, outer MCP validation, git publicatio
   assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_list_agents", args: { statuses: ["idle", "running"], limit: 100 } }, listPolicy), undefined);
   assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_list_agents", args: { workspaceId: "guessed" } }, listPolicy).block, true);
 
+  const peerWrite = { ...peerPolicy, writeMode: "write" };
   for (const cmd of ["git commit -m x", "git status", "git log --oneline", "git diff", "git branch -a", "git fetch origin", "ls -la", "npm test", "git checkout -b feature", "git stash list"]) {
-    assert.equal(extension.checkToolCall("bash", { command: cmd }, peerPolicy), undefined, `must pass: ${cmd}`);
+    assert.equal(extension.checkToolCall("bash", { command: cmd }, peerWrite), undefined, `must pass: ${cmd}`);
   }
   for (const cmd of ["paseo inspect peer-1 --json", "paseo send lead-1 --prompt hi", "PATH=/usr/bin paseo status"]) {
     assert.equal(extension.checkToolCall("bash", { command: cmd }, peerPolicy).block, true, `must block: ${cmd}`);
@@ -1226,7 +1227,7 @@ async function gitRepoFixture({ withProtocol = true } = {}) {
 }
 
 // Governed (supervisor|lead|peer) process wired on a fresh extension instance.
-async function governedFixture(ext, { role = "peer", activeTools = ["read", "bash"] } = {}) {
+async function governedFixture(ext, { role = "peer", activeTools = ["read", "bash"], writeMode = undefined } = {}) {
   const dir = await mkdtemp(join(tmpdir(), "ppo-env-"));
   await mkdir(join(dir, "pi-paseo-orchestration"), { recursive: true });
   await writeSettings(dir, validDoc);
@@ -1238,6 +1239,7 @@ async function governedFixture(ext, { role = "peer", activeTools = ["read", "bas
       PASEO_AGENT_ID: "agent-7",
       PI_CODING_AGENT_DIR: dir,
       PI_PASEO_ORCHESTRATION_PROFILES_DIR: profiles,
+      ...(writeMode ? { PI_PASEO_ORCHESTRATION_WRITE_MODE: writeMode } : {}),
     },
   });
   ext.default(fake.pi);
@@ -1658,7 +1660,7 @@ test("wiring: peer read/grep/ls/find of the protocol or .orchestration is blocke
   const previous = process.cwd();
   process.chdir(repo.dir);
   const ext = await freshExtension();
-  const env = await governedFixture(ext, { activeTools: ["read", "bash", "write", "edit"] });
+  const env = await governedFixture(ext, { activeTools: ["read", "bash", "write", "edit"], writeMode: "write" });
   try {
     const protoAbs = protocolPath(repo.dir);
 
@@ -3715,8 +3717,8 @@ test("resolved model: no hidden authority state or getters remain", () => {
   assert.equal(typeof extension.getAuthorityReason, "undefined");
 });
 test("resolved model: local write/edit and local commit pass for implementation roles without any authority state", () => {
-  const peerPolicy = { role: "peer", allowed: ["read", "bash", "write", "edit"] };
-  const leadPolicy = { role: "lead", allowed: ["read", "bash", "write", "edit", "mcp"] };
+  const peerPolicy = { role: "peer", allowed: ["read", "bash", "write", "edit"], writeMode: "write" };
+  const leadPolicy = { role: "lead", allowed: ["read", "bash", "write", "edit", "mcp"], allowLeadWrite: true };
   assert.equal(extension.checkToolCall("write", { path: "src/x.go" }, peerPolicy), undefined);
   assert.equal(extension.checkToolCall("edit", { path: "src/x.go" }, peerPolicy), undefined);
   assert.equal(extension.checkToolCall("bash", { command: "git commit -m x" }, peerPolicy), undefined);
@@ -3727,11 +3729,14 @@ test("resolved model: local write/edit and local commit pass for implementation 
   assert.equal(extension.checkToolCall("bash", { command: "git push" }, peerPolicy).block, true);
   assert.equal(extension.checkToolCall("bash", { command: "git commit --amend" }, peerPolicy).block, true);
 });
-test("resolved model: effectiveTools grants write/edit to implementation roles only", () => {
+test("resolved model: effectiveTools grants write/edit only to opted-in Lead and write-mode Peer", () => {
   const base = ["read", "bash", "write", "edit", "mcp"];
-  assert.deepEqual(extension.effectiveTools(base, "lead"), ["read", "bash", "write", "edit", "mcp"]);
-  const peerTool = extension.effectiveTools(base, "peer");
-  assert.equal(peerTool.includes("edit"), true);
+  assert.deepEqual(extension.effectiveTools(base, "lead", { allowLeadWrite: true }), ["read", "bash", "write", "edit", "mcp"]);
+  assert.deepEqual(extension.effectiveTools(base, "lead"), ["read", "bash", "mcp"]);
+  const peerWrite = extension.effectiveTools(base, "peer", { writeMode: "write" });
+  assert.equal(peerWrite.includes("edit"), true);
+  const peerRead = extension.effectiveTools(base, "peer");
+  assert.equal(peerRead.includes("edit"), false);
   const supTool = extension.effectiveTools(base, "supervisor");
   assert.equal(supTool.includes("edit"), false);
   assert.equal(supTool.includes("write"), false);
@@ -3774,7 +3779,8 @@ test("wiring: per-role MCP call contract is injected into the agent prompt (DOGF
     assert.doesNotMatch(before.systemPrompt, /paseo_get_agent_status|"agent_id"\s*:|prefixed/);
     if (role === "supervisor") {
       assert.match(before.systemPrompt, /`send_agent_prompt` with `\{"agentId":"<full bound Lead ID>","prompt":"<question or Human decision>"\}`/);
-      assert.doesNotMatch(before.systemPrompt, /list_workspaces|list_providers/);
+      assert.match(before.systemPrompt, /`list_workspaces` with `\{\}`/);
+      assert.doesNotMatch(before.systemPrompt, /list_providers/);
       assert.doesNotMatch(before.systemPrompt, /## Peer creation/);
     } else {
       assert.match(before.systemPrompt, /`list_workspaces` with `\{\}`/);
@@ -3966,4 +3972,39 @@ test("Doctor EVENT_CAPABILITIES checks outer MCP send_agent_prompt", async () =>
     await rm(profiles, { recursive: true, force: true });
     await rm(repo.dir, { recursive: true, force: true });
   }
+});
+
+test("create_agent write-mode is closed and Engineer-only write defaults to read-only", () => {
+  const createPolicy = {
+    role: "lead",
+    allowed: ["mcp"],
+    mcpTargets: { paseo: new Set(["create_agent"]) },
+    peerRoutes: { fast: { provider: "openai", model: "gpt-5", thinking: "off", description: "fast route" } },
+    peerProviderAlias: "ppo-peer",
+    currentAgentId: "agent-7",
+  };
+  const blank = { title: "Bounded peer", provider: "ppo-peer/openai/gpt-5", settings: { thinkingOptionId: "off" }, initialPrompt: 'Use "model_route":"fast" and bind "parent_lead_agent_id":"agent-7".', notifyOnFinish: true };
+  const call = (args) => extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_create_agent", args }, createPolicy);
+  const WRITE = "pi-paseo-orchestration.write-mode";
+  assert.equal(call({ ...blank, labels: { [WRITE]: "write" } }), undefined);
+  assert.equal(call({ ...blank, labels: { [WRITE]: "read-only" } }), undefined);
+  assert.equal(call({ ...blank, labels: { [WRITE]: "admin" } }).block, true);
+  const peerRead = { role: "peer", allowed: ["read", "bash", "write", "edit"] };
+  assert.equal(extension.checkToolCall("write", { path: "src/x.go" }, peerRead).block, true);
+  assert.equal(extension.checkToolCall("bash", { command: "git commit -m x" }, peerRead).block, true);
+  assert.equal(extension.checkToolCall("write", { path: "src/x.go" }, { ...peerRead, writeMode: "write" }), undefined);
+});
+
+test("Lead write/edit is protocol opt-in via allowsLeadTiny", () => {
+  const lead = { role: "lead", allowed: ["read", "bash", "write", "edit", "mcp"] };
+  assert.equal(extension.checkToolCall("write", { path: "src/x.go" }, lead).block, true);
+  assert.equal(extension.checkToolCall("edit", { path: "src/x.go" }, lead).block, true);
+  assert.equal(extension.checkToolCall("bash", { command: "git commit -m x" }, lead).block, true);
+  assert.equal(extension.checkToolCall("write", { path: "src/x.go" }, { ...lead, allowLeadWrite: true }), undefined);
+});
+
+test("Supervisor list_workspaces is a bounded empty-args discovery target", () => {
+  const policy = { role: "supervisor", allowed: ["mcp"], mcpTargets: { paseo: new Set(["list_workspaces"]) } };
+  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_list_workspaces", args: {} }, policy), undefined);
+  assert.equal(extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_list_workspaces", args: { unexpected: true } }, policy).block, true);
 });
