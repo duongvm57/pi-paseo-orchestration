@@ -20,7 +20,7 @@ Human
 
 - Lead and Supervisor require `ParentAgentId = null`; a parented lead/supervisor fails closed before governed work.
 - A Peer requires `ParentAgentId = <exact Lead agent ID>`; a root Peer or a Peer of another parent completes as `BLOCKED`.
-- A Supervisor is optional per task class. The Lead binds a Supervisor only when the Human assigns one or the task class warrants it. When present, the Supervisor observes one or more assigned Leads, projects, or workspaces; it does not direct Peers or issue project acceptance.
+- A Supervisor is optional per task class. The Human creates and binds a Supervisor only when the task class warrants it; the Supervisor observes one or more assigned Leads, projects, or workspaces passively through Paseo evidence. A Lead never binds or reports to a Supervisor, and the Supervisor does not direct Peers or issue project acceptance.
 
 ## Resolved Human model for ordinary local work
 
@@ -29,8 +29,8 @@ The initial Human root task and the exact Lead assignment authorize ordinary loc
 ## Event-driven communication
 
 - Peer → Lead: narrow parent-scoped kinds `question`, `blocked`, `dependency`, `progress`, `handoff`, resolved from Paseo parentage.
-- Lead → Supervisor: milestone events `LEAD_STARTED`, `PEER_BLOCKED`, `CANDIDATE_READY`, `REVIEW_COMPLETE`, `HUMAN_DECISION_REQUIRED`, `LEAD_FINISHED`.
-- Supervisor → bound Lead: ask why a strategy was chosen, or relay a recorded Human decision. Supervisor → Human/Notebook: evidence-backed observation.
+- Lead → Human observer: exactly one terminal `LEAD_FINISHED` completion event when a root Pi observer callback contract was supplied.
+- Supervisor → bound Lead: ask why a strategy was chosen, or relay a recorded Human decision. Supervisor → Human/Notebook: evidence-backed observation. The Supervisor observes passively through Paseo evidence; there is no Lead→Supervisor milestone channel.
 - One bounded versioned event envelope; duplicate `event_id` is idempotently ignored; receipt is an attention signal, not acceptance, and carries no authority.
 
 ## Cooperative task/assignment label contract
@@ -43,7 +43,7 @@ Canonical and adapter-prefixed operation names route through one explicit alias 
 
 ## Doctor
 
-Adds checks for `PASEO_MCP_CONNECTED`, `PASEO_REQUIRED_OPERATIONS`, `PASEO_AGENT_IDENTITY`, `PASEO_SELF_INSPECT`, `ROLE_PARENTAGE`, `ROLE_PROVIDER`, `WORKSPACE_BINDING`, `LEAD_SUPERVISOR_BINDING`, `PEER_PARENT_BINDING`, and `EVENT_CAPABILITIES`. Governed Lead/Supervisor/Peer missing mandatory live evidence returns `BLOCKED`; passive sessions report the environment ceiling without pretending governed readiness; the first failed Paseo connection/discovery operation fails fast.
+Adds checks for `PASEO_MCP_CONNECTED`, `PASEO_REQUIRED_OPERATIONS`, `PASEO_AGENT_IDENTITY`, `PASEO_SELF_INSPECT`, `ROLE_PARENTAGE`, `ROLE_PROVIDER`, `WORKSPACE_BINDING`, `SUPERVISOR_LEAD_BINDING`, `PEER_PARENT_BINDING`, and `EVENT_CAPABILITIES`. Governed Lead/Supervisor/Peer missing mandatory live evidence returns `BLOCKED`; passive sessions report the environment ceiling without pretending governed readiness; the first failed Paseo connection/discovery operation fails fast.
 
 ## Removal
 

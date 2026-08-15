@@ -229,7 +229,8 @@ test("declared resources and private profiles are nonempty files", async () => {
   const peerProfile = await readFile(join(root, "profiles/peer.md"), "utf8");
   const supervisorProfile = await readFile(join(root, "profiles/supervisor.md"), "utf8");
   assert.match(peerProfile, /classify material premises as supported, partial, or failed/);
-  assert.match(peerProfile, /injected `ParentAgentId` fact/);
+  assert.match(peerProfile, /injected parent agent identity/);
+  assert.doesNotMatch(peerProfile, /Paseo parent/);
   assert.doesNotMatch(peerProfile, /inspect the Peer and your parent through Paseo/);
   assert.match(supervisorProfile, /Workspace Protocol's observation rhythm/);
   assert.match(orchestrationSkill, /kind":"REOPEN_REQUEST"/);
@@ -951,19 +952,18 @@ test("handler: a normal Lead child lifecycle op reconciles through the integrate
       assert.equal(fake.notifications.some(([msg, level]) => level === "info" && /typed workspace identity.*not observable/.test(msg)), true, `${op.tool} must surface the workspace environment ceiling`);
     }
 
-    // A closed milestone envelope to a live root Supervisor passes the same
-    // integrated MCP gate without being misclassified as a Peer lifecycle call.
+    // A terminal LEAD_FINISHED envelope to a root Human observer passes the
+    // same integrated MCP gate; a Supervisor is never a Lead event recipient.
     const eventBin = await mkdtemp(join(tmpdir(), "ppo-event-recipient-"));
-    const eventScript = `#!/bin/sh\nif [ "$1" = "inspect" ]; then\n  printf '{"Id":"sup-1","Provider":"ppo-supervisor","Status":"idle","Cwd":"${repo.dir}","ParentAgentId":""}'\n  exit 0\nfi\nexit 1\n`;
+    const eventScript = `#!/bin/sh\nif [ "$1" = "inspect" ]; then\n  printf '{"Id":"human-1","Provider":"pi","Status":"idle","Cwd":"${repo.dir}","ParentAgentId":""}'\n  exit 0\nfi\nexit 1\n`;
     await writeFile(join(eventBin, "paseo"), eventScript, { mode: 0o755 });
     try {
-      ext.bindExactPartner({ supervisorId: "sup-1" });
-      const event = buildEventEnvelope({ kind: "CANDIDATE_READY", taskId: "task-1", senderAgentId: "lead-9", recipientAgentId: "sup-1", repoRoot: repo.dir });
+      const event = buildEventEnvelope({ kind: "LEAD_FINISHED", taskId: "task-1", senderAgentId: "lead-9", recipientAgentId: "human-1", repoRoot: repo.dir });
       assert.equal(event.ok, true);
       const prompt = `<pi-paseo-orchestration event="v1">${JSON.stringify(event.envelope)}</pi-paseo-orchestration>`;
-      const delivered = await fake.handlers.get("tool_call")({ toolName: "mcp", input: { server: "paseo", tool: "paseo_send_agent_prompt", args: { agentId: "sup-1", prompt } } }, { ...fake.ctx, env: { ...fake.ctx.env, PATH: `${eventBin}:${process.env.PATH ?? ""}` } });
+      const delivered = await fake.handlers.get("tool_call")({ toolName: "mcp", input: { server: "paseo", tool: "paseo_send_agent_prompt", args: { agentId: "human-1", prompt } } }, { ...fake.ctx, env: { ...fake.ctx.env, PATH: `${eventBin}:${process.env.PATH ?? ""}` } });
       assert.equal(delivered, undefined, JSON.stringify(delivered));
-      const duplicate = await fake.handlers.get("tool_call")({ toolName: "mcp", input: { server: "paseo", tool: "paseo_send_agent_prompt", args: { agentId: "sup-1", prompt } } }, { ...fake.ctx, env: { ...fake.ctx.env, PATH: `${eventBin}:${process.env.PATH ?? ""}` } });
+      const duplicate = await fake.handlers.get("tool_call")({ toolName: "mcp", input: { server: "paseo", tool: "paseo_send_agent_prompt", args: { agentId: "human-1", prompt } } }, { ...fake.ctx, env: { ...fake.ctx.env, PATH: `${eventBin}:${process.env.PATH ?? ""}` } });
       assert.equal(duplicate.block, true);
       assert.match(duplicate.reason, /duplicate event_id/);
     } finally {
@@ -3675,19 +3675,19 @@ test("reconcilePeerChild: ownership requires live parent, configured provider, a
   }
 });
 
-test("verifyPartnerBinding: root role/provider/repository partner binds only after live inspection", async () => {
-  const bin = await fakePaseoBin({ rootAgent: true });
+test("verifyPartnerBinding: root Lead partner binds only after live inspection", async () => {
+  const bin = await fakePaseoBin({ rootAgent: true, provider: "ppo-lead" });
   try {
     const env = { ...process.env, PATH: bin };
-    const base = { claimedId: "agent-42", kind: "supervisor", selfId: "another-agent", env, expectedRole: "supervisor", expectedProvider: "pi", expectedRepoRoot: "/tmp/repo", expectedWorkspaceId: "workspace-1", taskId: "task-1" };
+    const base = { claimedId: "agent-42", kind: "lead", selfId: "another-agent", env, expectedRole: "lead", expectedProvider: "ppo-lead", expectedRepoRoot: "/tmp/repo", expectedWorkspaceId: "workspace-1", taskId: "task-1" };
     const ok = await verifyPartnerBinding(base);
     assert.equal(ok.ok, true, ok.error);
     // Missing mandatory role/task/repo blocks.
     assert.equal((await verifyPartnerBinding({ ...base, expectedRole: "" })).ok, false);
     assert.equal((await verifyPartnerBinding({ ...base, taskId: "" })).ok, false);
     assert.equal((await verifyPartnerBinding({ ...base, expectedRepoRoot: "" })).ok, false);
-    // Wrong expected role blocks.
-    assert.equal((await verifyPartnerBinding({ ...base, expectedRole: "lead" })).ok, false);
+    // A Supervisor cannot be bound as a Lead partner.
+    assert.equal((await verifyPartnerBinding({ ...base, kind: "supervisor", expectedRole: "supervisor" })).ok, false);
     // Repository mismatch blocks.
     assert.equal((await verifyPartnerBinding({ ...base, expectedRepoRoot: "/other/repo" })).ok, false);
   } finally {
@@ -3695,22 +3695,24 @@ test("verifyPartnerBinding: root role/provider/repository partner binds only aft
   }
 });
 
-test("reconcileLeadEventRecipient permits root Supervisor milestones and root observer completion only", async () => {
-  bindExactPartner({ supervisorId: "sup-1" });
-  const supervisorBin = await fakePaseoBin({ rootAgent: true, provider: "ppo-supervisor", idEcho: true });
+test("reconcileLeadEventRecipient permits only terminal LEAD_FINISHED to a root Human observer", async () => {
   const observerBin = await fakePaseoBin({ rootAgent: true, provider: "pi", idEcho: true });
+  const supervisorBin = await fakePaseoBin({ rootAgent: true, provider: "ppo-supervisor", idEcho: true });
   const base = { version: 1, event_id: "event-1", task_id: "task-1", sender_agent_id: "lead-1", repository_root: "/tmp/repo", payload: {} };
   try {
-    const sup = await reconcileLeadEventRecipient("sup-1", { ...base, kind: "CANDIDATE_READY", recipient_agent_id: "sup-1" }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: supervisorBin } });
-    assert.equal(sup.ok, true, sup.error);
-    assert.equal(sup.recipientKind, "supervisor");
     const observer = await reconcileLeadEventRecipient("human-1", { ...base, kind: "LEAD_FINISHED", recipient_agent_id: "human-1" }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: observerBin } });
     assert.equal(observer.ok, true, observer.error);
     assert.equal(observer.recipientKind, "observer");
+    // A Supervisor is never a Lead event recipient.
+    const supervisor = await reconcileLeadEventRecipient("sup-1", { ...base, kind: "LEAD_STARTED", recipient_agent_id: "sup-1" }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: supervisorBin } });
+    assert.equal(supervisor.ok, false);
+    assert.match(supervisor.error, /only the terminal LEAD_FINISHED/);
+    // Non-terminal kinds to the observer are rejected.
     const early = await reconcileLeadEventRecipient("human-1", { ...base, kind: "LEAD_STARTED", recipient_agent_id: "human-1" }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: observerBin } });
     assert.equal(early.ok, false);
-    assert.match(early.error, /only LEAD_FINISHED/);
-    const forged = await reconcileLeadEventRecipient("sup-1", { ...base, kind: "LEAD_FINISHED", sender_agent_id: "other-lead", recipient_agent_id: "sup-1" }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: supervisorBin } });
+    assert.match(early.error, /only the terminal LEAD_FINISHED/);
+    // A forged sender is rejected.
+    const forged = await reconcileLeadEventRecipient("human-1", { ...base, kind: "LEAD_FINISHED", sender_agent_id: "other-lead", recipient_agent_id: "human-1" }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: observerBin } });
     assert.equal(forged.ok, false);
   } finally {
     await rm(supervisorBin, { recursive: true, force: true });
@@ -3885,28 +3887,19 @@ test("peer_lead_message delivers a closed envelope to the process parent Lead", 
   }
 });
 
-test("first-milestone bind requires a Human-announced Supervisor", async () => {
+test("a Supervisor is never a Lead event recipient (no milestone push)", async () => {
   const ext = await freshExtension();
-  const labeled = await fakePaseoBin({
-    rootAgent: true, provider: "ppo-supervisor", idEcho: true,
-    labels: { "pi-paseo-orchestration.task-key": "task-1" },
-  });
+  const supervisor = await fakePaseoBin({ rootAgent: true, provider: "ppo-supervisor", idEcho: true });
   try {
-    const missing = await ext.reconcileLeadEventRecipient("sup-1", {
-      version: 1, event_id: "event-labeled-1", task_id: "task-1", sender_agent_id: "lead-1",
-      recipient_agent_id: "sup-1", repository_root: "/tmp/repo", kind: "LEAD_STARTED", payload: {},
-    }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: labeled } });
-    assert.equal(missing.ok, false);
-    assert.match(missing.error, /Human-announced Supervisor/);
-    ext.bindExactPartner({ supervisorId: "sup-1" });
-    const first = await ext.reconcileLeadEventRecipient("sup-1", {
-      version: 1, event_id: "event-labeled-2", task_id: "task-1", sender_agent_id: "lead-1",
-      recipient_agent_id: "sup-1", repository_root: "/tmp/repo", kind: "LEAD_STARTED", payload: {},
-    }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: labeled } });
-    assert.equal(first.ok, true, first.error);
-    assert.equal(ext.getBoundSupervisorId(), "sup-1");
+    for (const kind of ["LEAD_STARTED", "PEER_BLOCKED", "CANDIDATE_READY", "REVIEW_COMPLETE", "HUMAN_DECISION_REQUIRED", "LEAD_FINISHED"]) {
+      const res = await ext.reconcileLeadEventRecipient("sup-1", {
+        version: 1, event_id: `event-${kind}`, task_id: "task-1", sender_agent_id: "lead-1",
+        recipient_agent_id: "sup-1", repository_root: "/tmp/repo", kind, payload: {},
+      }, { leadAgentId: "lead-1", repoRoot: "/tmp/repo", env: { ...process.env, PATH: supervisor } });
+      assert.equal(res.ok, false, `milestone ${kind} to a Supervisor must be rejected`);
+    }
   } finally {
-    await rm(labeled, { recursive: true, force: true });
+    await rm(supervisor, { recursive: true, force: true });
   }
 });
 
@@ -3949,10 +3942,10 @@ test("Doctor EVENT_CAPABILITIES checks outer MCP send_agent_prompt", async () =>
     assert.equal(event.status, "PASS");
     assert.match(event.expected, /send_agent_prompt/);
     assert.doesNotMatch(JSON.stringify(event), /sendEvent/);
-    const binding = report.checks.find((check) => check.code === "LEAD_SUPERVISOR_BINDING");
+    const binding = report.checks.find((check) => check.code === "SUPERVISOR_LEAD_BINDING");
     assert.equal(binding.status, "WARN");
     assert.equal(binding.required, false);
-    assert.match(binding.observed, /no Supervisor bound/);
+    assert.equal(binding.observed, "not applicable");
   } finally {
     await rm(settingsDir, { recursive: true, force: true });
     await rm(profiles, { recursive: true, force: true });

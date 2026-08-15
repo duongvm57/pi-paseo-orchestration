@@ -50,12 +50,37 @@ This separation preserves independent judgment: the author proves its work, an i
 
 The Human creates the team directly.
 
-1. **Create the Lead.** From a Human shell without `PASEO_AGENT_ID`, or through the Paseo UI, create a `ppo-lead` agent in the intended repository/workspace and supply the Human task as its initial prompt. The Lead is a root agent.
-2. **Create the Supervisor when needed.** After obtaining the exact Lead agent ID, create a `ppo-supervisor` root agent only when the Human assigns one or the task class warrants it. Tiny/bounded tasks may skip this step and run Lead-only. Supply an assignment binding the exact Lead agent ID, the exact Human task/task ID, the exact repository root, and the expected workspace binding.
-3. **Bind Supervisor and Lead.** When a Supervisor exists, the Human announces the exact Supervisor agent ID to the Lead. The first Lead milestone to that Supervisor is the canonical binder: the runtime verifies role, root parentage, repository/workspace applicability, and task binding before accepting it. The Supervisor may ask that bound Lead or relay a Human decision to it.
-4. **The Lead creates Peer children** through `paseo_create_agent`. Every Peer has `ParentAgentId` equal to the Lead and receives one bounded assignment.
+1. **Create the Lead.** From a Human shell without `PASEO_AGENT_ID` (or the Paseo UI), create a `ppo-lead` root agent with the task as its initial prompt:
 
-The Lead delegates bounded assignments to Peer children and returns the final candidate to the Human for local acceptance. Lead and Supervisor must both be root agents (`ParentAgentId = null`); a parented Lead or Supervisor fails closed before governed work, and a root or wrong-parent Peer is `BLOCKED`. Root launch does not automatically subscribe another Pi harness to completion: when a harness must receive the result, it sends one bounded prompt after launch containing its exact root Pi observer agent ID and callback contract. The Lead sends only the terminal `LEAD_FINISHED` event to that observer; milestones go to the verified root Supervisor. Both routes use a closed event envelope through `paseo_send_agent_prompt`; CLI `paseo send` is not a fallback. An interactive Human may instead observe the root agents in Paseo.
+   ```bash
+   paseo run --provider ppo-lead "<your task>"
+   ```
+
+2. **Get the Lead's agent ID.**
+
+   ```bash
+   paseo ls
+   ```
+
+3. **Create the Supervisor when needed** — only when governance across the task is warranted; tiny/bounded tasks skip this and run Lead-only. Create a `ppo-supervisor` root agent whose prompt binds the Lead:
+
+   ```bash
+   paseo run --provider ppo-supervisor \
+     "Bind as Supervisor for Lead <lead-id>. Task: <task>. Repo: /path/to/repo. Workspace: <workspace-id>."
+   ```
+
+   The Supervisor verifies the binding from live Paseo facts, then observes passively (agents, status, activity, workspaces). It may ask the bound Lead or relay a Human decision to it. The Lead is never told about the Supervisor and never sends it milestones.
+
+4. **The Lead creates Peer children** through `paseo_create_agent` — you don't create Peers. Every Peer has `ParentAgentId` equal to the Lead and receives one bounded assignment.
+
+5. **Watch progress and accept.** Observe any agent from the CLI or UI; the Lead returns the final candidate for your direct `LOCAL_ACCEPT`.
+
+   ```bash
+   paseo ls                    # all agents + status
+   paseo logs <agent-id> -f    # live activity of one agent
+   ```
+
+The Lead delegates bounded assignments to Peer children and returns the final candidate to the Human for local acceptance. Lead and Supervisor must both be root agents (`ParentAgentId = null`); a parented Lead or Supervisor fails closed before governed work, and a root or wrong-parent Peer is `BLOCKED`. Root launch does not automatically subscribe another Pi harness to completion: when a harness must receive the result, it sends one bounded prompt after launch containing its exact root Pi observer agent ID and callback contract. The Lead sends only the terminal `LEAD_FINISHED` event to that observer. The Supervisor observes the workflow passively through Paseo and never receives events from the Lead. Both routes use a closed event envelope through `paseo_send_agent_prompt`; CLI `paseo send` is not a fallback. An interactive Human may instead observe the root agents in Paseo.
 
 ## How it works
 
@@ -65,7 +90,7 @@ The Lead delegates bounded assignments to Peer children and returns the final ca
 4. A dirty caller checkout is evidence to classify, not an automatic blocker: untracked/read-only issue notes, specifications, research, generated logs, or unrelated documentation do not block an isolated worktree from a known clean commit. Only a real collision, overwrite risk, competing writer, or ambiguous base blocks work.
 5. A Peer ends its run with a correlated report: `HANDOFF`, `REOPEN_REQUEST`, `DEPENDENCY_REQUEST`, or `BLOCKED`. The Lead reacts to that event instead of polling and consuming coordination attention.
 6. Write work produces one exact local Git **Stable Candidate**. Required review and verification bind to that commit, the Lead issues a candidate-bound verdict, and only a direct Human action crosses the Local Acceptance Boundary.
-7. Communication is event-driven and bounded. The Lead sends milestone events to its verified Supervisor; the Supervisor performs one bounded observation pass per event, or on a low-frequency heartbeat used only as a safety net, and returns to idle. No daemon or continuous polling loop is introduced.
+7. Communication is event-driven and bounded. The Lead emits only a terminal completion event to a Human observer; the Supervisor observes passively through Paseo evidence and performs one bounded observation pass per event or low-frequency safety-net heartbeat, then returns to idle. No daemon or continuous polling loop is introduced.
 8. Paseo remains the only lifecycle, workspace, parentage, follow-up, and timeline control plane. This package adds policy and evidence contracts, not another scheduler or agent database.
 
 Use this package when those boundaries matter. For a small single-agent task, ordinary Pi is simpler.

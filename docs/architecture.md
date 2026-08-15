@@ -86,8 +86,9 @@ invariants). Role and provider **names are not the invariant** — independent
 judgment and attention are.
 
 This package was checked against the reference by an independent committee of
-three contrasting providers (Codex, Grok, and Pi/DeepSeek). Three real gaps were
-found and fixed:
+three contrasting providers (Codex, Grok, and Pi/DeepSeek), which recorded 19
+gaps (8 confirmed, 3 partial, 8 new) and returned a PARTIAL verdict with a
+blocker. Each was closed across the fix chain. The highest-signal fixes:
 
 - **Recovery (high).** Supervisor recovery could not mint a root successor Lead —
   agent-scoped `create_agent` only creates children, yet Lead/Supervisor fail
@@ -99,6 +100,17 @@ found and fixed:
 - **Skill topology (medium).** Skills were not role-scoped. Each role profile now
   names the skills it may load (`ppo-orchestrate` for the Lead,
   `workspace-protocol` for the Supervisor under mandate, neither for the Peer).
+- **Passive governance (G4/G8).** The first implementation inverted the
+  reference's observation model: the Lead pushed six milestone events to a
+  Supervisor whose ID the Human had announced to it. The Lead now emits only a
+  terminal `LEAD_FINISHED` event to a root Human observer, and the Supervisor
+  observes passively through Paseo evidence; a Supervisor is never a Lead event
+  recipient.
+- **Peer Paseo-awareness (G1).** The Peer profile no longer names Paseo
+  parentage; it derives its parent Lead from the injected parent identity, and
+  never reads Paseo state or the protocol.
+- **Multi-Lead binding (G7).** Per-Lead task/workspace binding is a map keyed by
+  Lead identity, not a single scalar pair shared across all bound Leads.
 
 Reconciled as non-gaps: the Human-only Local Acceptance boundary (a stricter
 repository decision, compatible with owner authority), Git-only candidates (v0.2
@@ -400,7 +412,7 @@ linear candidate and invalidate reviews tied to the prior one.
 
 - `/ppo:doctor` reports readiness without mutation (Paseo connection, required
   operations, identity, self-inspect, role parentage, provider, workspace binding,
-  Lead–Supervisor binding, Peer parent binding, event capabilities).
+  Supervisor–Lead binding, Peer parent binding, event capabilities).
 - `/ppo:settings` owns concrete provider/model/thinking tuples and installs the
   `ppo-*` providers.
 - The Supervisor Notebook (`/ppo:notebook-init` + `supervisor_notebook_append`)

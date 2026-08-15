@@ -37,10 +37,11 @@ ordinary task prose.
 - **Supervisor:** observes and proposes. It may inspect evidence, request
   clarification, pause affected work, escalate, and draft protocol revisions.
   It does not route ordinary project work or direct Peers as a substitute Lead.
-  Observation is event-triggered: one bounded observation pass per Lead
-  milestone or low-frequency safety-net heartbeat, then idle; the six
-  Lead→Supervisor milestone kinds are a transport contract, not an observation
-  strategy.
+  Observation is passive and event-triggered: the Supervisor reads Paseo
+  evidence (agents, status, activity, workspaces) scoped to its bound Lead(s)
+  and performs one bounded observation pass per event or low-frequency
+  safety-net heartbeat, then idle. The Lead never sends the Supervisor
+  milestones.
   Recovery is gated: the Supervisor may propose a successor Lead with evidence
   and a bounded handoff, but creating one requires an explicit per-incident
   Human authorization; it never self-grants recovery. The Supervisor may write

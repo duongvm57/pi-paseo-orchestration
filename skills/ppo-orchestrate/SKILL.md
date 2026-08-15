@@ -27,9 +27,8 @@ A Lead receives the Human task directly as a root agent. A Supervisor is created
 
 ## Supervisor binding
 
-1. The Supervisor inspects itself and the bound Lead; both must be root agents.
-2. The Human announces the exact Supervisor agent ID to the Lead. The Supervisor may ask its bound Lead or relay a Human decision to that Lead only.
-3. The first Lead milestone to that Supervisor is the canonical binder: the runtime verifies role, root parentage, repository/workspace applicability, and task binding against live Paseo facts before accepting. Process memory is only a cache; restart recovery revalidates against Paseo facts.
+1. The Human creates a root Supervisor only when governance/observation is warranted, with an assignment naming the exact bound Lead agent ID(s), the Human task/task ID, the repository root, and the expected workspace binding. The Supervisor inspects itself and each bound Lead from live Paseo facts; both must be root agents and the binding must be repository-applicable.
+2. The Supervisor observes passively through Paseo (`list_agents`, `get_agent_status`, `get_agent_activity`, `list_workspaces`) scoped to its bound Lead(s). It may ask a bound Lead or relay a Human decision to that Lead only. There is no Lead→Supervisor milestone channel: the Lead never announces, binds, or reports to the Supervisor.
 
 ## Lead workflow
 
@@ -51,9 +50,9 @@ A Lead receives the Human task directly as a root agent. A Supervisor is created
 
 Do not poll agents. Do not expose the complete Workspace Protocol to a Peer. Do not sleep while waiting on a named Paseo notification: finish the bounded turn and return idle. Idle is not a project verdict. No continuous polling or monitoring daemon is introduced; a low-frequency heartbeat is only a safety net.
 
-## Observation through bounded events
+## Bounded communication
 
-The Lead sends only meaningful milestone events to its verified root Supervisor through `paseo_send_agent_prompt`, using the closed event envelope as the first nonempty message content: `LEAD_STARTED`, `PEER_BLOCKED`, `CANDIDATE_READY`, `REVIEW_COMPLETE`, `HUMAN_DECISION_REQUIRED`, `LEAD_FINISHED`. The runtime live-reconciles the recipient, sender, repository, kind, and event ID before allowing the MCP call; do not bypass it with CLI `paseo send`. Follow the Workspace Protocol's observation rhythm for what each event requires; the default is one bounded Supervisor observation pass, then idle. Event receipt is an attention signal and not acceptance; it carries no authority. When the Human supplied a root Pi observer callback contract, send that observer one terminal `LEAD_FINISHED` envelope only; nonterminal observer events and non-Pi observer targets fail closed.
+The Lead's only outbound event is the terminal `LEAD_FINISHED` envelope to a root Human observer (when the Human supplied a root Pi observer callback contract), sent through `paseo_send_agent_prompt` as the first nonempty message content. Nonterminal events and non-Pi observer targets fail closed. The runtime live-reconciles the recipient, sender, repository, kind, and event ID before allowing the MCP call; do not bypass it with CLI `paseo send`. There is no Lead→Supervisor milestone channel: the Supervisor observes passively through Paseo evidence, following the Workspace Protocol's observation rhythm (one bounded pass per event or safety-net heartbeat, then idle).
 
 A Peer communicates with its parent Lead only through the allowed kinds `question`, `blocked`, `dependency`, `progress`, and `handoff`, resolving the parent from the process `ParentAgentId`. A Supervisor may ask a bound Lead or relay a Human decision to that Lead; it never messages Peers or issues project acceptance. A Supervisor proposes a successor Lead only with evidence and a bounded handoff; the Human creates the root successor Lead, because agent-scoped `create_agent` cannot mint a root agent. The Supervisor relays the bounded handoff to that successor.
 
