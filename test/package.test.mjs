@@ -4077,3 +4077,45 @@ test("peer write_mode cannot change after the first input", async () => {
     await rm(env.profiles, { recursive: true, force: true });
   }
 });
+
+test("receivePeerLeadEnvelope rejects a sender that is not a child of the Lead", async () => {
+  const ext = await freshExtension();
+  const stranger = await fakePaseoBin({ rootAgent: true, provider: "pi", idEcho: true });
+  try {
+    const envelope = ext.buildEventEnvelope({
+      kind: "question", taskId: "task-1", senderAgentId: "stranger-1",
+      recipientAgentId: "lead-1", repoRoot: "/tmp/repo", payload: { text: "hi" },
+    });
+    assert.equal(envelope.ok, true);
+    const text = `${ext.EVENT_ENVELOPE_BEGIN}${JSON.stringify(envelope.envelope)}${ext.EVENT_ENVELOPE_END}`;
+    const received = await ext.receivePeerLeadEnvelope(text, {
+      leadAgentId: "lead-1", expectedProvider: "ppo-peer", env: { ...process.env, PATH: stranger }, repoRoot: "/tmp/repo",
+    });
+    assert.equal(received.ok, false);
+    assert.match(received.error, /not a Peer child|does not equal the current Lead|provider/);
+  } finally {
+    await rm(stranger, { recursive: true, force: true });
+  }
+});
+
+test("two bound Leads reconcile children against their own task tuples", async () => {
+  const ext = await freshExtension();
+  ext.bindExactPartner({ leadId: "lead-a", taskId: "task-A" });
+  ext.bindExactPartner({ leadId: "lead-b", taskId: "task-B" });
+  const matchScript = `#!/bin/sh\nif [ "$1" = "inspect" ]; then\n  printf '{"Id":"%s","Provider":"ppo-peer","Status":"running","Cwd":"/tmp/repo","ParentAgentId":"lead-a","Labels":{"pi-paseo-orchestration.task-key":"task-A"}}' "$2"\n  exit 0\nfi\nexit 1\n`;
+  const mismatchScript = `#!/bin/sh\nif [ "$1" = "inspect" ]; then\n  printf '{"Id":"%s","Provider":"ppo-peer","Status":"running","Cwd":"/tmp/repo","ParentAgentId":"lead-b","Labels":{"pi-paseo-orchestration.task-key":"task-A"}}' "$2"\n  exit 0\nfi\nexit 1\n`;
+  const matchBin = await mkdtemp(join(tmpdir(), "ppo-tuple-match-"));
+  const mismatchBin = await mkdtemp(join(tmpdir(), "ppo-tuple-mismatch-"));
+  await writeFile(join(matchBin, "paseo"), matchScript, { mode: 0o755 });
+  await writeFile(join(mismatchBin, "paseo"), mismatchScript, { mode: 0o755 });
+  try {
+    const ok = await ext.reconcileSupervisorObservation("peer-a", { supervisorId: "sup-1", env: { ...process.env, PATH: matchBin }, repoRoot: "/tmp/repo" });
+    assert.equal(ok.ok, true, ok.error);
+    const bad = await ext.reconcileSupervisorObservation("peer-b", { supervisorId: "sup-1", env: { ...process.env, PATH: mismatchBin }, repoRoot: "/tmp/repo" });
+    assert.equal(bad.ok, false);
+    assert.match(bad.error, /task/);
+  } finally {
+    await rm(matchBin, { recursive: true, force: true });
+    await rm(mismatchBin, { recursive: true, force: true });
+  }
+});

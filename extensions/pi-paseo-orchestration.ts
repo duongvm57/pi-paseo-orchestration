@@ -4562,6 +4562,7 @@ export async function verifyPartnerBinding(opts) {
     boundSupervisorId = claimedId.trim();
     boundTaskId = taskId.trim();
     if (typeof expectedWorkspaceId === "string" && expectedWorkspaceId.trim() !== "") boundWorkspaceId = expectedWorkspaceId.trim();
+    if (typeof selfId === "string" && selfId.trim() !== "") rememberBoundLead(selfId, taskId, expectedWorkspaceId);
   } else if (kind === "lead") {
     rememberBoundLead(claimedId.trim(), taskId, expectedWorkspaceId);
   } else {
@@ -4591,8 +4592,9 @@ export async function reconcileLeadEventRecipient(agentId, envelope, options) {
   if (recipient.provider === "ppo-supervisor") {
     if (boundSupervisorId === null) return { ok: false, error: "Lead milestone requires a Human-announced Supervisor binding" };
     if (boundSupervisorId !== agentId) return { ok: false, error: "event recipient does not match the bound Supervisor" };
-    if (boundTaskId !== null && envelope.task_id !== boundTaskId) {
-      return { ok: false, error: `event task ${envelope.task_id} does not match the bound Lead task ${boundTaskId}` };
+    const announcedTask = boundLeadBindings.get(leadAgentId)?.taskId ?? boundTaskId;
+    if (announcedTask !== null && envelope.task_id !== announcedTask) {
+      return { ok: false, error: `event task ${envelope.task_id} does not match the bound Lead task ${announcedTask}` };
     }
     return { ok: true, recipientKind: "supervisor", warnings: [] };
   }
@@ -4603,11 +4605,15 @@ export async function reconcileLeadEventRecipient(agentId, envelope, options) {
   return { ok: true, recipientKind: "observer" };
 }
 
-export function bindExactPartner({ supervisorId = null, leadId = null }) {
+export function bindExactPartner({ supervisorId = null, leadId = null, taskId = null, workspaceId = null }) {
   if (supervisorId !== null && (typeof supervisorId !== "string" || supervisorId.trim() === "")) return false;
   if (leadId !== null && (typeof leadId !== "string" || leadId.trim() === "")) return false;
-  if (supervisorId !== null) boundSupervisorId = supervisorId;
-  if (leadId !== null) rememberBoundLead(leadId);
+  if (supervisorId !== null) {
+    boundSupervisorId = supervisorId;
+    if (typeof taskId === "string" && taskId.trim() !== "") boundTaskId = taskId.trim();
+    if (typeof workspaceId === "string" && workspaceId.trim() !== "") boundWorkspaceId = workspaceId.trim();
+  }
+  if (leadId !== null) rememberBoundLead(leadId, taskId, workspaceId);
   return true;
 }
 
@@ -4672,6 +4678,14 @@ export async function reconcileSupervisorObservation(agentId, options) {
     if (root && cwd && cwd !== root && !cwd.startsWith(root + "/")) {
       return { ok: false, error: "observation target is outside the bound Lead repository" };
     }
+    const tuple = boundLeadBindings.get(obs.parent_agent_id);
+    const childTask = labelKeyOf(obs.labels, PPO_TASK_KEY);
+    if (tuple?.taskId && childTask && childTask !== tuple.taskId) {
+      return { ok: false, error: `observation target task ${childTask} does not match bound Lead ${obs.parent_agent_id} task ${tuple.taskId}` };
+    }
+    if (tuple?.workspaceId && obs.workspace_id && obs.workspace_id !== tuple.workspaceId) {
+      return { ok: false, error: `observation target workspace ${obs.workspace_id} does not match bound Lead ${obs.parent_agent_id} workspace ${tuple.workspaceId}` };
+    }
     return { ok: true, scope: "child" };
   }
   return { ok: false, error: `observation target ${id} is outside the bound Lead/project scope of Supervisor ${supervisorId}` };
@@ -4707,8 +4721,8 @@ export async function deliverPeerLeadMessage({ kind, taskId, payload, env = proc
   return { ok: true, envelope: built.envelope, recipientId: parentId, transport: "runtime_paseo_send" };
 }
 
-export function receivePeerLeadEnvelope(text, options) {
-  const { leadAgentId, env = process.env, repoRoot = null } = options ?? {};
+export async function receivePeerLeadEnvelope(text, options) {
+  const { leadAgentId, expectedProvider = "ppo-peer", env = process.env, repoRoot = null } = options ?? {};
   const parsed = parseEventEnvelopeText(text);
   if (!parsed.ok) return parsed;
   if (parsed.envelope === null) return { ok: true, envelope: null };
@@ -4716,6 +4730,14 @@ export function receivePeerLeadEnvelope(text, options) {
   if (!directed.ok) return directed;
   if (parsed.envelope.recipient_agent_id !== leadAgentId) {
     return { ok: false, error: "Peer event recipient does not match the current Lead" };
+  }
+  const sender = await observePaseoCurrentAgent(parsed.envelope.sender_agent_id, { env });
+  if (!sender.ok) return { ok: false, error: `Peer event sender inspection failed: ${sender.error}` };
+  const parent = sender.observation.parent_agent_id ?? null;
+  if (parent === null || parent === "") return { ok: false, error: `Peer event sender ${parsed.envelope.sender_agent_id} is not a Peer child of the current Lead` };
+  if (parent !== leadAgentId) return { ok: false, error: `Peer event sender parent ${parent} does not equal the current Lead ${leadAgentId}` };
+  if (typeof expectedProvider === "string" && expectedProvider !== "" && sender.observation.provider !== expectedProvider) {
+    return { ok: false, error: `Peer event sender provider ${sender.observation.provider} does not match the configured Peer provider ${expectedProvider}` };
   }
   if (eventDedupe(parsed.envelope.event_id)) return { ok: false, error: "duplicate event_id is ignored (idempotent)" };
   return { ok: true, envelope: parsed.envelope, senderId: parsed.envelope.sender_agent_id, env, repoRoot };
@@ -5278,7 +5300,7 @@ export default function (pi) {
       }
     }
     if (latch.role === "lead") {
-      const incoming = receivePeerLeadEnvelope(event.text ?? "", { leadAgentId: latch.agentId, env: envOf(ctx), repoRoot: protocolPin?.repoRoot ?? null });
+      const incoming = await receivePeerLeadEnvelope(event.text ?? "", { leadAgentId: latch.agentId, env: envOf(ctx), repoRoot: protocolPin?.repoRoot ?? null });
       if (incoming.ok !== true) {
         ctx.ui?.notify?.(`pi-paseo-orchestration: Peer event rejected (${"error" in incoming && typeof incoming.error === "string" ? incoming.error : "invalid envelope"})`, "error");
         return { action: "continue" };
