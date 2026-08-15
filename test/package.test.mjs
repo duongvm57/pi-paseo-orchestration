@@ -3974,7 +3974,7 @@ test("Doctor EVENT_CAPABILITIES checks outer MCP send_agent_prompt", async () =>
   }
 });
 
-test("create_agent write-mode is closed and Engineer-only write defaults to read-only", () => {
+test("create_agent write_mode is a closed prompt binding; labels stay task/assignment only", () => {
   const createPolicy = {
     role: "lead",
     allowed: ["mcp"],
@@ -3985,14 +3985,35 @@ test("create_agent write-mode is closed and Engineer-only write defaults to read
   };
   const blank = { title: "Bounded peer", provider: "ppo-peer/openai/gpt-5", settings: { thinkingOptionId: "off" }, initialPrompt: 'Use "model_route":"fast" and bind "parent_lead_agent_id":"agent-7".', notifyOnFinish: true };
   const call = (args) => extension.checkToolCall("mcp", { server: "paseo", tool: "paseo_create_agent", args }, createPolicy);
-  const WRITE = "pi-paseo-orchestration.write-mode";
-  assert.equal(call({ ...blank, labels: { [WRITE]: "write" } }), undefined);
-  assert.equal(call({ ...blank, labels: { [WRITE]: "read-only" } }), undefined);
-  assert.equal(call({ ...blank, labels: { [WRITE]: "admin" } }).block, true);
-  const peerRead = { role: "peer", allowed: ["read", "bash", "write", "edit"] };
-  assert.equal(extension.checkToolCall("write", { path: "src/x.go" }, peerRead).block, true);
-  assert.equal(extension.checkToolCall("bash", { command: "git commit -m x" }, peerRead).block, true);
-  assert.equal(extension.checkToolCall("write", { path: "src/x.go" }, { ...peerRead, writeMode: "write" }), undefined);
+  assert.equal(call({ ...blank }), undefined);
+  assert.equal(call({ ...blank, initialPrompt: blank.initialPrompt + ' "write_mode":"write"' }), undefined);
+  assert.equal(call({ ...blank, initialPrompt: blank.initialPrompt + ' "write_mode":"read-only"' }), undefined);
+  assert.equal(call({ ...blank, initialPrompt: blank.initialPrompt + ' "write_mode":"admin"' }).block, true);
+  assert.equal(call({ ...blank, labels: { "pi-paseo-orchestration.write-mode": "write" } }).block, true);
+});
+
+test("peer write_mode from the assignment brief unlocks write/edit after first input", async () => {
+  const ext = await freshExtension();
+  const env = await governedFixture(ext, { activeTools: ["read", "bash", "write", "edit"] });
+  try {
+    await env.fake.handlers.get("before_agent_start")(
+      { prompt: "hi", systemPrompt: "base", systemPromptOptions: { selectedTools: ["read", "bash", "write", "edit"] } },
+      env.fake.ctx,
+    );
+    assert.deepEqual(env.fake.holder.activeTools, ["read", "bash"]);
+    const blocked = await env.fake.handlers.get("tool_call")({ toolName: "write", input: { path: "src/x.go" } }, env.fake.ctx);
+    assert.equal(blocked.block, true);
+    const continued = await env.fake.handlers.get("input")({ text: 'Use "model_route":"fast" and bind "parent_lead_agent_id":"lead-7" with "write_mode":"write".' }, env.fake.ctx);
+    assert.deepEqual(continued, { action: "continue" });
+    assert.deepEqual(env.fake.holder.activeTools, ["read", "bash", "write", "edit"]);
+    const granted = await env.fake.handlers.get("tool_call")({ toolName: "write", input: { path: "src/x.go" } }, env.fake.ctx);
+    assert.equal(granted, undefined);
+    const commit = await env.fake.handlers.get("tool_call")({ toolName: "bash", input: { command: "git commit -m x" } }, env.fake.ctx);
+    assert.equal(commit, undefined);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+  }
 });
 
 test("Lead write/edit is protocol opt-in via allowsLeadTiny", () => {

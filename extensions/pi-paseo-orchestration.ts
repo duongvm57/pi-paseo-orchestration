@@ -139,7 +139,6 @@ export const AGENT_ENV = "PASEO_AGENT_ID";
 const COOPERATIVE_LABEL_PREFIX = "pi-paseo-orchestration.";
 const PPO_TASK_KEY = `${COOPERATIVE_LABEL_PREFIX}task-key`;
 const PPO_ASSIGNMENT_KEY = `${COOPERATIVE_LABEL_PREFIX}assignment-key`;
-const PPO_WRITE_MODE_KEY = `${COOPERATIVE_LABEL_PREFIX}write-mode`;
 
 // Closed role ceilings: Peer is read+Bash; Supervisor and Lead add the outer
 // mcp tool (whose inner targets are validated separately). write/edit are never
@@ -412,7 +411,7 @@ export async function activate({ env, dir, profileDir, models, setModel, setThin
     selectedModel: { provider: sel.provider, id: sel.model },
     selectedThinking: sel.thinking,
     selectedPeerRoute: selectedRoute,
-    writeMode: roleCheck.role === "peer" ? ((env.PI_PASEO_ORCHESTRATION_WRITE_MODE ?? "").trim() || "read-only") : null,
+    writeMode: roleCheck.role === "peer" ? (((env.PI_PASEO_ORCHESTRATION_WRITE_MODE ?? "").trim() === "write") ? "write" : "read-only") : null,
   };
   return { ok: true, latch };
 }
@@ -543,9 +542,10 @@ function createAgentPolicyPrompt(activeLatch) {
       "- Set `provider` and `settings` exactly from the chosen route.",
       "- Bind the route once in `initialPrompt` as \"model_route\":\"<route-id>\".",
       `- Bind this full Lead ID once in \`initialPrompt\` as \"parent_lead_agent_id\":\"${activeLatch.agentId}\".`,
+      "- Bind write mode once in `initialPrompt` as \"write_mode\":\"write\" for Engineer or \"write_mode\":\"read-only\" for Architect, Reviewer, and Scout.",
       "- Set a trimmed nonempty `title` (maximum 60 characters), a nonempty `initialPrompt`, and `notifyOnFinish: true`.",
       "- Let Paseo inherit workspace and parentage; the argument shape excludes `workspaceId`.",
-      "- Labels are optional. When present, use only `pi-paseo-orchestration.task-key`, `pi-paseo-orchestration.assignment-key`, and `pi-paseo-orchestration.write-mode` (`read-only` or `write`).",
+      "- Labels are optional. When present, use only `pi-paseo-orchestration.task-key` and `pi-paseo-orchestration.assignment-key`, each with a trimmed nonempty value.",
       "The call is ready when one route and one parent Lead are bound, route settings match, notification is enabled, and every supplied key matches this shape.",
       "",
       mcpContractPrompt("lead"),
@@ -599,6 +599,11 @@ function validateCreateAgentArgs(args, policy) {
     return block("Peer create_agent prompt must bind parent_lead_agent_id exactly once to the current Lead");
   }
   if (args.notifyOnFinish !== true) return block("create_agent must request the native finish notification");
+  const writeBindings = [...args.initialPrompt.matchAll(/\"write_mode\"\s*:\s*\"([^\"]*)\"/g)];
+  if (writeBindings.length > 1) return block("Peer create_agent prompt must bind write_mode at most once");
+  if (writeBindings.length === 1 && writeBindings[0][1] !== "read-only" && writeBindings[0][1] !== "write") {
+    return block("Peer create_agent write_mode must be exactly read-only or write");
+  }
   // Optional cooperative correlation labels. Omitted labels stay valid for
   // legacy/no-label calls. When supplied, labels must be an object closed to
   // exactly the two namespaced correlation keys; each present value must be a
@@ -607,19 +612,16 @@ function validateCreateAgentArgs(args, policy) {
   // Labels are correlation metadata, never authentication; workspaceId is never
   // accepted here so inherited parentage/workspace placement is preserved.
   if (args.labels !== undefined) {
-    const allowedLabels = new Set([PPO_TASK_KEY, PPO_ASSIGNMENT_KEY, PPO_WRITE_MODE_KEY]);
+    const allowedLabels = new Set([PPO_TASK_KEY, PPO_ASSIGNMENT_KEY]);
     if (!isRecord(args.labels) || Object.keys(args.labels).length === 0) {
       return block("create_agent labels, when supplied, must be a nonempty closed object of namespaced correlation keys");
     }
     for (const [key, val] of Object.entries(args.labels)) {
       if (!allowedLabels.has(key)) {
-        return block(`create_agent labels key ${JSON.stringify(key)} is not an allowed namespaced correlation key; labels are closed to ${PPO_TASK_KEY}, ${PPO_ASSIGNMENT_KEY}, and ${PPO_WRITE_MODE_KEY}`);
+        return block(`create_agent labels key ${JSON.stringify(key)} is not an allowed namespaced correlation key; labels are closed to ${PPO_TASK_KEY} and ${PPO_ASSIGNMENT_KEY}`);
       }
       if (typeof val !== "string" || val.trim() === "" || val !== val.trim()) {
         return block(`create_agent labels value for ${JSON.stringify(key)} must be a trimmed nonempty string`);
-      }
-      if (key === PPO_WRITE_MODE_KEY && val !== "read-only" && val !== "write") {
-        return block(`${PPO_WRITE_MODE_KEY} must be exactly read-only or write`);
       }
     }
   }
@@ -5177,7 +5179,32 @@ export default function (pi) {
       ctx.ui?.notify?.(`pi-paseo-orchestration: local acceptance blocked (${acceptance.error})`, "error");
       return { action: "handled" };
     }
-
+    if (latch.role === "peer") {
+      const bindings = [...String(event.text ?? "").matchAll(/\"write_mode\"\s*:\s*\"([^\"]*)\"/g)];
+      if (bindings.length > 1) {
+        blockWith(ctx, "Peer assignment brief must bind write_mode at most once");
+        reportBlockedInput(pi, blockedReason);
+        return { action: "handled" };
+      }
+      if (bindings.length === 1) {
+        const mode = bindings[0][1];
+        if (mode !== "read-only" && mode !== "write") {
+          blockWith(ctx, "Peer assignment write_mode must be exactly read-only or write");
+          reportBlockedInput(pi, blockedReason);
+          return { action: "handled" };
+        }
+        if (latch.writeMode !== mode) {
+          latch = { ...latch, writeMode: mode };
+          lastAppliedTools = null;
+          const tools = await ensureToolPolicy(pi);
+          if (tools.ok !== true) {
+            blockWith(ctx, "error" in tools && typeof tools.error === "string" ? tools.error : "active tools are not observable");
+            reportBlockedInput(pi, blockedReason);
+            return { action: "handled" };
+          }
+        }
+      }
+    }
 
     return { action: "continue" };
 
