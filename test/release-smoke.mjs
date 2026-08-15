@@ -275,6 +275,7 @@ async function main() {
       find: (provider, id) => MODEL_REGISTRY.find((m) => m.provider === provider && m.id === id),
       complete: () => { throw new Error("settings must never invoke a model"); },
     },
+    observeParentAgentId: async () => null,
   };
 
   // ── settings command write, then exact application at activation ──

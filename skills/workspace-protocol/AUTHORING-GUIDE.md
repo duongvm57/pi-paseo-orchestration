@@ -27,7 +27,6 @@ Preserve this precedence:
 ```text
 Role Profile
   > Workspace Protocol
-  > current-run Task Authority Envelope
   > ordinary task prose
 ```
 
@@ -92,7 +91,7 @@ Define revision authority, Human confirmation, versioning, review triggers, and 
 ```
 <!-- canonical-protocol-skeleton:end -->
 
-The only optional H2 headings are `Project criticality`, `Review and council rules` (or `Review and council`), `Anti-patterns`, and `Supervisor hints`. Omit an optional section when it does not change repository behavior. Do not create other headings.
+The only optional H2 headings are `Project criticality`, `Review and council rules` (or `Review and council`), `Anti-patterns`, `Supervisor hints`, and `Model and effort routing`. Omit an optional section when it does not change repository behavior. Do not create other headings.
 
 ### 3.1 Identity and applicability
 
@@ -188,10 +187,12 @@ Use Git history as the change record. Do not create a parallel protocol changelo
 
 ## 4. Content to leave out
 
+Record model and effort selection principles when they change routing. Keep concrete provider, model, and thinking tuples in Human-owned role settings.
+
 Keep these outside the protocol:
 
 - complete global role behavior already owned by Role Profiles;
-- model IDs or thinking settings;
+- concrete provider/model/thinking tuples;
 - task-specific file lists;
 - secrets or credentials;
 - instructions requiring a Peer to understand Paseo topology;

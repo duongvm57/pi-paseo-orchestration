@@ -12,9 +12,9 @@ _Avoid_: Agent type, disposition
 A repository-specific orchestration contract interpreted by the Lead. Here, workspace means the project's operating context, not a Git worktree.
 _Avoid_: Global role prompt, task brief
 
-**Task Authority Envelope**:
-A current-run, machine-readable, role-specific grant that bounds one task capability and expires before the next run unless restated. It is not role identity or authentication.
-_Avoid_: Task prose, permanent permission, role identity
+**Assignment**:
+The exact Lead-issued bounded outcome for one Peer run. It is a workflow fact, not a capability credential or authentication.
+_Avoid_: Task prose as authority, permanent permission, role identity
 
 **Peer Report**:
 A versioned, evidence-bearing terminal handoff from one Peer run to its exact parent Lead. It is neither proof of delivery or acceptance nor a source of authority.
@@ -24,12 +24,12 @@ _Avoid_: Status message, mailbox event, authority grant
 A Human-owned, project-scoped, append-only store of causal governance evidence written by Supervisors. It is historical evidence, not authority, task or lifecycle state, acceptance, or a communication/control plane.
 _Avoid_: Task ledger, mailbox, lifecycle store
 
-**Authority Grant**:
-A Human-approved, bounded permission for one task run, such as editing within a scope, making one local commit, or recovering a Lead.
+**Human-only boundary**:
+A decision or effect reserved for the Human: publication, protocol mutation, secrets/material cost, irreversible trade-offs, and Local Acceptance.
 _Avoid_: Role identity, unrestricted control
 
 **Capability**:
-One concrete action permitted by an Authority Grant, such as `edit` or `local_commit`.
+One concrete action exposed to a run, such as `edit` or `local_commit`. Ordinary local reversible work comes from the initial Human task or an Engineer write-mode assignment.
 _Avoid_: General trust, sandbox guarantee
 
 **Policy Guardrail**:

@@ -1,6 +1,6 @@
 {
   "name": "pi-paseo-orchestration",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Governed Supervisor-Lead-Peer orchestration for Pi and Paseo.",
   "type": "module",
   "keywords": [
@@ -23,7 +23,8 @@
     "profiles/*.md",
     "skills/ppo-orchestrate/SKILL.md",
     "skills/workspace-protocol/SKILL.md",
-    "skills/workspace-protocol/AUTHORING-GUIDE.md"
+    "skills/workspace-protocol/AUTHORING-GUIDE.md",
+    "docs/architecture.md"
   ],
   "publishConfig": {
     "access": "public"
