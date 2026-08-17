@@ -664,6 +664,25 @@ test("intersectTools: baseline ∩ role ceiling, mcp_script never included", () 
   assert.deepEqual(extension.intersectTools(["read", "bash", "mcp"], "peer"), ["read", "bash"]);
 });
 
+test("wiring: an active Peer keeps the parent-message tool available to the model", async () => {
+  const ext = await freshExtension();
+  const env = await governedFixture(ext, {
+    role: "peer",
+    activeTools: ["read", "bash", extension.PEER_LEAD_MESSAGE_TOOL],
+  });
+  try {
+    const before = await env.fake.handlers.get("before_agent_start")(
+      { prompt: "inspect and report", systemPrompt: "base", systemPromptOptions: { selectedTools: ["read", "bash", extension.PEER_LEAD_MESSAGE_TOOL] } },
+      env.fake.ctx,
+    );
+    assert.deepEqual(env.fake.holder.activeTools, ["read", "bash", extension.PEER_LEAD_MESSAGE_TOOL]);
+    assert.match(before.systemPrompt, /terminal Peer Report is delivered automatically to that parent Lead/);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+  }
+});
+
 test("checkToolCall: closed per-role gates, outer MCP validation, git publication routes", () => {
   const peerPolicy = { role: "peer", allowed: ["read", "bash"] };
   const leadPolicy = { role: "lead", allowed: ["read", "bash", "mcp"] };
@@ -2007,18 +2026,30 @@ test("createInspectionLimit: at most one bounded inspection; evidence resets; ex
   assert.throws(() => createInspectionLimit("1"), /positive integer/);
 });
 
-test("wiring: peer agent_end accepts only a correlated terminal Peer Report", async () => {
+test("wiring: peer agent_end delivers one correlated terminal Peer Report to its parent Lead", async () => {
   const ext = await freshExtension();
   const env = await governedFixture(ext, { role: "peer", activeTools: ["read", "bash"] });
+  const bin = await mkdtemp(join(tmpdir(), "ppo-peer-terminal-send-"));
+  const log = join(bin, "sent.log");
+  await writeFile(join(bin, "paseo"), `#!/bin/sh\nprintf '%s\n' "$*" >> "${log}"; exit 0\n`, { mode: 0o755 });
+  env.fake.ctx.env.PATH = `${bin}:${env.fake.ctx.env.PATH ?? ""}`;
   try {
-    const report = progressReport();
-    await env.fake.handlers.get("agent_end")({ messages: [{ role: "assistant", content: reportText(report) }] }, { ...env.fake.ctx, peerReportContext: { peerId: "peer-1", parentId: "lead-7", taskId: "task-42", assignmentId: "a-1" } });
+    const report = handoffReport({ peer_agent_id: "agent-7" });
+    const context = { ...env.fake.ctx, peerReportContext: { peerId: "agent-7", parentId: "lead-7", taskId: "task-42", assignmentId: "a-1" } };
+    await env.fake.handlers.get("agent_end")({ messages: [{ role: "assistant", content: reportText(report) }] }, context);
     assert.deepEqual(ext.getPeerReport(), report);
+    const delivered = await readFile(log, "utf8").catch(() => "");
+    assert.match(delivered, /^send lead-7 --prompt /);
+    assert.match(delivered, /"kind":"handoff"/);
+    assert.match(delivered, /"report_id":"report-1"/);
+
     await env.fake.handlers.get("agent_end")({ messages: [{ role: "assistant", content: reportText({ ...report, peer_agent_id: "wrong-peer" }) }] }, { ...env.fake.ctx, peerReportContext: { peerId: "peer-1", parentId: "lead-7", taskId: "task-42", assignmentId: "a-1" } });
     assert.equal(ext.getPeerReport(), null);
+    assert.equal(await readFile(log, "utf8"), delivered, "a rejected report must not be delivered");
   } finally {
     await rm(env.dir, { recursive: true, force: true });
     await rm(env.profiles, { recursive: true, force: true });
+    await rm(bin, { recursive: true, force: true });
   }
 });
 

@@ -267,9 +267,10 @@ agent management and no Paseo; never self-expand scope; challenge the premise wi
 evidence; verify its own writes but never self-accept a difficult change.
 
 **Thin profile.** The profile carries only role invariants; disposition and
-method arrive in the assignment. Communication is only to the parent Lead through
-narrow kinds (`question`, `blocked`, `dependency`, `progress`, plus a terminal
-`handoff` report).
+method arrive in the assignment. Communication is only to the parent Lead:
+`peer_lead_message` exposes narrow mid-run kinds (`question`, `blocked`,
+`dependency`, `progress`), while the runtime delivers a valid correlated terminal
+report automatically.
 
 ---
 
@@ -396,7 +397,9 @@ prefixes stay blocked.
 A Peer's terminal response is a closed, versioned JSON envelope —
 `PROGRESS`, `HANDOFF`, `REOPEN_REQUEST`, `DEPENDENCY_REQUEST`, or `BLOCKED` — with
 exact peer/parent/task/assignment IDs and a kind-specific payload. It is validated
-as a document only: it grants no authority and accepts nothing.
+against the active Peer and parent identities, then delivered to the exact parent
+Lead through a bounded Peer→Lead event. Delivery failure is explicit; neither the
+report nor delivery grants authority or accepts anything.
 
 ### 7.6 Stable Candidate
 

@@ -139,16 +139,18 @@ export const AGENT_ENV = "PASEO_AGENT_ID";
 const COOPERATIVE_LABEL_PREFIX = "pi-paseo-orchestration.";
 const PPO_TASK_KEY = `${COOPERATIVE_LABEL_PREFIX}task-key`;
 const PPO_ASSIGNMENT_KEY = `${COOPERATIVE_LABEL_PREFIX}assignment-key`;
+export const PEER_LEAD_MESSAGE_TOOL = "peer_lead_message";
+export const PEER_LEAD_MESSAGE_KINDS = new Set(["question", "blocked", "dependency", "progress"]);
 
-// Closed role ceilings: Peer is read+Bash. The peer_lead_message custom tool
-// performs the parent-scoped send through the runtime, not via a Peer MCP
-// target. Supervisor and Lead add the outer mcp tool. write/edit are never in
-// a ceiling — they are granted only when a Lead protocol opts into self-work
-// or a Peer assignment binds write_mode write. mcp_script is in no ceiling.
+// Closed role ceilings: Peer is read+Bash plus its parent-scoped message tool.
+// The custom tool performs the send through the runtime, not via a Peer MCP
+// target. Supervisor and Lead add the outer mcp tool. write/edit are never in a
+// ceiling — they are granted only when a Lead protocol opts into self-work or a
+// Peer assignment binds write_mode write. mcp_script is in no ceiling.
 export const CEILINGS = {
   supervisor: ["read", "bash", "mcp"],
   lead: ["read", "bash", "mcp"],
-  peer: ["read", "bash"],
+  peer: ["read", "bash", PEER_LEAD_MESSAGE_TOOL],
 };
 
 // Validated outer-MCP inner targets. Lead lifecycle calls are restricted to
@@ -162,9 +164,6 @@ export const MCP_TARGETS = {
   lead: { paseo: new Set(["list_workspaces", "list_providers", "list_agents", "create_agent", "send_agent_prompt", "get_agent_status", "get_agent_activity", "cancel_agent", "archive_agent"]) },
   peer: {},
 };
-
-export const PEER_LEAD_MESSAGE_TOOL = "peer_lead_message";
-export const PEER_LEAD_MESSAGE_KINDS = new Set(["question", "blocked", "dependency", "progress"]);
 
 // MCP operation normalization: one explicit alias map canonicalizes
 // adapter-prefixed operation names to canonical form. Server identity must be
@@ -685,7 +684,7 @@ function createAgentPolicyPrompt(activeLatch) {
   }
   return [
     "Message your parent Lead through the peer_lead_message tool using kinds question, blocked, dependency, or progress.",
-    "End the run with the assignment's terminal Peer Report contract.",
+    "End the run with the assignment's terminal Peer Report contract; a valid correlated terminal Peer Report is delivered automatically to that parent Lead.",
   ].join(" ");
 }
 
@@ -1111,6 +1110,13 @@ async function gitChangedPaths(repoRoot) {
 export const REPORT_BEGIN = '<pi-paseo-orchestration report="v1">';
 export const REPORT_END = "</pi-paseo-orchestration>";
 export const REPORT_KINDS = ["PROGRESS", "HANDOFF", "REOPEN_REQUEST", "DEPENDENCY_REQUEST", "BLOCKED"];
+const REPORT_MESSAGE_KIND = {
+  PROGRESS: "progress",
+  HANDOFF: "handoff",
+  REOPEN_REQUEST: "question",
+  DEPENDENCY_REQUEST: "dependency",
+  BLOCKED: "blocked",
+};
 
 // Closed common block: report version/kind, Peer agent ID, exact parent Lead
 // agent ID, task/assignment IDs, nonempty summary + evidence, typed payload
@@ -5506,7 +5512,24 @@ export default function (pi) {
         return undefined;
       }
     }
+    if (parsed.report.peer_agent_id !== latch.agentId || parsed.report.parent_lead_agent_id !== inspectionParentAgentId) {
+      lastPeerReport = null;
+      ctx.ui?.notify?.("pi-paseo-orchestration: Peer report rejected (report identities do not match the active Peer and its parent Lead)", "error");
+      return undefined;
+    }
     lastPeerReport = parsed.report;
+    const delivered = await deliverPeerLeadMessage({
+      kind: REPORT_MESSAGE_KIND[parsed.report.kind],
+      taskId: parsed.report.task_id,
+      payload: { report: parsed.report },
+      env: envOf(ctx),
+      repoRoot: typeof ctx?.cwd === "string" && ctx.cwd !== "" ? ctx.cwd : process.cwd(),
+    });
+    if (!delivered.ok) {
+      ctx.ui?.notify?.(`pi-paseo-orchestration: terminal Peer Report was valid but delivery to the parent Lead failed (${delivered.error})`, "error");
+      return undefined;
+    }
+    ctx.ui?.notify?.(`pi-paseo-orchestration: terminal Peer Report delivered to parent Lead ${delivered.recipientId}`, "info");
     return undefined;
   });
 
