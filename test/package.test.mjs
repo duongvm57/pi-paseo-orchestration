@@ -1129,6 +1129,30 @@ test("checkToolCall: git global-flag forms and deploy routes are blocked", () =>
   }
 });
 
+test("checkToolCall: shell policy distinguishes effectful commands from prose and read-only inspection", () => {
+  const peerPolicy = { role: "peer", allowed: ["read", "bash"] };
+  const leadPolicy = { role: "lead", allowed: ["read", "bash", "mcp"] };
+
+  assert.equal(extension.checkToolCall("bash", { command: "echo paseo" }, peerPolicy), undefined);
+  assert.equal(extension.checkToolCall("bash", { command: "rg TODO /tmp/pi-paseo-orchestration" }, peerPolicy), undefined);
+  assert.equal(extension.checkToolCall("bash", { command: "git merge-base HEAD origin/main" }, leadPolicy), undefined);
+  assert.equal(extension.checkToolCall("bash", { command: "gh pr view 123" }, leadPolicy), undefined);
+  assert.equal(extension.checkToolCall("bash", { command: "echo git push" }, leadPolicy), undefined);
+  assert.equal(extension.checkToolCall("bash", { command: 'echo "safe; git push"' }, leadPolicy), undefined);
+  assert.equal(extension.checkToolCall("bash", { command: "printf 'paseo; git push'" }, peerPolicy), undefined);
+  assert.equal(extension.checkToolCall("bash", { command: "echo .orchestration/workspace-protocol.md" }, peerPolicy), undefined);
+
+  for (const cmd of [
+    "paseo inspect peer-1 --json",
+    "git push origin main",
+    "git -C /repo push origin main",
+    "git merge feature",
+    "gh pr create --fill",
+  ]) {
+    assert.equal(extension.checkToolCall("bash", { command: cmd }, peerPolicy).block, true, `must block: ${cmd}`);
+  }
+});
+
 test("wiring: missing read or outer mcp baseline blocks a governed lead", async () => {
   const ext = await freshExtension();
   const profiles = await profileDirFixture();
@@ -1621,7 +1645,7 @@ test("wiring: protocol project identity mismatch blocks permanently with the exa
   }
 });
 
-test("wiring: a lead without a valid protocol pin is blocked at input and before_agent_start", async () => {
+test("wiring: a lead without a protocol stays in core mode while malformed protocol still blocks", async () => {
   const previous = process.cwd();
   const bare = await gitRepoFixture({ withProtocol: false });
   process.chdir(bare.dir);
@@ -1630,15 +1654,15 @@ test("wiring: a lead without a valid protocol pin is blocked at input and before
   try {
     assert.equal(ext.getProtocolPin(), null);
     const input = await inputText(env.fake, "hi");
-    assert.deepEqual(input, { action: "handled" });
-    assert.equal(env.fake.notifications.some(([msg]) => /protocol file is missing/.test(msg)), true);
+    assert.deepEqual(input, { action: "continue" });
+    assert.equal(env.fake.notifications.some(([msg]) => /protocol file is missing/.test(msg)), false);
     const before = await env.fake.handlers.get("before_agent_start")(
       { prompt: "hi", systemPrompt: "base", systemPromptOptions: { selectedTools: ["read", "bash", "mcp"] } },
       env.fake.ctx,
     );
-    assert.equal(before, undefined);
+    assert.match(before.systemPrompt, /role="lead"/);
     const call = await env.fake.handlers.get("tool_call")({ toolName: "read", input: {} }, env.fake.ctx);
-    assert.equal(call.block, true);
+    assert.equal(call, undefined);
   } finally {
     await rm(env.dir, { recursive: true, force: true });
     await rm(env.profiles, { recursive: true, force: true });
@@ -1660,6 +1684,47 @@ test("wiring: a lead without a valid protocol pin is blocked at input and before
     await rm(env2.dir, { recursive: true, force: true });
     await rm(env2.profiles, { recursive: true, force: true });
     await rm(malformed.dir, { recursive: true, force: true });
+    process.chdir(previous);
+  }
+});
+
+test("wiring: a lead without a protocol can use core mode but cannot self-write", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ppo-core-no-protocol-"));
+  const previous = process.cwd();
+  process.chdir(dir);
+  const ext = await freshExtension();
+  const env = await governedFixture(ext, { role: "lead", activeTools: ["read", "bash", "mcp"] });
+  try {
+    assert.deepEqual(await inputText(env.fake, "inspect the repository"), { action: "continue" });
+    const write = await env.fake.handlers.get("tool_call")({ toolName: "write", input: { path: "README.md" } }, env.fake.ctx);
+    assert.equal(write.block, true, "missing protocol must not grant Lead self-write");
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true });
+    process.chdir(previous);
+  }
+});
+
+test("wiring: a lead in a non-git directory pins the protocol at its own root and is not blocked", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ppo-gitless-"));
+  await mkdir(join(dir, ".orchestration"), { recursive: true });
+  await writeFile(protocolPath(dir), validProtocol, "utf8");
+  const previous = process.cwd();
+  process.chdir(dir);
+  const ext = await freshExtension();
+  const env = await governedFixture(ext, { role: "lead", activeTools: ["read", "bash", "mcp"] });
+  try {
+    const pin = ext.getProtocolPin();
+    assert.notEqual(pin, null, "lead must pin without a git repository");
+    assert.equal(pin.repoRoot, await realpath(dir));
+    const input = await inputText(env.fake, "hi");
+    assert.deepEqual(input, { action: "continue" }, "lead input must not be blocked in a non-git directory");
+    assert.equal(env.fake.notifications.some(([msg]) => /pi-paseo-orchestration blocked/.test(msg)), false);
+  } finally {
+    await rm(env.dir, { recursive: true, force: true });
+    await rm(env.profiles, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true });
     process.chdir(previous);
   }
 });
@@ -3334,7 +3399,7 @@ test("Doctor: paseo CLI observer proves identity/model/thinking; attestation sta
     const ext = await freshExtension();
     const fake = fakePi({
       activeTools: ["read", "bash", "mcp"],
-      env: { PI_CODING_AGENT_DIR: config, PI_PASEO_ORCHESTRATION_ROLE: "supervisor", PASEO_AGENT_ID: "agent-42", PI_PASEO_ORCHESTRATION_PROFILES_DIR: profiles, PATH: bin },
+      env: { PI_CODING_AGENT_DIR: config, PI_PASEO_ORCHESTRATION_ROLE: "lead", PASEO_AGENT_ID: "agent-42", PI_PASEO_ORCHESTRATION_PROFILES_DIR: profiles, PATH: bin },
     });
     fake.ctx.cwd = repo.dir;
     ext.default(fake.pi);
@@ -3349,11 +3414,9 @@ test("Doctor: paseo CLI observer proves identity/model/thinking; attestation sta
     const attestation = report.checks.find((check) => check.code === "OBSERVER_ATTESTATION");
     assert.equal(attestation.status, "WARN");
     assert.match(attestation.observed, /workspace_binding, mcp_configuration_attestation/);
-    // v0.2: governed Supervisor work fails closed (BLOCKED) when mandatory live
-    // evidence (attested workspace binding, root parentage) is absent; the CLI
-    // observer proves identity/model/thinking but an unattested binding is an
-    // explicit environment ceiling, never a readiness claim.
-    assert.equal(report.overall_status, "BLOCKED", "governed Supervisor with unattested binding fails closed (environment ceiling)");
+    const workspace = report.checks.find((check) => check.code === "WORKSPACE_BINDING");
+    assert.equal(workspace.status, "WARN");
+    assert.notEqual(workspace.status, "BLOCKED", "unattested optional binding must not become a hard blocker");
     assert.equal(extension.parseDoctorReport(extension.formatDoctorReport(report)).ok, true);
   } finally {
     await rm(bin, { recursive: true, force: true });

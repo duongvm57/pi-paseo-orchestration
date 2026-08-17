@@ -1,6 +1,6 @@
 # Workspace Protocol Authoring Guide
 
-This guide defines the reference model used when authoring a repository's Workspace Protocol. The protocol is repository-specific orchestration policy: it decides how work is routed, owned, verified, reviewed, escalated, and accepted without replacing Paseo's lifecycle or workspace state.
+This guide defines the reference model used when authoring a repository's Workspace Protocol. The protocol is optional for core inspection and read-only coordination. When present, it is repository-specific orchestration policy: it decides how work is routed, owned, verified, reviewed, escalated, and accepted without replacing Paseo's lifecycle or workspace state.
 
 ## 1. Protocol boundary
 
@@ -34,7 +34,7 @@ A lower layer may narrow an upper layer but cannot widen it. Omission grants not
 
 ## 2. Readers and decision authority
 
-The Lead reads the protocol before routing governed work. A Supervisor reads it only under an authoring, audit, or revision mandate. A Peer receives only the constraints needed for its assignment; do not broadcast the complete protocol.
+The Lead reads the protocol before using protocol-derived routing or self-write. A Supervisor reads it only under an authoring, audit, or revision mandate. A Peer receives only the constraints needed for its assignment; do not broadcast the complete protocol.
 
 Use repository-specific allocations within these decision boundaries:
 
@@ -79,7 +79,7 @@ Define one-writer scope, isolated checkouts, dependencies, handback, and integra
 
 ## Candidate, verification, review, and acceptance
 
-For every class, define the Git Stable Candidate, exact evidence, review trigger, Lead verdict, and prerequisites for direct Human Local Acceptance.
+For every class that produces an accepted artifact, define the Git Stable Candidate, exact evidence, review trigger, Lead verdict, and prerequisites for direct Human Local Acceptance. For inspect-only/core work, state the evidence and verdict without inventing a Git prerequisite.
 
 ## Reopen, dependency, and blocked handling
 
@@ -217,13 +217,13 @@ Lead or one Engineer
   -> direct Human Local Acceptance when prerequisites pass
 ```
 
-Permit Lead self-work only when it is tightly coupled, explicitly allowed by the protocol, and covered by current-run Human authority. Do not require a council by default.
+Permit Lead self-work only when it is tightly coupled, explicitly allowed by the protocol, and covered by current-run Human authority. Treat a worktree as an option for concurrent writers: the Lead proposes it and the Human chooses or confirms it; serialize a moving scope when no isolation is needed. Do not require a council by default.
 
 ### 5.2 Cross-module or lifecycle-sensitive
 
 ```text
 Lead
-  -> one Engineer in an isolated checkout
+  -> one Engineer in a Human-approved isolated checkout when needed
   -> Git Stable Candidate
   -> independent Reviewer when risk triggers it
   -> Lead verdict

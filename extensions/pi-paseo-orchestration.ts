@@ -209,15 +209,144 @@ const PASEO_CHILD_TOOLS = new Set(["send_agent_prompt", "get_agent_status", "get
 const PROTOCOL_READ_TOOLS = ["read", "grep", "ls", "find"];
 
 // Cooperative, recognizable-only command detection. Not a sandbox: aliases,
-// scripts, and child programs can bypass it. Local reversible commit is
-// allowed for implementation roles by the exact assignment; only amend,
-// push, and merge stay blocked.
-const GIT_AMEND = /\bgit\b[^\n;&|]*\bcommit\b[^\n;&|]*--amend\b/;
-const PUBLICATION = [
-  /\bgit\b[^\n;&|]*\b(?:push|merge)\b/, // push/merge never allowed
-  /\bgh\s+pr\b/,
-  /\b(?:vercel|netlify|flyctl?|railway|supabase|render|amplify)\s+deploy\b/,
-];
+// scripts, and child programs can bypass it. Parse command segments first so
+// prose (`echo git push`) and read-only Git inspection (`git merge-base`) do not
+// look like effectful routes. Local reversible commit is allowed for
+// implementation roles by the exact assignment; only amend, push, and merge
+// stay blocked.
+const SHELL_TOKEN = /(?:"(?:[^"\\]|\\.)*"|'[^']*'|[^\s"';&|]+)/g;
+const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
+const GIT_GLOBAL_OPTIONS_WITH_VALUE = new Set(["-C", "--git-dir", "--work-tree", "-c", "--config-env"]);
+const GH_PR_READ_ACTIONS = new Set(["view", "list", "status", "checks", "diff"]);
+const DEPLOY_COMMANDS = new Set(["vercel", "netlify", "fly", "flyctl", "railway", "supabase", "render", "amplify"]);
+const INERT_SHELL_COMMANDS = new Set(["echo", "printf", "true", "false", ":"]);
+const PROTOCOL_PATH_TOKEN = /(?:^|[\\/=\s])\.orchestration(?:[\\/]|$)|(?:^|[\\/=\s])workspace-protocol\.md(?:$|[\\/])/;
+
+function shellWords(segment) {
+  return String(segment).match(SHELL_TOKEN)?.map((token) => {
+    if ((token.startsWith("\"") && token.endsWith("\"")) || (token.startsWith("'") && token.endsWith("'"))) {
+      return token.slice(1, -1);
+    }
+    return token;
+  }) ?? [];
+}
+
+function shellSegments(command) {
+  const segments = [];
+  let segment = "";
+  let quote = null;
+  let escaped = false;
+  const flush = () => {
+    const words = shellWords(segment);
+    if (words.length > 0) segments.push(words);
+    segment = "";
+  };
+  for (const char of String(command)) {
+    if (quote !== null) {
+      segment += char;
+      if (char === quote) quote = null;
+      continue;
+    }
+    if (escaped) {
+      segment += char;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      segment += char;
+      escaped = true;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      segment += char;
+      continue;
+    }
+    if (char === ";" || char === "&" || char === "|" || char === "\n") {
+      flush();
+      continue;
+    }
+    segment += char;
+  }
+  flush();
+  return segments;
+}
+
+function executableIndex(words) {
+  let index = 0;
+  while (index < words.length && ENV_ASSIGNMENT.test(words[index])) index += 1;
+  if (words[index] === "env") {
+    index += 1;
+    while (index < words.length && (ENV_ASSIGNMENT.test(words[index]) || words[index].startsWith("-"))) index += 1;
+  }
+  if (words[index] === "sudo" || words[index] === "command") index += 1;
+  return index;
+}
+
+function executableName(words) {
+  const index = executableIndex(words);
+  const value = words[index] ?? "";
+  return { index, name: value.replace(/^.*[\\/]/, "").replace(/\.exe$/i, "") };
+}
+
+function gitInvocation(words) {
+  const executable = executableName(words);
+  if (executable.name !== "git") return null;
+  let index = executable.index + 1;
+  while (index < words.length && words[index].startsWith("-")) {
+    index += GIT_GLOBAL_OPTIONS_WITH_VALUE.has(words[index]) ? 2 : 1;
+  }
+  return { index: executable.index, subcommandIndex: index, subcommand: words[index] ?? "", words };
+}
+
+function hasPaseoCliInvocation(command) {
+  return shellSegments(command).some((words) => executableName(words).name === "paseo");
+}
+
+function hasGitSubcommand(command, subcommand) {
+  return shellSegments(command).some((words) => gitInvocation(words)?.subcommand === subcommand);
+}
+
+function hasGitCommitAmend(command) {
+  return shellSegments(command).some((words) => {
+    const git = gitInvocation(words);
+    return git?.subcommand === "commit" && words.slice(git.subcommandIndex + 1).includes("--amend");
+  });
+}
+
+function hasGhPrPublication(command) {
+  return shellSegments(command).some((words) => {
+    const executable = executableName(words);
+    if (executable.name !== "gh" || words[executable.index + 1] !== "pr") return false;
+    const action = words[executable.index + 2];
+    return action !== undefined && !GH_PR_READ_ACTIONS.has(action);
+  });
+}
+
+function hasDeployCommand(command) {
+  return shellSegments(command).some((words) => {
+    const executable = executableName(words);
+    return DEPLOY_COMMANDS.has(executable.name) && words[executable.index + 1] === "deploy";
+  });
+}
+
+function hasProtocolPathReference(command) {
+  return shellSegments(command).some((words) => {
+    const executable = executableName(words);
+    const args = words.slice(executable.index + 1);
+    const hasPath = [words[executable.index] ?? "", ...args].some((arg) => PROTOCOL_PATH_TOKEN.test(arg));
+    if (!hasPath) return false;
+    const hasSubstitution = words.some((word) => word.includes("$(") || word.includes("`"));
+    return !INERT_SHELL_COMMANDS.has(executable.name) || hasSubstitution;
+  });
+}
+
+function hasPublicationRoute(command) {
+  return hasGitSubcommand(command, "push")
+    || hasGitSubcommand(command, "merge")
+    || hasGhPrPublication(command)
+    || hasDeployCommand(command);
+}
 
 // Resolved Human model: ordinary local reversible repository work (inspect,
 // edit, test, worktree, local commit) is authorized directly by the initial
@@ -760,20 +889,18 @@ export function checkToolCall(toolName, input, policy) {
   }
   if (toolName === "bash") {
     if (typeof input?.command !== "string") return block("bash call without a command string");
-    if (policy.role === "peer" && /\bpaseo\b/.test(input.command)) {
+    if (policy.role === "peer" && hasPaseoCliInvocation(input.command)) {
       return block("paseo CLI is unavailable to the peer role");
     }
-    if (policy.role === "peer" && /(?:\.orchestration|workspace-protocol\.md)/.test(input.command)) {
+    if (policy.role === "peer" && hasProtocolPathReference(input.command)) {
       return block("reading the workspace protocol is a governance violation for the peer role");
     }
-    if (/\bgit\b[^\n;&|]*\bcommit\b/.test(input.command) && !GIT_AMEND.test(input.command)) {
+    if (hasGitSubcommand(input.command, "commit") && !hasGitCommitAmend(input.command)) {
       if (policy.role === "lead" && policy.allowLeadWrite !== true) return block("Lead local commit requires protocol opt-in for Lead self-work");
       if (policy.role === "peer" && policy.writeMode !== "write") return block("peer local commit requires write-mode write");
     }
-    for (const pattern of PUBLICATION) {
-      if (pattern.test(input.command)) return block("publication route is always blocked");
-    }
-    if (GIT_AMEND.test(input.command)) return block("git commit --amend is forbidden");
+    if (hasPublicationRoute(input.command)) return block("publication route is always blocked");
+    if (hasGitCommitAmend(input.command)) return block("git commit --amend is forbidden");
     return undefined;
   }
   if (toolName === "write" || toolName === "edit") {
@@ -938,6 +1065,22 @@ function gitOut(repoRoot, args, trim = true) {
 
 function findRepoRoot(cwd = process.cwd()) {
   return gitOut(cwd, ["rev-parse", "--show-toplevel"]).then((root) => (root === "" ? null : root));
+}
+
+// Pin root: the canonical Git repository root when observable, otherwise the
+// canonical cwd. The protocol lives at <root>/.orchestration/workspace-protocol.md
+// in both cases, so a fresh non-git directory pins at its own root; git init
+// in the same directory re-pins to the same physical root, and git init in a
+// parent re-pins when the resolved root changes. Git-backed evidence
+// (candidates, worktrees, acceptance) still requires a real repository.
+async function resolvePinRoot(cwd = process.cwd()) {
+  const gitRoot = await findRepoRoot(cwd);
+  if (gitRoot !== null) return { root: gitRoot, git: true };
+  try {
+    return { root: await realpath(cwd), git: false };
+  } catch {
+    return { root: null, git: false };
+  }
 }
 
 async function gitChangedPaths(repoRoot) {
@@ -2317,13 +2460,24 @@ export async function readAndValidateProtocol(repoRoot) {
 // lifecycle gate consults it for authority.
 async function ensureProtocolPin() {
   if (latch === null || latch.role !== "lead") return { ok: true };
-  const repoRoot = await findRepoRoot();
-  if (repoRoot === null) {
-    return { ok: false, error: "no git repository root is observable for workspace protocol pinning" };
+  const resolved = await resolvePinRoot();
+  if (resolved.root === null) {
+    return { ok: false, error: "workspace protocol pinning requires a resolvable directory root" };
   }
-  if (protocolPin === null || protocolPin.repoRoot !== repoRoot) {
+  const repoRoot = resolved.root;
+  const rootChanged = protocolPin !== null && protocolPin.repoRoot !== repoRoot;
+  if (protocolPin === null || rootChanged) {
     const read = await readAndValidateProtocol(repoRoot);
-    if (!read.ok) return { ok: false, error: read.error };
+    if (!read.ok) {
+      // Core orchestration remains usable without a repository policy file. A
+      // missing file only removes protocol-derived capabilities (notably Lead
+      // self-write); an existing but malformed policy still fails closed.
+      if (/workspace protocol file is missing/.test(read.error) && (protocolPin === null || rootChanged)) {
+        protocolPin = null;
+        return { ok: true, available: false, warning: read.error };
+      }
+      return { ok: false, error: read.error };
+    }
     protocolPin = {
       repoRoot,
       version: read.protocol.meta.version,
@@ -2331,7 +2485,7 @@ async function ensureProtocolPin() {
       digest: read.protocol.digest,
       allowsLeadTiny: read.protocol.allowsLeadTiny,
     };
-    return { ok: true };
+    return { ok: true, available: true };
   }
   const read = await readAndValidateProtocol(repoRoot);
   if (!read.ok) return { ok: false, error: read.error };
@@ -3745,25 +3899,30 @@ export async function buildDoctorReport(options = {}) {
   if (cwdValue !== null) {
     try { cwd = await realpath(cwdValue); } catch { cwd = null; }
   }
-  let repoRoot = null;
+  // Git worktree facts and the protocol pin root are separate observations:
+  // a directory without git still pins the protocol at its own root, while
+  // git-backed evidence (status, candidates, worktrees) stays honestly
+  // unavailable until a repository exists.
+  let gitRoot = null;
   if (cwd !== null) {
     const found = await findRepoRoot(cwd);
-    if (found !== null) { try { repoRoot = await realpath(found); } catch { repoRoot = found; } }
+    if (found !== null) { try { gitRoot = await realpath(found); } catch { gitRoot = found; } }
   }
-  const statusOutput = repoRoot === null ? null : await gitOut(repoRoot, ["status", "--porcelain=v1", "--untracked-files=all"], false);
-  const head = repoRoot === null ? null : await gitOut(repoRoot, ["rev-parse", "HEAD"]);
-  const branch = repoRoot === null ? null : await gitOut(repoRoot, ["branch", "--show-current"]);
+  const pinRoot = gitRoot !== null ? gitRoot : cwd;
+  const statusOutput = gitRoot === null ? null : await gitOut(gitRoot, ["status", "--porcelain=v1", "--untracked-files=all"], false);
+  const head = gitRoot === null ? null : await gitOut(gitRoot, ["rev-parse", "HEAD"]);
+  const branch = gitRoot === null ? null : await gitOut(gitRoot, ["branch", "--show-current"]);
   const statusLines = statusOutput === null ? [] : statusOutput.split(/\r?\n/).filter(Boolean);
   const untracked = statusLines.filter((line) => line.startsWith("??")).length;
   const staged = statusLines.filter((line) => !line.startsWith("??") && line[0] !== " ").length;
   const unstaged = statusLines.filter((line) => !line.startsWith("??") && line[1] !== " ").length;
   const dirty = statusLines.length;
   const cwdCheckStatus = cwd === null ? (role ? "BLOCKED" : "WARN") : "PASS";
-  const repoStatus = repoRoot === null ? (role ? "BLOCKED" : "WARN") : "PASS";
+  const repoStatus = gitRoot === null ? "WARN" : "PASS";
   const checks = [];
   checks.push(doctorCheck("CONTEXT_CWD", "current Pi cwd", cwdCheckStatus, "ctx.cwd resolves to a readable canonical directory", cwd ?? "unavailable", [{ kind: "memory", source: "ctx.cwd", output: cwd }], { owner: "operator", action: "Start doctor with the current readable Pi cwd." }));
-  checks.push(doctorCheck("GIT_REPOSITORY", "containing Git repository", repoStatus, "one canonical Git repository root contains cwd", repoRoot ?? "not found", [{ kind: "command", source: "git rev-parse --show-toplevel", output: repoRoot }], { owner: "operator", action: "Open the intended Git repository and rerun doctor." }));
-  checks.push(doctorCheck("GIT_WORKTREE", "Git clean and dirty counts", repoRoot === null ? (role ? "BLOCKED" : "WARN") : "PASS", "read-only Git status is observable", repoRoot === null ? "unavailable" : JSON.stringify({ head, branch, staged, unstaged, untracked, dirty }), [{ kind: "command", source: "git status --porcelain=v1 --untracked-files=all", output: repoRoot === null ? null : JSON.stringify({ head, branch, staged, unstaged, untracked, dirty }) }], { owner: "human", action: "Review reported dirty files manually; doctor does not clean or stash them." }));
+  checks.push(doctorCheck("GIT_REPOSITORY", "containing Git repository", repoStatus, "one canonical Git repository root contains cwd", gitRoot ?? "not initialized (protocol pins at the directory root; acceptance and worktrees require git)", [{ kind: "command", source: "git rev-parse --show-toplevel", output: gitRoot }], { owner: "operator", action: gitRoot === null ? "git init when Git-backed evidence (candidates, worktrees, acceptance) is needed; ordinary directory work is already governed." : "Open the intended Git repository and rerun doctor." }));
+  checks.push(doctorCheck("GIT_WORKTREE", "Git clean and dirty counts", gitRoot === null ? "WARN" : "PASS", "read-only Git status is observable", gitRoot === null ? "unavailable" : JSON.stringify({ head, branch, staged, unstaged, untracked, dirty }), [{ kind: "command", source: "git status --porcelain=v1 --untracked-files=all", output: gitRoot === null ? null : JSON.stringify({ head, branch, staged, unstaged, untracked, dirty }) }], { owner: "human", action: "Review reported dirty files manually; doctor does not clean or stash them." }));
 
   const piFacts = doctorPiCapabilities(pi);
   checks.push(doctorCheck("PI_CAPABILITIES", "Pi read-only API and hook surface", piFacts.missing.length === 0 ? "PASS" : (role ? "BLOCKED" : "WARN"), "required Pi APIs are present", piFacts.missing.length === 0 ? "all required APIs present" : `missing ${piFacts.missing.join(", ")}`, [{ kind: "api", source: "Pi extension API", output: piFacts.observed.join(", ") }], { owner: "operator", action: "Use a Pi process exposing the required extension APIs." }));
@@ -3777,15 +3936,16 @@ export async function buildDoctorReport(options = {}) {
   checks.push(doctorCheck("PASEO_IDENTITY", "Paseo current-agent identity", paseoIdentityStatus, role ? "PASEO_AGENT_ID is nonempty" : "identity is not required for passive mode", (env[AGENT_ENV] ?? "").trim() || "absent", [{ kind: "env", source: AGENT_ENV, output: (env[AGENT_ENV] ?? "").trim() ? "present" : "absent" }], { owner: "operator", action: "Set the exact Paseo agent identity before governed work." }));
   const observerOwner = role === "supervisor" ? "supervisor" : role === "lead" ? "lead" : "operator";
   checks.push(doctorCheck("ADAPTER_OBSERVER", "public current-agent observation capability", paseo.status, "the already-loaded adapter or Paseo CLI proves exact current-agent observation", paseo.reason, [{ kind: "api", source: paseo.observation?.source ?? "public current-agent observer", output: paseo.observation ? "verified" : "unavailable" }], { owner: observerOwner, action: paseo.status === "BLOCKED" ? "Start the Paseo daemon and verify the exact agent identity, then rerun doctor." : "Use a configured observer when governed live facts are needed." }));
-  // Workspace binding and MCP-configuration attestation are required
-  // observations that neither the installed pi-mcp-adapter (no Paseo
-  // integration) nor the Paseo CLI currently proves. Capability-first: never
-  // claimed as proven, surfaced as an explicit WARN with the exact pieces.
+  // Workspace binding and MCP-configuration attestation are optional
+  // observations for core governance. Neither the installed pi-mcp-adapter
+  // (no Paseo integration) nor the Paseo CLI currently proves them, so keep
+  // the environment ceiling explicit without turning ordinary work into a
+  // hard blocker.
   const unverified = [];
   if (!paseo.observation?.workspace_id) unverified.push("workspace_binding");
   if (paseo.observation?.mcp_configuration_attested !== true) unverified.push("mcp_configuration_attestation");
   const attestationStatus = unverified.length === 0 ? "PASS" : "WARN";
-  checks.push(doctorCheck("OBSERVER_ATTESTATION", "workspace binding and MCP-configuration attestation", attestationStatus, "the observation proves the typed workspace binding and MCP-configuration attestation", unverified.length === 0 ? "all attested" : `unverified: ${unverified.join(", ")}`, [{ kind: "api", source: "current observation tuple", output: unverified.length === 0 ? "attested" : unverified.join(", ") }], { owner: "operator", action: "Provide an observer that proves the typed workspace binding and MCP-configuration attestation, or accept the WARN as the environment ceiling.", applicable: role !== null, required: role !== null }));
+  checks.push(doctorCheck("OBSERVER_ATTESTATION", "workspace binding and MCP-configuration attestation", attestationStatus, "the observation proves the typed workspace binding and MCP-configuration attestation when workspace-scoped capabilities are used", unverified.length === 0 ? "all attested" : `unverified: ${unverified.join(", ")}`, [{ kind: "api", source: "current observation tuple", output: unverified.length === 0 ? "attested" : unverified.join(", ") }], { owner: "operator", action: "Provide an observer that proves the typed workspace binding and MCP-configuration attestation before workspace-scoped acceptance or mutation, or accept the WARN for core mode.", applicable: role !== null, required: false }));
 
   // v0.2 topology and binding checks. Root roles require ParentAgentId null;
   // a Peer requires a parent equal to the bound Lead. Live parentage comes
@@ -3819,8 +3979,8 @@ export async function buildDoctorReport(options = {}) {
   checks.push(doctorCheck("ROLE_PROVIDER", "configured role provider/model route", providerStatus, role ? "the role provider/model is latched from a Human-configured route" : "not configured in passive mode", role ? (latch?.selectedModel ? `${latch.selectedModel.provider}/${latch.selectedModel.id} (requested->runtime verified by verifyLatch)` : "no latched provider") : "not applicable", [{ kind: "memory", source: "activation latch", output: role ? (latch?.selectedModel ? `${latch.selectedModel.provider}/${latch.selectedModel.id}` : null) : null }], { owner: "human", action: "Configure the exact role provider/model route and start a fresh governed process; doctor never substitutes a model.", applicable: role !== null, required: role !== null }));
 
   const workspaceId = paseo.observation?.workspace_id ?? paseo.observation?.workspace?.id ?? null;
-  const workspaceStatus = role ? (paseo.status === "PASS" && paseo.observation?.mcp_configuration_attested === true ? "PASS" : "BLOCKED") : "WARN";
-  checks.push(doctorCheck("WORKSPACE_BINDING", "typed workspace binding", workspaceStatus, role ? "the current agent binds an attested typed workspace" : "workspace binding is not required in passive mode", workspaceStatus === "PASS" ? `workspace ${workspaceId}` : (unverified.includes("workspace_binding") ? "workspace_binding unverified" : "not attested"), [{ kind: "api", source: "current observation tuple", output: workspaceId }], { owner: "operator", action: "Provide an observation that attests the typed workspace binding, or record the environment ceiling; doctor never claims it as proven.", applicable: role !== null, required: role !== null }));
+  const workspaceStatus = role ? (paseo.status === "PASS" && paseo.observation?.mcp_configuration_attested === true ? "PASS" : "WARN") : "WARN";
+  checks.push(doctorCheck("WORKSPACE_BINDING", "typed workspace binding", workspaceStatus, role ? "the current agent binds an attested typed workspace when workspace-scoped capabilities are used" : "workspace binding is not required in passive mode", workspaceStatus === "PASS" ? `workspace ${workspaceId}` : (unverified.includes("workspace_binding") ? "workspace_binding unverified (core mode remains available)" : "not attested (core mode remains available)"), [{ kind: "api", source: "current observation tuple", output: workspaceId }], { owner: "operator", action: "Provide an observation that attests the typed workspace binding before workspace-scoped acceptance or mutation, or continue in core mode with the WARN.", applicable: role !== null, required: false }));
 
 
   if (!roleCheck.ok) {
@@ -3870,12 +4030,15 @@ export async function buildDoctorReport(options = {}) {
   checks.push(doctorCheck("ROLE_PROFILE", "selected Role Profile snapshot", profileStatus, role ? "selected profile bytes equal the latched digest" : "not applicable in passive mode", profileObserved, [{ kind: "file", source: role ? latch?.profileDir ?? "unavailable" : "not applicable", digest: role ? latch?.profileDigest ? `sha256:${latch.profileDigest}` : null : null, output: role ? profileObserved : null }], { owner: "human", action: "Restore the selected profile or start a fresh process; doctor does not fall back.", applicable: role !== null, required: role !== null }));
 
   let protocol = null;
-  if (repoRoot !== null) protocol = await readAndValidateProtocol(repoRoot);
-  const protocolRequired = role !== null;
+  if (pinRoot !== null) protocol = await readAndValidateProtocol(pinRoot);
   let protocolStatus;
   let protocolObserved;
-  if (protocol === null) { protocolStatus = protocolRequired ? "BLOCKED" : "WARN"; protocolObserved = "repository root unavailable"; }
-  else if (!protocol.ok) { protocolStatus = protocolRequired ? "BLOCKED" : "WARN"; protocolObserved = protocol.error; }
+  const protocolMissing = protocol !== null && !protocol.ok && /workspace protocol file is missing/.test(protocol.error);
+  if (protocol === null) { protocolStatus = "WARN"; protocolObserved = "repository root unavailable"; }
+  else if (!protocol.ok) {
+    protocolStatus = protocolMissing || role !== "lead" ? "WARN" : "BLOCKED";
+    protocolObserved = protocol.error;
+  }
   else {
     protocolObserved = JSON.stringify({ project_id: protocol.protocol.meta.project_id, version: protocol.protocol.meta.version, digest: protocol.protocol.digest });
     protocolStatus = "PASS";
@@ -3884,7 +4047,7 @@ export async function buildDoctorReport(options = {}) {
       protocolObserved = `pinned protocol drift: ${protocolObserved}`;
     }
   }
-  checks.push(doctorCheck("WORKSPACE_PROTOCOL", "repository-root Workspace Protocol", protocolStatus, protocolRequired ? "strict protocol is valid and matches any current Lead pin" : "current protocol is informative in passive mode", protocolObserved, [{ kind: "file", source: repoRoot ? protocolPath(repoRoot) : "unavailable", digest: protocol?.ok ? protocol.protocol.digest : null, output: protocolObserved }], { owner: "lead", action: "Re-read the exact repository-root protocol, resolve drift with the Human, and rerun doctor.", applicable: repoRoot !== null, required: protocolRequired }));
+  checks.push(doctorCheck("WORKSPACE_PROTOCOL", "repository-root Workspace Protocol", protocolStatus, role === "lead" ? "protocol is optional for core mode and required only for protocol-derived capabilities" : "current protocol is informative outside the Lead role", protocolObserved, [{ kind: "file", source: pinRoot ? protocolPath(pinRoot) : "unavailable", digest: protocol?.ok ? protocol.protocol.digest : null, output: protocolObserved }], { owner: "lead", action: "Create or repair the repository protocol only when protocol-derived capabilities are needed, then rerun doctor.", applicable: pinRoot !== null, required: false }));
 
   const toolReport = doctorEffectiveToolReport(pi, role);
   const missingCore = role ? requireBaselineTools(baseline, role) : { ok: true };
@@ -3918,7 +4081,7 @@ export async function buildDoctorReport(options = {}) {
   const paseoObservation = paseo.observation;
   const target = {
     cwd,
-    repository_root: repoRoot,
+    repository_root: gitRoot,
     pi_session_id: ctx.sessionId ?? ctx.piSessionId ?? ctx.session?.id ?? null,
     paseo_agent_id: (env[AGENT_ENV] ?? "").trim() || null,
     workspace_id: paseoObservation?.workspace_id ?? paseoObservation?.workspace?.id ?? ctx.workspaceId ?? ctx.paseoWorkspaceId ?? null,
@@ -5404,10 +5567,11 @@ export default function (pi) {
       }
     }
     // Resolve the repository root for the peer read gate; the gate needs a
-    // root to resolve read targets.
+    // root to resolve read targets. Same pin-root fallback as the Lead pin so
+    // a not-yet-git directory still resolves read targets.
     let repoRoot = null;
     if (repoRoot === null && latch.role === "peer" && PROTOCOL_READ_TOOLS.includes(event.toolName)) {
-      repoRoot = await findRepoRoot();
+      repoRoot = (await resolvePinRoot()).root;
     }
     // v0.2 live child reconciliation: a Lead lifecycle call toward a Peer
     // child is allowed only when live Paseo inspection proves the child's

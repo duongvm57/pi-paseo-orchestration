@@ -59,12 +59,12 @@ The Lead delegates bounded assignments to Peer children and returns the final ca
 
 ## How it works
 
-1. Each process receives one durable Role Profile. The Lead also reads the repository's Workspace Protocol; each Peer receives only its bounded assignment. Keeping these layers separate avoids spending Peer attention on the whole organization manual.
+1. Each process receives one durable Role Profile. A Lead reads and pins a Workspace Protocol when protocol-derived routing or self-write is needed; without one it remains in core mode for inspection, coordination, and read-only work. Each Peer receives only its bounded assignment. Keeping these layers separate avoids spending Peer attention on the whole organization manual.
 2. The initial root Lead task and each exact Peer assignment authorize ordinary local reversible inspect, test, and worktree work. Lead write/edit/commit requires Workspace Protocol opt-in; Peer write/edit/commit requires an Engineer `write_mode` binding. The Human types only `implement <spec-path>` (or equivalent) once; no marker, JSON envelope, hash, agent ID, assignment ID, scope syntax, capability list, digest, or grant is ever written. Assignment, ownership, scope, and exclusions are workflow facts, not capability credentials.
-3. The Lead describes the outcome, constraints, known evidence, writable scope, exclusions, and verification—not a supposedly final implementation plan. One moving write scope has one owner; concurrent writers need disjoint scopes and isolated checkouts. The Lead prepares required isolated worktrees itself.
+3. The Lead describes the outcome, constraints, known evidence, writable scope, exclusions, and verification—not a supposedly final implementation plan. One moving write scope has one owner. A worktree is an option for concurrent writers, not a default: the Lead proposes the isolation needed, and the Human chooses or confirms it when the trade-off matters.
 4. A dirty caller checkout is evidence to classify, not an automatic blocker: untracked/read-only issue notes, specifications, research, generated logs, or unrelated documentation do not block an isolated worktree from a known clean commit. Only a real collision, overwrite risk, competing writer, or ambiguous base blocks work.
 5. A Peer ends its run with a correlated report: `HANDOFF`, `REOPEN_REQUEST`, `DEPENDENCY_REQUEST`, or `BLOCKED`. The Lead reacts to that event instead of polling and consuming coordination attention.
-6. Write work produces one exact local Git **Stable Candidate**. Required review and verification bind to that commit, the Lead issues a candidate-bound verdict, and only a direct Human action crosses the Local Acceptance Boundary.
+6. Candidate-producing write work produces one exact local Git **Stable Candidate**. Required review and verification bind to that commit, the Lead issues a candidate-bound verdict, and only a direct Human action crosses the Local Acceptance Boundary. Core mode does not require Git and does not claim candidate/acceptance readiness.
 7. Communication is event-driven and bounded. The Lead sends milestone events to its verified Supervisor; the Supervisor performs one bounded observation pass per event, or on a low-frequency heartbeat used only as a safety net, and returns to idle. No daemon or continuous polling loop is introduced.
 8. Paseo remains the only lifecycle, workspace, parentage, follow-up, and timeline control plane. This package adds policy and evidence contracts, not another scheduler or agent database.
 
@@ -75,7 +75,7 @@ Use this package when those boundaries matter. For a small single-agent task, or
 - Pi
 - Paseo and its CLI
 - `pi-mcp-adapter`, installed separately and configured to expose the Paseo MCP server to Pi
-- A Git repository for governed work
+- Git is optional for core inspection, coordination, and read-only work. A Git repository is required only for Stable Candidates, local acceptance, or Git-backed concurrent isolation.
 
 This package does not bundle Paseo or `pi-mcp-adapter`.
 
@@ -138,15 +138,15 @@ Custom Peer routes are also supported. Use a capable model for Lead orchestratio
 
 Restart Paseo after updating the providers.
 
-### 2. Create the repository protocol
+### 2. Create the repository protocol (when needed)
 
-Every governed repository needs:
+Create this file when the Lead must perform protocol-derived self-write, repository-specific routing, review, or Git candidate acceptance:
 
 ```
 .orchestration/workspace-protocol.md
 ```
 
-This file contains decisions that cannot safely be global: how this repository classifies work, assigns writers, isolates concurrent changes, requires review, verifies candidates, and escalates decisions to the Human. The Lead refuses governed work when the protocol is missing or invalid.
+This file contains decisions that cannot safely be global: how this repository classifies work, assigns writers, isolates concurrent changes, requires review, verifies candidates, and escalates decisions to the Human. If it is missing, the package still supports core mode; malformed or drifted protocol bytes block only protocol-derived capabilities.
 
 From an ordinary Pi session opened at the repository root, send this exact prompt:
 
@@ -164,7 +164,7 @@ From the repository:
 /ppo:doctor
 ```
 
-Doctor is observation-only. It reports the current Pi, Git, role, settings, protocol, Paseo connection, identity, topology, and binding state without repairing or mutating them.
+Doctor is observation-only. It reports the current Pi, Git, role, settings, protocol, Paseo connection, identity, topology, and binding state without repairing or mutating them. Missing Git, protocol, or workspace attestation is reported as a warning when the requested work can stay in core mode.
 
 ### 4. Start work
 

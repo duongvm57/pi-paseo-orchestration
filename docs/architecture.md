@@ -6,7 +6,7 @@ multi-agent work for [Pi](https://github.com/earendil-works/pi), running through
 The package gives each process one explicit role — **Supervisor**, **Lead**, or
 **Peer** — and keeps Paseo as the source of truth for agents, workspaces,
 parentage, and lifecycle. It adds policy guardrails, repository workflow rules,
-evidence-bearing handoffs, and local Git candidate acceptance. There is no
+evidence-bearing handoffs, and optional local Git candidate acceptance. There is no
 coordinator: the Human creates the root Lead and a root Supervisor only when the
 task class warrants one.
 
@@ -113,15 +113,19 @@ Before standing up the roles, the substrate must be right:
 
 - Pi, Paseo and its CLI, and `pi-mcp-adapter` configured to expose the Paseo MCP
   server to Pi.
-- A Git repository for governed work, with the ability to create worktrees for
-  concurrent writers.
-- A place for the Workspace Protocol (`.orchestration/workspace-protocol.md`) and
-  the optional Supervisor Notebook (under Pi's config directory).
+- Git is optional for core inspection, coordination, and read-only work. Stable
+  Candidates, local acceptance, and Git-backed concurrent isolation require a
+  repository with the ability to create worktrees when the Human chooses that
+  trade-off.
+- A Workspace Protocol (`.orchestration/workspace-protocol.md`) when repository-
+  specific routing, Lead self-write, review, or candidate acceptance is needed;
+  the Supervisor Notebook remains optional (under Pi's config directory).
 
 A preflight (`/ppo:doctor`) answers four questions: is the control plane
 reachable; which providers/models actually exist; which workspaces/agents already
 exist and must be preserved; and does the checkout carry user-owned changes that
-must not be overwritten.
+must not be overwritten. Missing Git, protocol, or workspace attestation is a
+warning when the requested work remains in core mode.
 
 ### One control plane
 
@@ -139,9 +143,11 @@ briefed neutrally against an exact candidate.
 
 ### Workspace isolation
 
-One workspace ID is not filesystem isolation. The minimum safe rule: one writer
-per moving scope, separate worktrees for concurrent writers, review only a stable
-candidate, explicit handback.
+One workspace ID is not filesystem isolation. The minimum safe rule is one writer
+per moving scope. Separate worktrees are an option for concurrent writers when
+the Human chooses the isolation trade-off; otherwise serialize the moving scope.
+Review only a stable candidate when candidate acceptance is in scope, then hand
+back explicitly.
 
 ### Discoverable providers
 
@@ -173,8 +179,10 @@ evidence level for `ACCEPT`.
 | Workspace Protocol (`.orchestration/workspace-protocol.md`) | Durable per repo | topology, model/effort policy, review rhythm, escalation | one task's detail |
 | Assignment (Peer brief) | One assignment | objective, scope, ownership, exclusions, verification, handoff | the organization manual |
 
-The Lead reads the full protocol; a Peer receives only the extracted constraints
-and is blocked from reading the protocol (a read gate plus a peer bash guard).
+When a protocol exists and protocol-derived work is requested, the Lead reads the
+full protocol; a Peer receives only the extracted constraints and is blocked from
+reading the protocol (a read gate plus a peer bash guard). Core mode can proceed
+without a protocol.
 Precedence is `Role Profile > Workspace Protocol > ordinary task prose`; a lower
 layer narrows but never widens a higher layer, and omission grants nothing.
 
@@ -292,9 +300,9 @@ models agreeing does not make an unevidenced conclusion true.
 
 ### 5.4 Agent creation contract
 
-Every significant task carries: repository root, workspace/worktree, role and
-disposition, objective, owned scope, excluded scope, authority, verification, and
-handoff. The Lead binds the route (`model_route`), its own identity
+Every significant task carries: repository root, workspace, optional worktree,
+role and disposition, objective, owned scope, excluded scope, authority,
+verification, and handoff. The Lead binds the route (`model_route`), its own identity
 (`parent_lead_agent_id`), and `write_mode` (`write` for Engineer, `read-only` for
 Architect/Reviewer/Scout) once in the Peer's initial prompt.
 
@@ -312,9 +320,10 @@ low-frequency heartbeat as a safety net only — never re-reads the timeline to
 ### 6.1 Definition and readers
 
 `.orchestration/workspace-protocol.md` is the repository-specific orchestration
-policy — like `AGENTS.md`, but read by the Lead (mandatory, before orchestration)
-and the Supervisor (only under an authoring/audit mandate), and **not** broadcast
-to Peers. The Lead extracts the relevant constraints into each assignment.
+policy — like `AGENTS.md`, read by the Lead when protocol-derived work is
+requested and by the Supervisor only under an authoring/audit mandate, and **not**
+broadcast to Peers. The Lead extracts the relevant constraints into each
+assignment. Its absence leaves core mode available.
 
 ### 6.2 Required content
 
@@ -485,7 +494,7 @@ only the entries with causal, repository-specific evidence. Highlights:
 | Class | Topology |
 |---|---|
 | Tiny / bounded | Lead or one Engineer → focused checks → Lead inspect → Human accept |
-| Cross-module / lifecycle | Lead → one Engineer in an isolated checkout → Stable Candidate → Reviewer if risk triggers → Lead verdict → Human accept |
+| Cross-module / lifecycle | Lead → one Engineer in a Human-approved isolated checkout when needed → Stable Candidate → Reviewer if risk triggers → Lead verdict → Human accept |
 | Architecture-sensitive | read-only Architect (neutral brief) → Lead design decision → one Engineer → fresh Reviewer → correction → new candidate → Lead verdict → Human accept |
 
 A difficult decision may warrant multiple advisers with **distinct mandates**
