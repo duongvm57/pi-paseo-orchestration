@@ -6,6 +6,8 @@ The package gives each process one explicit role—**Supervisor**, **Lead**, or 
 
 For the full architecture — role model, instruction layers, runtime gates, acceptance model, and the anti-pattern catalog — see [docs/architecture.md](docs/architecture.md).
 
+For the evidence-backed manual E2E gate derived from the orchestration deep dive, use [docs/agent-orchestration-e2e-checklist.md](docs/agent-orchestration-e2e-checklist.md).
+
 ## Why subagents are not enough
 
 A subagent API solves **process creation**. It does not solve ownership, independent judgment, coordination, or acceptance. In practice, multi-agent coding commonly fails in these ways:
